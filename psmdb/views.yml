@@ -1,13 +1,15 @@
 - view:
-    name: 'MultiConf'
-    description: |
-        PSMDB Multi-Configuration jobs
-        Do not edit these jobs through the web!
-    view-type: list
-
-- view:
     name: 'SingleConf'
     description: |
         PSMDB Single-Configuration jobs
         Do not edit these jobs through the web!
     view-type: list
+    regex: 'percona-server.*'
+
+- view:
+    name: 'MultiConf'
+    description: |
+        PSMDB Multi-Configuration jobs
+        Do not edit these jobs through the web!
+    view-type: list
+    regex: 'multi.*'
