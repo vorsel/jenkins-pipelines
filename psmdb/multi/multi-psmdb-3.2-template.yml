@@ -1,0 +1,452 @@
+- job:
+    axes:
+    - axis:
+        name: label_exp
+        type: label-expression
+        values:
+        - min-centos-6-x64
+        - min-centos-7-x64
+        - min-bionic-x64
+        - min-cosmic-x64
+        - min-jessie-x64
+        - min-stretch-x64
+    block-downstream: false
+    block-upstream: false
+    builders:
+    - shell: echo "###DESCRIPTION###${DESCRIPTION}###"
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi5wbHVnaW5zLmRlc2NyaXB0aW9uc2V0dGVyLkRlc2NyaXB0aW9uU2V0dGVyQnVpbGRl
+          ciBwbHVnaW49ImRlc2NyaXB0aW9uLXNldHRlckAxLjEwIj4KICAgICAgPHJlZ2V4cD5eIyMjREVT
+          Q1JJUFRJT04jIyMoLiopIyMjJDwvcmVnZXhwPgogICAgPC9odWRzb24ucGx1Z2lucy5kZXNjcmlw
+          dGlvbnNldHRlci5EZXNjcmlwdGlvblNldHRlckJ1aWxkZXI+CiAgICA=
+    - shell: |-
+        #!/bin/bash
+        # clean workspace
+        if [ "${RELEASE_TEST}" = "true" ]; then
+        rm -rf ${WORKSPACE}/*
+        fi
+
+        #cleanup
+        killall -9 mongos || true
+        killall -9 mongod || true
+        pkill -f killer.sh || true
+        #
+        sudo rm -rf /mnt/data /data
+        sudo mkdir /mnt/data
+        sudo chmod 777 /mnt/data
+        sudo ln -s /mnt/data /data
+        #
+        echo "echo never > /sys/kernel/mm/transparent_hugepage/enabled" > disable-thp.sh
+        echo "echo never > /sys/kernel/mm/transparent_hugepage/defrag" >> disable-thp.sh
+        chmod +x disable-thp.sh
+        sudo -n ./disable-thp.sh
+        rm -f disable-thp.sh
+
+        echo "Transparent huge pages status:"
+        cat /sys/kernel/mm/transparent_hugepage/enabled
+    - shell: |-
+        #!/bin/bash
+
+        # debian/ubuntu, install dependencies
+        if [[ -f /usr/bin/apt-get ]]; then
+        sudo apt-get update
+        sudo apt-get -y install build-essential python-pip g++-5 gcc-5 libgflags-dev libsnappy-dev gcc-4.8
+        sudo apt-get -y install zlib1g-dev libbz2-dev python-ptyprocess scons libsasl2-dev scons g++-4.8
+        sudo apt-get -y install pkg-config libpcap0.8-dev libssl-dev cmake valgrind libsasl2-dev
+        sudo pip install pymongo subprocess32 PyYAML
+        fi
+
+        # centos 6 and 7, install dependencies
+        if [[ -f /usr/bin/yum ]]; then
+        sudo yum -y install libcurl-devel centos-release-scl
+        sudo yum -y install devtoolset-7-gcc-c++ devtoolset-7-binutils
+        sudo yum -y install devtoolset-7-libasan-devel devtoolset-7-libubsan-devel
+        sudo yum -y install devtoolset-7-valgrind devtoolset-7-valgrind-devel
+        fi
+
+        # GoLang
+        if [ ! -f /usr/local/go/bin/go ]; then
+        rm -f go1.8.3.linux-amd64.tar.gz
+        wget http://jenkins.percona.com/downloads/golang/go1.8.3.linux-amd64.tar.gz
+        sudo tar -C /usr/local -xzf go1.8.3.linux-amd64.tar.gz
+        fi
+    - shell: |-
+        if [ "${RELEASE_TEST}" != "true" ]; then
+        # prepare source
+        #
+        #git clone ${PSM_REPO}
+        cd percona-server-mongodb
+        #git checkout ${PSM_BRANCH}
+        REVISION=$(git rev-parse --short HEAD)
+        REVISION_LONG=$(git rev-parse HEAD)
+        # Need to fetch tags from upstream to be able to describe the commit with version
+        #if [ "${BUILD_TYPE}" = "param" ]; then
+        git remote add upstream https://github.com/mongodb/mongo.git
+        git fetch upstream --tags
+        #fi
+        PSM_VERSION=$(git describe --tags | sed 's/^psmdb-//' | sed 's/^r//' | awk -F '-' '{print $1}')
+        PSM_RELEASE=$(git describe --tags | sed 's/^psmdb-//' | sed 's/^r//' |awk -F '-' '{print $2}')
+        # create a proper version.json
+        echo "{" > version.json
+        echo "    \"version\": \"${PSM_VERSION}-${PSM_RELEASE}\"," >> version.json
+        echo "    \"githash\": \"${REVISION_LONG}\"" >> version.json
+        echo "}" >> version.json
+        #
+        if [ "${MAIN_VERSION_LINE}" = "v3.2" ]; then
+        rm -fr debian rpm
+        cp -a percona-packaging/manpages .
+        cp -a percona-packaging/docs/* .
+        fi
+        #
+        # submodules
+        git submodule init
+        git submodule update
+        #
+        rm -rf mongo-tools
+        git clone https://github.com/mongodb/mongo-tools.git
+        pushd mongo-tools
+        if [ "${MAIN_VERSION_LINE}" = "v3.2" ]; then
+        git checkout v3.2
+        else
+        git checkout v3.4
+        fi
+        #MONGO_TOOLS_TAG=$(git describe --tags | awk -F '-' '{print $1}')
+        MONGO_TOOLS_TAG=$(git describe --tags)
+        git checkout $MONGO_TOOLS_TAG
+        echo "export PSMDB_TOOLS_COMMIT_HASH=\"$(git rev-parse HEAD)\"" > set_tools_revision.sh
+        echo "export PSMDB_TOOLS_REVISION=\"${PSM_VERSION}-${PSM_RELEASE}\"" >> set_tools_revision.sh
+        chmod +x set_tools_revision.sh
+        popd
+        #
+        cd ${WORKSPACE}
+        fi
+        rm -rf psmdb-misc-scripts
+        git clone https://github.com/Percona-QA/psmdb-misc-scripts.git --depth 1
+    - shell: |-
+        if [ "${RELEASE_TEST}" != "true" ]; then
+        # build binaries
+        if [ -f /opt/percona-devtoolset/enable ]; then
+        source /opt/percona-devtoolset/enable
+        fi
+        #
+        export PATH=/usr/local/go/bin:$PATH
+        #
+        if [ -f /etc/debian_version ]; then
+        export CC=gcc-4.8
+        export CXX=g++-4.8
+        else
+        export CC=$(which gcc)
+        export CXX=$(which g++)
+        fi
+        #
+        if [ "${ASAN_RUN}" = "true" ]; then
+        ASAN_OPTIONS="--allocator=system --sanitize=address"
+        fi
+        #
+        if [ ! -z "${CUSTOM_SUITE}" ]; then
+        UNITTESTS=$(echo "${CUSTOM_SUITE}" | grep -c "^unittests" || true)
+        DBTESTS=$(echo "${CUSTOM_SUITE}" | grep -c "^dbtest" || true)
+        INTEGRATIONTESTS=$(echo "${CUSTOM_SUITE}" | grep -c "^integration_tests" || true)
+        else
+        UNITTESTS=$(cat psmdb-misc-scripts/suite_sets/${SUITE}.txt | grep -c "^unittests" || true)
+        DBTESTS=$(cat psmdb-misc-scripts/suite_sets/${SUITE}.txt | grep -c "^dbtest" || true)
+        INTEGRATIONTESTS=$(cat psmdb-misc-scripts/suite_sets/${SUITE}.txt | grep -c "^integration_tests" || true)
+        fi
+        if [ "${UNITTESTS}" -gt 0 ]; then
+        OPT_TARGETS=" unittests"
+        else
+        OPT_TARGETS=""
+        fi
+        if [ "${DBTESTS}" -gt 0 ]; then
+        OPT_TARGETS="${OPT_TARGETS} dbtest"
+        else
+        OPT_TARGETS="${OPT_TARGETS}"
+        fi
+        if [ "${INTEGRATIONTESTS}" -gt 0 ]; then
+        OPT_TARGETS="${OPT_TARGETS} integration_tests"
+        else
+        OPT_TARGETS="${OPT_TARGETS}"
+        fi
+        PSM_TARGETS="mongod mongos mongo mongobridge${OPT_TARGETS}"
+        TARBALL_SUFFIX=""
+        if [ -f /etc/debian_version ]; then
+        export OS_RELEASE="$(lsb_release -sc)"
+        fi
+        #
+        if [ -f /etc/redhat-release ]; then
+        export OS_RELEASE="centos$(lsb_release -sr | awk -F'.' '{print $1}')"
+        RHEL=$(rpm --eval %rhel)
+        fi
+        #
+        ARCH=$(uname -m 2>/dev/null||true)
+        PSMDIR=percona-server-mongodb
+        PSMDIR_ABS=${WORKSPACE}/percona-server-mongodb
+        TOOLSDIR=${PSMDIR}/mongo-tools
+        TOOLSDIR_ABS=${WORKSPACE}/${TOOLSDIR}
+        TOOLS_TAGS="ssl sasl"
+
+        NJOBS=$(grep -c processor /proc/cpuinfo)
+
+        # link PSM dir to /tmp to avoid "argument list too long error"
+        rm -fr /tmp/${PSMDIR}
+        ln -fs ${PSMDIR_ABS} /tmp/${PSMDIR}
+        cd /tmp
+        #
+        export CFLAGS="${CFLAGS:-} -fno-omit-frame-pointer"
+        export CXXFLAGS="${CFLAGS}"
+        export INSTALLDIR=${WORKSPACE}/install
+        # BLD-800
+        export PORTABLE=1
+        export USE_SSE=1
+        #
+        rm -rf ${INSTALLDIR}
+        mkdir -p ${INSTALLDIR}/include
+        mkdir -p ${INSTALLDIR}/bin
+        mkdir -p ${INSTALLDIR}/lib
+        #
+        # TokuBackup
+        if [ "${MAIN_VERSION_LINE}" = "v3.2" ]; then
+        pushd $PSMDIR/src/third_party/Percona-TokuBackup/backup
+        cmake . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX=/ -DBUILD_STATIC_LIBRARY=ON
+        make -j$NJOBS
+        make install DESTDIR=${INSTALLDIR}
+        popd
+        fi
+        # PerconaFT
+        if [ "${MAIN_VERSION_LINE}" = "v3.2" ]; then
+        pushd $PSMDIR/src/third_party/PerconaFT
+        cmake . -DCMAKE_BUILD_TYPE=Release -DUSE_VALGRIND=OFF -DTOKU_DEBUG_PARANOID=OFF -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX=/ -DJEMALLOC_SOURCE_DIR=${PSMDIR_ABS}/src/third_party/jemalloc
+        make -j$NJOBS VERBOSE=1
+        make install DESTDIR=${INSTALLDIR}
+        popd
+        fi
+        #
+        # RocksDB
+        pushd ${PSMDIR}/src/third_party/rocksdb
+        # static liblz4.a
+        rm -rf lz4-r127 || true
+        wget https://codeload.github.com/Cyan4973/lz4/tar.gz/r127
+        mv r127 lz4-r127.tar.gz
+        tar xvzf lz4-r127.tar.gz
+        pushd lz4-r127/lib
+        make CFLAGS=' -O3 -I. -std=c99 -Wall -Wextra -Wundef -Wshadow -Wcast-align -Wstrict-prototypes -pedantic -fPIC' all
+        popd
+        cp lz4-r127/lib/liblz4.a .
+        cp ./lz4-r127/lib/lz4.h ${INSTALLDIR}/include
+        cp ./lz4-r127/lib/lz4frame.h ${INSTALLDIR}/include
+        cp ./lz4-r127/lib/lz4hc.h ${INSTALLDIR}/include
+        cp ./lz4-r127/lib/liblz4.a ${INSTALLDIR}/lib
+        # static librocksdb.a
+        make -j$NJOBS EXTRA_CFLAGS='-DHAVE_SSE42' EXTRA_CXXFLAGS='-DHAVE_SSE42' static_lib
+        #make -j$NJOBS EXTRA_CFLAGS='-fPIC' EXTRA_CXXFLAGS='-fPIC' static_lib
+        make install-static INSTALL_PATH=${INSTALLDIR}
+        popd
+        #
+        # Finally build Percona Server for MongoDB with SCons
+        cd ${PSMDIR_ABS}
+        if [ "${MAIN_VERSION_LINE}" = "v3.2" ]; then
+        scons CC=${CC} CXX=${CXX} --release --ssl --opt=on -j$NJOBS --use-sasl-client --tokubackup --wiredtiger --audit --rocksdb --PerconaFT --inmemory --hotbackup ${ASAN_OPTIONS} CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
+        else
+        scons CC=${CC} CXX=${CXX} --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --rocksdb --inmemory --hotbackup ${ASAN_OPTIONS} CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
+        fi
+        #
+        # scons install doesn't work - it installs the binaries not linked with fractal tree
+        #scons --prefix=$PWD/$PSMDIR install
+        #
+        #mkdir -p ${PSMDIR}/bin
+        #for target in ${PSM_TARGETS[@]}; do
+        #  cp -f $target ${PSMDIR}/bin
+        #  strip --strip-debug ${PSMDIR}/bin/${target}
+        #done
+        #
+        cd ${WORKSPACE}
+        #
+        # Build mongo tools
+        cd ${TOOLSDIR}
+        rm -rf vendor/pkg
+        [[ ${PATH} == *"/usr/local/go/bin"* && -x /usr/local/go/bin/go ]] || export PATH=/usr/local/go/bin:${PATH}
+        . ./set_gopath.sh
+        . ./set_tools_revision.sh
+        mkdir -p bin
+        for i in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog; do
+        echo "Building ${i}..."
+        go build -a -o "bin/$i" -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec=${PSMDB_TOOLS_COMMIT_HASH} -X github.com/mongodb/mongo-tools/common/options.VersionStr=${PSMDB_TOOLS_REVISION}" -tags "${TOOLS_TAGS}" "$i/main/$i.go"
+        done
+        # move mongo tools to PSM root dir for running tests
+        mv bin/* ${PSMDIR_ABS}
+        # end build tools
+        fi
+    - raw:
+        xml: !!binary |
+          PG9yZy5qZW5raW5zY2kucGx1Z2lucy5jb25kaXRpb25hbGJ1aWxkc3RlcC5Db25kaXRpb25hbEJ1
+          aWxkZXIgcGx1Z2luPSJjb25kaXRpb25hbC1idWlsZHN0ZXBAMS4zLjYiPgogICAgICA8cnVubmVy
+          IGNsYXNzPSJvcmcuamVua2luc19jaS5wbHVnaW5zLnJ1bl9jb25kaXRpb24uQnVpbGRTdGVwUnVu
+          bmVyJEZhaWwiIHBsdWdpbj0icnVuLWNvbmRpdGlvbkAxLjIiIC8+CiAgICAgIDxydW5Db25kaXRp
+          b24gY2xhc3M9Im9yZy5qZW5raW5zX2NpLnBsdWdpbnMucnVuX2NvbmRpdGlvbi5jb250cmlidXRl
+          ZC5TaGVsbENvbmRpdGlvbiIgcGx1Z2luPSJydW4tY29uZGl0aW9uQDEuMiI+CiAgICAgICAgPGNv
+          bW1hbmQ+aWYgWyAke1JFTEVBU0VfVEVTVH0gPSB0cnVlIF07IHRoZW4KICBleGl0IDAKZWxzZQog
+          IGV4aXQgMQpmaTwvY29tbWFuZD4KICAgICAgPC9ydW5Db25kaXRpb24+CiAgICAgIDxjb25kaXRp
+          b25hbGJ1aWxkZXJzPgogICAgICAgIDxodWRzb24ucGx1Z2lucy5jb3B5YXJ0aWZhY3QuQ29weUFy
+          dGlmYWN0IHBsdWdpbj0iY29weWFydGlmYWN0QDEuNDEiPgogICAgICAgICAgPHByb2plY3QgLz4K
+          ICAgICAgICAgIDxmaWx0ZXI+Ki5wcm9wZXJ0aWVzLCBzb3VyY2VfdGFyYmFsbC8qLnRhci5nejwv
+          ZmlsdGVyPgogICAgICAgICAgPHRhcmdldCAvPgogICAgICAgICAgPGV4Y2x1ZGVzIC8+CiAgICAg
+          ICAgICA8c2VsZWN0b3IgY2xhc3M9Imh1ZHNvbi5wbHVnaW5zLmNvcHlhcnRpZmFjdC5TdGF0dXNC
+          dWlsZFNlbGVjdG9yIiAvPgogICAgICAgICAgPGZsYXR0ZW4+dHJ1ZTwvZmxhdHRlbj4KICAgICAg
+          ICAgIDxkb05vdEZpbmdlcnByaW50QXJ0aWZhY3RzPmZhbHNlPC9kb05vdEZpbmdlcnByaW50QXJ0
+          aWZhY3RzPgogICAgICAgIDwvaHVkc29uLnBsdWdpbnMuY29weWFydGlmYWN0LkNvcHlBcnRpZmFj
+          dD4KICAgICAgICA8aHVkc29uLnBsdWdpbnMuY29weWFydGlmYWN0LkNvcHlBcnRpZmFjdCBwbHVn
+          aW49ImNvcHlhcnRpZmFjdEAxLjQxIj4KICAgICAgICAgIDxwcm9qZWN0IC8+CiAgICAgICAgICA8
+          ZmlsdGVyPnRhcmJhbGwvKi50YXIuZ3o8L2ZpbHRlcj4KICAgICAgICAgIDx0YXJnZXQgLz4KICAg
+          ICAgICAgIDxleGNsdWRlcyAvPgogICAgICAgICAgPHNlbGVjdG9yIGNsYXNzPSJodWRzb24ucGx1
+          Z2lucy5jb3B5YXJ0aWZhY3QuU3RhdHVzQnVpbGRTZWxlY3RvciIgLz4KICAgICAgICAgIDxmbGF0
+          dGVuPnRydWU8L2ZsYXR0ZW4+CiAgICAgICAgICA8ZG9Ob3RGaW5nZXJwcmludEFydGlmYWN0cz5m
+          YWxzZTwvZG9Ob3RGaW5nZXJwcmludEFydGlmYWN0cz4KICAgICAgICA8L2h1ZHNvbi5wbHVnaW5z
+          LmNvcHlhcnRpZmFjdC5Db3B5QXJ0aWZhY3Q+CiAgICAgIDwvY29uZGl0aW9uYWxidWlsZGVycz4K
+          ICAgIDwvb3JnLmplbmtpbnNjaS5wbHVnaW5zLmNvbmRpdGlvbmFsYnVpbGRzdGVwLkNvbmRpdGlv
+          bmFsQnVpbGRlcj4KICAgIA==
+    - shell: |-
+        # run tests
+        cd ${WORKSPACE}
+        PSMDIR="percona-server-mongodb"
+        PSMDIR_ABS=${WORKSPACE}/${PSMDIR}
+        DISTRIBUTION="xenial"
+
+        if [ "${RELEASE_TEST}" = "true" ]; then
+        rm -rf install
+        rm -rf percona-server-mongodb
+        #rm -f *.tar.gz
+        #wget http://jenkins.percona.com/job/percona-server-mongodb-3.2-SOURCE/lastSuccessfulBuild/artifact/percona-server-mongodb-3.properties
+        PSM_VERSION=$(grep '^VERSION=' percona-server-mongodb-32.properties|cut -d'=' -f2)
+        PSM_RELEASE=$(grep '^RELEASE=' percona-server-mongodb-32.properties|cut -d'=' -f2)
+        #wget http://jenkins.percona.com/job/percona-server-mongodb-3.2-SOURCE/lastSuccessfulBuild/artifact/percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}.tar.gz
+        #wget http://jenkins.percona.com/job/percona-server-mongodb-3.2-TARBALL-release/label_exp=ubuntu-xenial-64bit/lastSuccessfulBuild/artifact/percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}-${DISTRIBUTION}-x86_64.tar.gz
+        if [ ! -f "percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}.tar.gz" ]; then
+        echo "Tarball percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}.tar.gz doesn't exists!"
+        exit 1
+        fi
+        if [ ! -f "percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}-${DISTRIBUTION}-x86_64.tar.gz" ]; then
+        echo "Tarball percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}-${DISTRIBUTION}-x86_64.tar.gz doesn't exists!"
+        exit 1
+        fi
+        tar xf percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}.tar.gz
+        tar xf percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}-${DISTRIBUTION}-x86_64.tar.gz
+        mv percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}/bin/* percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE}
+        mv percona-server-mongodb-${PSM_VERSION}-${PSM_RELEASE} ${PSMDIR}
+        fi
+
+        if [ "$JOBS" != "auto" ]; then
+        sed -i "s/^RESMOKE_JOBS=.*$/RESMOKE_JOBS=${JOBS}/" psmdb-misc-scripts/run_resmoke_psmdb_3.2.sh
+        fi
+        if [ ! -z "${CUSTOM_SUITE}" ]; then
+        echo "${CUSTOM_SUITE}" > psmdb-misc-scripts/suite_sets/custom.txt
+        TEST_SUITE_FILE="custom.txt"
+        else
+        TEST_SUITE_FILE="${SUITE}.txt"
+        fi
+
+        cd ${PSMDIR_ABS}
+        find build/opt -type f -name '*.a' -delete || true
+        find build/opt -type f -name '*.o' -delete || true
+        touch killer.log
+        if [ "${ENABLE_KILLER}" = "true" ]; then
+        ../psmdb-misc-scripts/killer.sh &
+        fi
+
+        ../psmdb-misc-scripts/run_resmoke_psmdb_3.2.sh 1 ${TEST_SUITE_FILE}
+        ../psmdb-misc-scripts/resmoke2junit.py
+
+        tar czf resmoke_logs.tar.gz  *.log *.json *.xml
+
+        #cleanup
+        killall -9 mongos || true
+        killall -9 mongod || true
+        pkill -f killer.sh || true
+    concurrent: false
+    disabled: true
+    execution-strategy:
+      sequential: false
+    name: multi-psmdb-3.2-template
+    project-type: matrix
+    properties:
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi5wbHVnaW5zLmJ1aWxkYmxvY2tlci5CdWlsZEJsb2NrZXJQcm9wZXJ0eSBwbHVnaW49
+          ImJ1aWxkLWJsb2NrZXItcGx1Z2luQDEuNy4zIj4KICAgICAgPHVzZUJ1aWxkQmxvY2tlcj5mYWxz
+          ZTwvdXNlQnVpbGRCbG9ja2VyPgogICAgICA8YmxvY2tMZXZlbD5HTE9CQUw8L2Jsb2NrTGV2ZWw+
+          CiAgICAgIDxzY2FuUXVldWVGb3I+RElTQUJMRUQ8L3NjYW5RdWV1ZUZvcj4KICAgICAgPGJsb2Nr
+          aW5nSm9icyAvPgogICAgPC9odWRzb24ucGx1Z2lucy5idWlsZGJsb2NrZXIuQnVpbGRCbG9ja2Vy
+          UHJvcGVydHk+CiAgICA=
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi5wbHVnaW5zLmRpc2tfX3VzYWdlLkRpc2tVc2FnZVByb3BlcnR5IHBsdWdpbj0iZGlz
+          ay11c2FnZUAwLjI4IiAvPgogIA==
+    publishers:
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi5wbHVnaW5zLndhcm5pbmdzLldhcm5pbmdzUHVibGlzaGVyIHBsdWdpbj0id2Fybmlu
+          Z3NANC42OCI+CiAgICAgIDxoZWFsdGh5IC8+CiAgICAgIDx1bkhlYWx0aHkgLz4KICAgICAgPHRo
+          cmVzaG9sZExpbWl0PmxvdzwvdGhyZXNob2xkTGltaXQ+CiAgICAgIDxwbHVnaW5OYW1lPltXQVJO
+          SU5HU10gPC9wbHVnaW5OYW1lPgogICAgICA8ZGVmYXVsdEVuY29kaW5nIC8+CiAgICAgIDxjYW5S
+          dW5PbkZhaWxlZD5mYWxzZTwvY2FuUnVuT25GYWlsZWQ+CiAgICAgIDx1c2VQcmV2aW91c0J1aWxk
+          QXNSZWZlcmVuY2U+ZmFsc2U8L3VzZVByZXZpb3VzQnVpbGRBc1JlZmVyZW5jZT4KICAgICAgPHVz
+          ZVN0YWJsZUJ1aWxkQXNSZWZlcmVuY2U+ZmFsc2U8L3VzZVN0YWJsZUJ1aWxkQXNSZWZlcmVuY2U+
+          CiAgICAgIDx1c2VEZWx0YVZhbHVlcz5mYWxzZTwvdXNlRGVsdGFWYWx1ZXM+CiAgICAgIDx0aHJl
+          c2hvbGRzIHBsdWdpbj0iYW5hbHlzaXMtY29yZUAxLjk1Ij4KICAgICAgICA8dW5zdGFibGVUb3Rh
+          bEFsbCAvPgogICAgICAgIDx1bnN0YWJsZVRvdGFsSGlnaCAvPgogICAgICAgIDx1bnN0YWJsZVRv
+          dGFsTm9ybWFsIC8+CiAgICAgICAgPHVuc3RhYmxlVG90YWxMb3cgLz4KICAgICAgICA8dW5zdGFi
+          bGVOZXdBbGwgLz4KICAgICAgICA8dW5zdGFibGVOZXdIaWdoIC8+CiAgICAgICAgPHVuc3RhYmxl
+          TmV3Tm9ybWFsIC8+CiAgICAgICAgPHVuc3RhYmxlTmV3TG93IC8+CiAgICAgICAgPGZhaWxlZFRv
+          dGFsQWxsIC8+CiAgICAgICAgPGZhaWxlZFRvdGFsSGlnaCAvPgogICAgICAgIDxmYWlsZWRUb3Rh
+          bE5vcm1hbCAvPgogICAgICAgIDxmYWlsZWRUb3RhbExvdyAvPgogICAgICAgIDxmYWlsZWROZXdB
+          bGwgLz4KICAgICAgICA8ZmFpbGVkTmV3SGlnaCAvPgogICAgICAgIDxmYWlsZWROZXdOb3JtYWwg
+          Lz4KICAgICAgICA8ZmFpbGVkTmV3TG93IC8+CiAgICAgIDwvdGhyZXNob2xkcz4KICAgICAgPHNo
+          b3VsZERldGVjdE1vZHVsZXM+ZmFsc2U8L3Nob3VsZERldGVjdE1vZHVsZXM+CiAgICAgIDxkb250
+          Q29tcHV0ZU5ldz50cnVlPC9kb250Q29tcHV0ZU5ldz4KICAgICAgPGRvTm90UmVzb2x2ZVJlbGF0
+          aXZlUGF0aHM+dHJ1ZTwvZG9Ob3RSZXNvbHZlUmVsYXRpdmVQYXRocz4KICAgICAgPGluY2x1ZGVQ
+          YXR0ZXJuIC8+CiAgICAgIDxleGNsdWRlUGF0dGVybiAvPgogICAgICA8bWVzc2FnZXNQYXR0ZXJu
+          IC8+CiAgICAgIDxjYXRlZ29yaWVzUGF0dGVybiAvPgogICAgICA8cGFyc2VyQ29uZmlndXJhdGlv
+          bnMgLz4KICAgICAgPGNvbnNvbGVQYXJzZXJzPgogICAgICAgIDxodWRzb24ucGx1Z2lucy53YXJu
+          aW5ncy5Db25zb2xlUGFyc2VyPgogICAgICAgICAgPHBhcnNlck5hbWU+R05VIE1ha2UgKyBHTlUg
+          QyBDb21waWxlciAoZ2NjKTwvcGFyc2VyTmFtZT4KICAgICAgICA8L2h1ZHNvbi5wbHVnaW5zLndh
+          cm5pbmdzLkNvbnNvbGVQYXJzZXI+CiAgICAgIDwvY29uc29sZVBhcnNlcnM+CiAgICA8L2h1ZHNv
+          bi5wbHVnaW5zLndhcm5pbmdzLldhcm5pbmdzUHVibGlzaGVyPgogICAg
+    - archive:
+        allow-empty: false
+        artifacts: percona-server-mongodb/resmoke_summary*.log, percona-server-mongodb/killer.log,
+          percona-server-mongodb/resmoke_logs.tar.gz
+        case-sensitive: true
+        default-excludes: true
+        fingerprint: false
+        only-if-success: false
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi50YXNrcy5qdW5pdC5KVW5pdFJlc3VsdEFyY2hpdmVyIHBsdWdpbj0ianVuaXRAMS4y
+          Ni4xIj4KICAgICAgPHRlc3RSZXN1bHRzPnBlcmNvbmEtc2VydmVyLW1vbmdvZGIvanVuaXQueG1s
+          PC90ZXN0UmVzdWx0cz4KICAgICAgPGtlZXBMb25nU3RkaW8+ZmFsc2U8L2tlZXBMb25nU3RkaW8+
+          CiAgICAgIDxoZWFsdGhTY2FsZUZhY3Rvcj4xLjA8L2hlYWx0aFNjYWxlRmFjdG9yPgogICAgICA8
+          YWxsb3dFbXB0eVJlc3VsdHM+ZmFsc2U8L2FsbG93RW1wdHlSZXN1bHRzPgogICAgPC9odWRzb24u
+          dGFza3MuanVuaXQuSlVuaXRSZXN1bHRBcmNoaXZlcj4KICAgIA==
+    - raw:
+        xml: !!binary |
+          PGplbmtpbnMucGx1Z2lucy5zbGFjay5TbGFja05vdGlmaWVyIHBsdWdpbj0ic2xhY2tAMi4xMCI+
+          CiAgICAgIDxiYXNlVXJsIC8+CiAgICAgIDx0ZWFtRG9tYWluIC8+CiAgICAgIDx0b2tlbkNyZWRl
+          bnRpYWxJZCAvPgogICAgICA8Ym90VXNlcj5mYWxzZTwvYm90VXNlcj4KICAgICAgPHJvb20+cHNt
+          ZGItc3RhbmR1cDwvcm9vbT4KICAgICAgPHN0YXJ0Tm90aWZpY2F0aW9uPmZhbHNlPC9zdGFydE5v
+          dGlmaWNhdGlvbj4KICAgICAgPG5vdGlmeVN1Y2Nlc3M+ZmFsc2U8L25vdGlmeVN1Y2Nlc3M+CiAg
+          ICAgIDxub3RpZnlBYm9ydGVkPmZhbHNlPC9ub3RpZnlBYm9ydGVkPgogICAgICA8bm90aWZ5Tm90
+          QnVpbHQ+ZmFsc2U8L25vdGlmeU5vdEJ1aWx0PgogICAgICA8bm90aWZ5VW5zdGFibGU+dHJ1ZTwv
+          bm90aWZ5VW5zdGFibGU+CiAgICAgIDxub3RpZnlSZWdyZXNzaW9uPmZhbHNlPC9ub3RpZnlSZWdy
+          ZXNzaW9uPgogICAgICA8bm90aWZ5RmFpbHVyZT50cnVlPC9ub3RpZnlGYWlsdXJlPgogICAgICA8
+          bm90aWZ5QmFja1RvTm9ybWFsPmZhbHNlPC9ub3RpZnlCYWNrVG9Ob3JtYWw+CiAgICAgIDxub3Rp
+          ZnlSZXBlYXRlZEZhaWx1cmU+ZmFsc2U8L25vdGlmeVJlcGVhdGVkRmFpbHVyZT4KICAgICAgPGlu
+          Y2x1ZGVUZXN0U3VtbWFyeT5mYWxzZTwvaW5jbHVkZVRlc3RTdW1tYXJ5PgogICAgICA8aW5jbHVk
+          ZUZhaWxlZFRlc3RzPmZhbHNlPC9pbmNsdWRlRmFpbGVkVGVzdHM+CiAgICAgIDxjb21taXRJbmZv
+          Q2hvaWNlPkFVVEhPUlNfQU5EX1RJVExFUzwvY29tbWl0SW5mb0Nob2ljZT4KICAgICAgPGluY2x1
+          ZGVDdXN0b21NZXNzYWdlPnRydWU8L2luY2x1ZGVDdXN0b21NZXNzYWdlPgogICAgICA8Y3VzdG9t
+          TWVzc2FnZSAvPgogICAgICA8Y3VzdG9tTWVzc2FnZVN1Y2Nlc3MgLz4KICAgICAgPGN1c3RvbU1l
+          c3NhZ2VBYm9ydGVkIC8+CiAgICAgIDxjdXN0b21NZXNzYWdlTm90QnVpbHQgLz4KICAgICAgPGN1
+          c3RvbU1lc3NhZ2VVbnN0YWJsZSAvPgogICAgICA8Y3VzdG9tTWVzc2FnZUZhaWx1cmUgLz4KICAg
+          IDwvamVua2lucy5wbHVnaW5zLnNsYWNrLlNsYWNrTm90aWZpZXI+CiAg
+    triggers: []
+    wrappers: []
