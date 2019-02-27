@@ -1,0 +1,192 @@
+- job:
+    axes:
+    - axis:
+        name: label_exp
+        type: label-expression
+        values:
+        - min-centos-6-x64
+        - min-centos-7-x64
+        - min-bionic-x64
+        - min-cosmic-x64
+        - min-jessie-x64
+        - min-stretch-x64
+    block-downstream: false
+    block-upstream: false
+    builders:
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi5wbHVnaW5zLnRlbXBsYXRlcHJvamVjdC5Qcm94eUJ1aWxkZXIgcGx1Z2luPSJ0ZW1w
+          bGF0ZS1wcm9qZWN0QDEuNS4yIj4KICAgICAgPHByb2plY3ROYW1lPm11bHRpLXBzbWRiLTQuMC10
+          ZW1wbGF0ZTwvcHJvamVjdE5hbWU+CiAgICA8L2h1ZHNvbi5wbHVnaW5zLnRlbXBsYXRlcHJvamVj
+          dC5Qcm94eUJ1aWxkZXI+CiAg
+    concurrent: true
+    disabled: false
+    execution-strategy:
+      sequential: false
+    name: multi-psmdb-4.0-param
+    parameters:
+    - string:
+        default: ''
+        description: Build description which will be visible in build history on the
+          right side.
+        name: DESCRIPTION
+        trim: 'false'
+    - string:
+        default: https://github.com/percona/percona-server-mongodb.git
+        description: ''
+        name: PSM_REPO
+        trim: 'false'
+    - string:
+        default: v4.0
+        description: ''
+        name: PSM_BRANCH
+        trim: 'false'
+    - string:
+        default: auto
+        description: <h3>Number of parallel jobs for running tests, auto=number of
+          cores or specify exact number like 8,4,2,1</h3>
+        name: JOBS
+        trim: 'false'
+    - string:
+        default: resmoke_psmdb_4.0_big
+        description: |-
+          <h3>AVAILABLE OPTIONS:<br>
+          core_all_engines<br>
+          core_default<br>
+          resmoke_psmdb_4.0_big<br>
+          resmoke_psmdb_4.0_big_nommap<br>
+          resmoke_psmdb_4.0_medium<br>
+          This is test suite from psmdb-misc-scripts/suite_sets and needs to be without .txt extension</h3>
+        name: SUITE
+        trim: 'false'
+    - text:
+        default: ''
+        description: |-
+          <h3>With this you can specify a custom suite content which will be generated and passed to resmoke script.<br>
+          EXAMPLE CONTENT:<br>
+          aggregation|mmapv1|wiredTiger|inMemory<br>
+          core|mmapv1|wiredTiger|inMemory<br>
+          sharding --excludeWithAnyTags=requires_persistence,requires_journaling|inMemory</h3>
+        name: CUSTOM_SUITE
+        trim: 'false'
+    - string:
+        default: '1'
+        description: Number of trials to execute - makes sense if you wish to execute
+          1 suite some number of times because of flapping tests.
+        name: NUM_TRIALS
+        trim: 'false'
+    - bool:
+        default: false
+        description: If this is enabled the binaries will be built with ASAN instrumentation
+          and then tests run.
+        name: ASAN_RUN
+    - string:
+        default: https://github.com/Percona-QA/psmdb-misc-scripts.git
+        description: Use this if you wish to use another psmdb-misc-repo for testing
+          purposes.
+        name: MISC_SCRIPTS_REPO
+        trim: 'false'
+    - bool:
+        default: false
+        description: Don't build the binaries from github but copy the latest binaries
+          from the release job and run tests on them
+        name: RELEASE_TEST
+    - bool:
+        default: true
+        description: This enables killer.sh to monitor and kill stalled tests
+        name: ENABLE_KILLER
+    - string:
+        default: master
+        description: Set to whatever needs to be checked out from psmdb-misc-scripts
+          repo
+        name: MISC_SCRIPTS_TAG
+        trim: 'false'
+    project-type: matrix
+    properties:
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi5wbHVnaW5zLmJ1aWxkYmxvY2tlci5CdWlsZEJsb2NrZXJQcm9wZXJ0eSBwbHVnaW49
+          ImJ1aWxkLWJsb2NrZXItcGx1Z2luQDEuNy4zIj4KICAgICAgPHVzZUJ1aWxkQmxvY2tlcj5mYWxz
+          ZTwvdXNlQnVpbGRCbG9ja2VyPgogICAgICA8YmxvY2tMZXZlbD5HTE9CQUw8L2Jsb2NrTGV2ZWw+
+          CiAgICAgIDxzY2FuUXVldWVGb3I+RElTQUJMRUQ8L3NjYW5RdWV1ZUZvcj4KICAgICAgPGJsb2Nr
+          aW5nSm9icyAvPgogICAgPC9odWRzb24ucGx1Z2lucy5idWlsZGJsb2NrZXIuQnVpbGRCbG9ja2Vy
+          UHJvcGVydHk+CiAgICA=
+    - build-discarder:
+        artifact-days-to-keep: -1
+        artifact-num-to-keep: -1
+        days-to-keep: -1
+        num-to-keep: 30
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi5wbHVnaW5zLmRpc2tfX3VzYWdlLkRpc2tVc2FnZVByb3BlcnR5IHBsdWdpbj0iZGlz
+          ay11c2FnZUAwLjI4IiAvPgogICAg
+    publishers:
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi5wbHVnaW5zLndhcm5pbmdzLldhcm5pbmdzUHVibGlzaGVyIHBsdWdpbj0id2Fybmlu
+          Z3NANC42OCI+CiAgICAgIDxoZWFsdGh5IC8+CiAgICAgIDx1bkhlYWx0aHkgLz4KICAgICAgPHRo
+          cmVzaG9sZExpbWl0PmxvdzwvdGhyZXNob2xkTGltaXQ+CiAgICAgIDxwbHVnaW5OYW1lPltXQVJO
+          SU5HU10gPC9wbHVnaW5OYW1lPgogICAgICA8ZGVmYXVsdEVuY29kaW5nIC8+CiAgICAgIDxjYW5S
+          dW5PbkZhaWxlZD5mYWxzZTwvY2FuUnVuT25GYWlsZWQ+CiAgICAgIDx1c2VQcmV2aW91c0J1aWxk
+          QXNSZWZlcmVuY2U+ZmFsc2U8L3VzZVByZXZpb3VzQnVpbGRBc1JlZmVyZW5jZT4KICAgICAgPHVz
+          ZVN0YWJsZUJ1aWxkQXNSZWZlcmVuY2U+ZmFsc2U8L3VzZVN0YWJsZUJ1aWxkQXNSZWZlcmVuY2U+
+          CiAgICAgIDx1c2VEZWx0YVZhbHVlcz5mYWxzZTwvdXNlRGVsdGFWYWx1ZXM+CiAgICAgIDx0aHJl
+          c2hvbGRzIHBsdWdpbj0iYW5hbHlzaXMtY29yZUAxLjk1Ij4KICAgICAgICA8dW5zdGFibGVUb3Rh
+          bEFsbCAvPgogICAgICAgIDx1bnN0YWJsZVRvdGFsSGlnaCAvPgogICAgICAgIDx1bnN0YWJsZVRv
+          dGFsTm9ybWFsIC8+CiAgICAgICAgPHVuc3RhYmxlVG90YWxMb3cgLz4KICAgICAgICA8dW5zdGFi
+          bGVOZXdBbGwgLz4KICAgICAgICA8dW5zdGFibGVOZXdIaWdoIC8+CiAgICAgICAgPHVuc3RhYmxl
+          TmV3Tm9ybWFsIC8+CiAgICAgICAgPHVuc3RhYmxlTmV3TG93IC8+CiAgICAgICAgPGZhaWxlZFRv
+          dGFsQWxsIC8+CiAgICAgICAgPGZhaWxlZFRvdGFsSGlnaCAvPgogICAgICAgIDxmYWlsZWRUb3Rh
+          bE5vcm1hbCAvPgogICAgICAgIDxmYWlsZWRUb3RhbExvdyAvPgogICAgICAgIDxmYWlsZWROZXdB
+          bGwgLz4KICAgICAgICA8ZmFpbGVkTmV3SGlnaCAvPgogICAgICAgIDxmYWlsZWROZXdOb3JtYWwg
+          Lz4KICAgICAgICA8ZmFpbGVkTmV3TG93IC8+CiAgICAgIDwvdGhyZXNob2xkcz4KICAgICAgPHNo
+          b3VsZERldGVjdE1vZHVsZXM+ZmFsc2U8L3Nob3VsZERldGVjdE1vZHVsZXM+CiAgICAgIDxkb250
+          Q29tcHV0ZU5ldz50cnVlPC9kb250Q29tcHV0ZU5ldz4KICAgICAgPGRvTm90UmVzb2x2ZVJlbGF0
+          aXZlUGF0aHM+dHJ1ZTwvZG9Ob3RSZXNvbHZlUmVsYXRpdmVQYXRocz4KICAgICAgPGluY2x1ZGVQ
+          YXR0ZXJuIC8+CiAgICAgIDxleGNsdWRlUGF0dGVybiAvPgogICAgICA8bWVzc2FnZXNQYXR0ZXJu
+          IC8+CiAgICAgIDxjYXRlZ29yaWVzUGF0dGVybiAvPgogICAgICA8cGFyc2VyQ29uZmlndXJhdGlv
+          bnMgLz4KICAgICAgPGNvbnNvbGVQYXJzZXJzPgogICAgICAgIDxodWRzb24ucGx1Z2lucy53YXJu
+          aW5ncy5Db25zb2xlUGFyc2VyPgogICAgICAgICAgPHBhcnNlck5hbWU+R05VIE1ha2UgKyBHTlUg
+          QyBDb21waWxlciAoZ2NjKTwvcGFyc2VyTmFtZT4KICAgICAgICA8L2h1ZHNvbi5wbHVnaW5zLndh
+          cm5pbmdzLkNvbnNvbGVQYXJzZXI+CiAgICAgIDwvY29uc29sZVBhcnNlcnM+CiAgICA8L2h1ZHNv
+          bi5wbHVnaW5zLndhcm5pbmdzLldhcm5pbmdzUHVibGlzaGVyPgogICAg
+    - archive:
+        allow-empty: false
+        artifacts: percona-server-mongodb/resmoke_summary*.log, percona-server-mongodb/killer.log,
+          percona-server-mongodb/resmoke_logs.tar.gz, percona-server-mongodb/perf.json,
+          percona-server-mongodb/perf_sharding.json
+        case-sensitive: true
+        default-excludes: true
+        fingerprint: false
+        only-if-success: false
+    - raw:
+        xml: !!binary |
+          PGh1ZHNvbi50YXNrcy5qdW5pdC5KVW5pdFJlc3VsdEFyY2hpdmVyIHBsdWdpbj0ianVuaXRAMS4y
+          Ni4xIj4KICAgICAgPHRlc3RSZXN1bHRzPnBlcmNvbmEtc2VydmVyLW1vbmdvZGIvanVuaXQueG1s
+          PC90ZXN0UmVzdWx0cz4KICAgICAgPGtlZXBMb25nU3RkaW8+ZmFsc2U8L2tlZXBMb25nU3RkaW8+
+          CiAgICAgIDxoZWFsdGhTY2FsZUZhY3Rvcj4xLjA8L2hlYWx0aFNjYWxlRmFjdG9yPgogICAgICA8
+          YWxsb3dFbXB0eVJlc3VsdHM+ZmFsc2U8L2FsbG93RW1wdHlSZXN1bHRzPgogICAgPC9odWRzb24u
+          dGFza3MuanVuaXQuSlVuaXRSZXN1bHRBcmNoaXZlcj4KICAgIA==
+    - workspace-cleanup:
+        clean-if:
+        - success: true
+        - unstable: true
+        - failure: true
+        - not-built: true
+        - aborted: true
+        clean-parent: false
+        dirmatch: false
+        exclude: []
+        fail-build: true
+        include: []
+    scm:
+    - git:
+        basedir: percona-server-mongodb
+        branches:
+        - ${PSM_BRANCH}
+        url: ${PSM_REPO}
+        wipe-workspace: true
+    triggers: []
+    wrappers:
+    - timestamps
+    - inject: {}
