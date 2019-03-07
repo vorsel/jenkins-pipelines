@@ -22,7 +22,7 @@ pipeline {
         disableConcurrentBuilds()
     }
     triggers {
-        upstream upstreamProjects: 'pmm-submodules-rewind', threshold: hudson.model.Result.SUCCESS
+        upstream upstreamProjects: 'pmm-submodules-rewind,pmm2-submodules-rewind', threshold: hudson.model.Result.SUCCESS
     }
     stages {
         stage('Prepare') {
@@ -33,16 +33,7 @@ pipeline {
                 sh '''
                     git reset --hard
                     sudo git clean -xdf
-                    git submodule update --init --jobs 10 \
-                        sources/pmm-client/src/github.com/percona/pmm-client \
-                        sources/mongodb_exporter/src/github.com/percona/mongodb_exporter \
-                        sources/postgres_exporter/src/github.com/percona/postgres_exporter \
-                        sources/mysqld_exporter/src/github.com/percona/mysqld_exporter \
-                        sources/proxysql_exporter/src/github.com/percona/proxysql_exporter \
-                        sources/qan-agent/src/github.com/percona/qan-agent \
-                        sources/node_exporter/src/github.com/prometheus/node_exporter \
-                        sources/pid-watchdog/src/github.com/percona/pid-watchdog \
-                        sources/percona-toolkit/src/github.com/percona/percona-toolkit
+                    git submodule update --init
 
                     git rev-parse --short HEAD > shortCommit
                     echo "UPLOAD/${DESTINATION}/${JOB_NAME}/pmm/\$(cat VERSION)/${GIT_BRANCH}/\$(cat shortCommit)/${BUILD_NUMBER}" > uploadPath
@@ -109,7 +100,7 @@ pipeline {
         stage('Build client source rpm') {
             steps {
                 sh 'sg docker -c "./build/bin/build-client-srpm centos:6"'
-                stash includes: 'results/srpm/pmm-client-*.src.rpm', name: 'rpms'
+                stash includes: 'results/srpm/pmm*-client-*.src.rpm', name: 'rpms'
                 uploadRPM()
             }
         }
@@ -121,7 +112,7 @@ pipeline {
                         ./build/bin/build-client-rpm centos:7
                     "
                 '''
-                stash includes: 'results/rpm/pmm-client-*.rpm', name: 'rpms'
+                stash includes: 'results/rpm/pmm*-client-*.rpm', name: 'rpms'
                 uploadRPM()
             }
         }
