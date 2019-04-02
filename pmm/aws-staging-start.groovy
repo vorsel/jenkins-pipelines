@@ -223,8 +223,7 @@ pipeline {
                             set -o xtrace
 
                             sudo yum -y update --security
-                            sudo yum -y install https://repo.percona.com/yum/percona-release-0.1-7.noarch.rpm
-                            sudo rpm --import /etc/pki/rpm-gpg/PERCONA-PACKAGING-KEY
+                            sudo yum install https://repo.percona.com/yum/percona-release-latest.noarch.rpm
                             sudo yum -y install svn docker sysbench mysql
                             sudo yum -y install bats --enablerepo=epel
                             sudo usermod -aG docker ec2-user
@@ -287,7 +286,6 @@ pipeline {
                                 ${DOCKER_VERSION}
 
                             if [[ \$CLIENT_VERSION = dev-latest ]]; then
-                                sudo yum install https://repo.percona.com/yum/percona-release-latest.noarch.rpm
                                 sudo percona-release enable original testing 
                                 sudo yum -y install pmm2-client
                             else
