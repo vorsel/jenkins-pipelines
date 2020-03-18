@@ -16,56 +16,86 @@ void popArtifactFile(String FILE_NAME) {
         """
     }
 }
+
+TestsReport = '<testsuite  name=\\"PXC\\">\n'
+testsReportMap = [:]
+void makeReport() {
+    for ( test in testsReportMap ) {
+        TestsReport = TestsReport + "<testcase name=\\\"${test.key}\\\"><${test.value}/></testcase>\n"
+    }
+    TestsReport = TestsReport + '</testsuite>\n'
+}
+
 void runTest(String TEST_NAME) {
-    GIT_SHORT_COMMIT = sh(script: 'git -C source rev-parse --short HEAD', , returnStdout: true).trim()
-    VERSION = "${env.GIT_BRANCH}-$GIT_SHORT_COMMIT"
-    FILE_NAME = "$VERSION-$TEST_NAME-minikube"
+    try {
+        echo "The $TEST_NAME test was started!"
 
-    popArtifactFile("$FILE_NAME")
-    sh """
-        if [ -f "FILE_NAME" ]; then
-            echo Skip $TEST_NAME test
-        else
-            cd ./source
-            if [ -n "${PXC_OPERATOR_IMAGE}" ]; then
-                export IMAGE=${PXC_OPERATOR_IMAGE}
+        GIT_SHORT_COMMIT = sh(script: 'git -C source rev-parse --short HEAD', , returnStdout: true).trim()
+        VERSION = "${env.GIT_BRANCH}-$GIT_SHORT_COMMIT"
+        FILE_NAME = "$VERSION-$TEST_NAME-minikube-${env.KUBER_VERSION}"
+        testsReportMap[TEST_NAME] = 'failure'
+
+        popArtifactFile("$FILE_NAME")
+        sh """
+            if [ -f "FILE_NAME" ]; then
+                echo Skip $TEST_NAME test
             else
-                export IMAGE=perconalab/percona-xtradb-cluster-operator:${env.GIT_BRANCH}
-            fi
+                cd ./source
+                if [ -n "${PXC_OPERATOR_IMAGE}" ]; then
+                    export IMAGE=${PXC_OPERATOR_IMAGE}
+                else
+                    export IMAGE=perconalab/percona-xtradb-cluster-operator:${env.GIT_BRANCH}
+                fi
 
-            if [ -n "${IMAGE_PXC}" ]; then
-                export IMAGE_PXC=${IMAGE_PXC}
-            fi
+                if [ -n "${IMAGE_PXC}" ]; then
+                    export IMAGE_PXC=${IMAGE_PXC}
+                fi
 
-            if [ -n "${IMAGE_PROXY}" ]; then
-                export IMAGE_PROXY=${IMAGE_PROXY}
-            fi
+                if [ -n "${IMAGE_PROXY}" ]; then
+                    export IMAGE_PROXY=${IMAGE_PROXY}
+                fi
 
-            if [ -n "${IMAGE_BACKUP}" ]; then
-                export IMAGE_BACKUP=${IMAGE_BACKUP}
-            fi
+                if [ -n "${IMAGE_BACKUP}" ]; then
+                    export IMAGE_BACKUP=${IMAGE_BACKUP}
+                fi
 
-            if [ -n "${IMAGE_PMM}" ]; then
-                export IMAGE_PMM=${IMAGE_PMM}
-            fi
+                if [ -n "${IMAGE_PMM}" ]; then
+                    export IMAGE_PMM=${IMAGE_PMM}
+                fi
 
-            ./e2e-tests/$TEST_NAME/run
-            touch $FILE_NAME
-        fi
-    """
-    pushArtifactFile("$FILE_NAME")
+                ./e2e-tests/$TEST_NAME/run
+                touch $FILE_NAME
+            fi
+        """
+        pushArtifactFile("$FILE_NAME")
+        testsReportMap[TEST_NAME] = 'passed'
+    }
+    catch (exc) {
+        currentBuild.result = 'FAILURE'
+    }
 
     sh """
         rm -rf $FILE_NAME
     """
+
+    echo "The $TEST_NAME test was finished!"
 }
 void installRpms() {
     sh '''
-        wget https://repo.percona.com/apt/percona-release_latest.$(lsb_release -sc)_all.deb
-        sudo dpkg -i percona-release_latest.$(lsb_release -sc)_all.deb
-        sudo percona-release setup ps80
-        sudo apt-get update
-        sudo apt-get install -y percona-xtrabackup-80 jq
+        cat <<EOF > /tmp/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+EOF
+        sudo mv /tmp/kubernetes.repo /etc/yum.repos.d/
+
+        sudo yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm || true
+        sudo percona-release enable-only tools
+        sudo yum install -y percona-xtrabackup-80 jq kubectl || true
     '''
 }
 pipeline {
@@ -98,13 +128,17 @@ pipeline {
             defaultValue: '',
             description: 'PMM image: perconalab/percona-server-mongodb-operator:master-pmm',
             name: 'IMAGE_PMM')
+        string(
+            defaultValue: 'v1.14.8',
+            description: 'Kubernetes Version',
+            name: 'KUBER_VERSION',
+            trim: true)
     }
     agent {
          label 'micro-amazon' 
     }
     options {
         skipDefaultCheckout()
-        disableConcurrentBuilds()
     }
 
     stages {
@@ -150,21 +184,28 @@ pipeline {
             }
         }
         stage('Tests') {
-            agent { label 'virtualbox' }
+            agent { label 'docker-32gb' }
                 steps {
+
                     sh '''
+                        if [ ! -d $HOME/google-cloud-sdk/bin ]; then
+                            rm -rf $HOME/google-cloud-sdk
+                            curl https://sdk.cloud.google.com | bash
+                        fi
+
+                        source $HOME/google-cloud-sdk/path.bash.inc
+                        gcloud components install alpha
+                        gcloud components install kubectl
+
                         curl -s https://storage.googleapis.com/kubernetes-helm/helm-v2.12.1-linux-amd64.tar.gz \
                             | sudo tar -C /usr/local/bin --strip-components 1 -zvxpf -
-
-                        echo 'deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main' | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
-                        curl https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-                            | sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
-                        sudo apt-get update
-                        sudo apt-get -y install kubectl google-cloud-sdk
-
                         sudo curl -Lo /usr/local/bin/minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
                         sudo chmod +x /usr/local/bin/minikube
-                        minikube start --vm-driver=none --dns-domain=percona.com --memory=4096 --cpus=3 --kubernetes-version v1.12.8
+                        export CHANGE_MINIKUBE_NONE_USER=true
+                        sudo -E /usr/local/bin/minikube start --vm-driver=none --kubernetes-version ${KUBER_VERSION}
+                        sudo mv /root/.kube /root/.minikube $HOME
+                        sudo chown -R $USER $HOME/.kube $HOME/.minikube
+                        sed -i s:/root:$HOME:g $HOME/.kube/config
                     '''
                     
                     unstash "sourceFILES"
@@ -177,6 +218,16 @@ pipeline {
                     runTest('upgrade-consistency')
                     runTest('self-healing-advanced')
                     runTest('operator-self-healing')
+            }
+        }
+        stage('Make report') {
+            steps {
+                makeReport()
+                sh """
+                    echo "${TestsReport}" > TestsReport.xml
+                """
+                step([$class: 'JUnitResultArchiver', testResults: '*.xml', healthScaleFactor: 1.0])
+                archiveArtifacts '*.xml'
             }
         }
     }
