@@ -111,7 +111,6 @@
         do-not-fingerprint: true
     - shell: |
         echo "${TRIGGERED_BUILD_NUMBERS_pxc_8_0_pipeline}" > PIPELINE_BUILD_NUMBER
-        gunzip build.log.gz
     publishers:
     - junit:
         results: "**/*.xml"
