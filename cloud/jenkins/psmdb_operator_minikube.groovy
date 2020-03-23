@@ -202,7 +202,7 @@ pipeline {
                     '''
                     
                     unstash "sourceFILES"
-                    withCredentials([file(credentialsId: 'cloud-secret-file', variable: 'CLOUD_SECRET_FILE')]) {
+                    withCredentials([file(credentialsId: 'cloud-secret-file-test', variable: 'CLOUD_SECRET_FILE')]) {
                         sh '''
                            cp $CLOUD_SECRET_FILE ./source/e2e-tests/conf/cloud-secret.yml
                         '''
@@ -210,17 +210,7 @@ pipeline {
 
                     installRpms()
                     runTest('init-deploy')
-                    runTest('limits')
-                    runTest('scaling')
-                    runTest('storage')
-                    runTest('monitoring')
-                    runTest('arbiter')
-                    runTest('service-per-pod')
-                    runTest('self-healing')
-                    runTest('operator-self-healing')
                     runTest('demand-backup')
-                    runTest('liveness')
-                    runTest('security-context')
             }
             post {
                 always {
