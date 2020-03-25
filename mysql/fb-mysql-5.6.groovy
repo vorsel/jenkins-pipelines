@@ -14,7 +14,7 @@ void build(String CMAKE_BUILD_TYPE) {
                 cmake .. \
                     -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
                     -DWITH_SSL=system \
-                    -DWITH_ZLIB=bundled \
+                    -DWITH_ZLIB=system \
                     -DMYSQL_MAINTAINER_MODE=0 \
                     -DENABLED_LOCAL_INFILE=1 \
                     -DENABLE_DTRACE=0 \
@@ -171,7 +171,7 @@ pipeline {
         stage('Prepare deps') {
             steps {
                 sh '''
-                    sudo -E yum -y install awscli wget cmake gcc-c++ boost-devel openssl-devel ncurses-devel readline-devel numactl-devel bison binutils MySQL-python perl-DBD-MySQL perl-XML-Simple
+                    sudo -E yum -y install awscli wget cmake gcc-c++ boost-devel openssl-devel ncurses-devel readline-devel numactl-devel bison binutils MySQL-python perl-DBD-MySQL perl-XML-Simple lz4-devel
 
                     wget https://github.com/facebook/zstd/archive/v${ZSTD_VERSION}.tar.gz
                     tar zxpf v${ZSTD_VERSION}.tar.gz
