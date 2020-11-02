@@ -1,5 +1,5 @@
 - job:
-    name: pbm-autobuild-TEST
+    name: get-pbm-debs-TEST
     project-type: pipeline
     description: |
         Do not edit this job through the web!
@@ -12,6 +12,4 @@
             - 'PBM_test'
             wipe-workspace: false
       lightweight-checkout: true
-      script-path: pbm/jenkins/get-pbm-branches.groovy
-    triggers:
-      - timed: "H/15 * * * *"
+      script-path: pbm/jenkins/get-pbm-debs-test.groovy
