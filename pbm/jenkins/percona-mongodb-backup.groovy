@@ -1,6 +1,6 @@
-library changelog: false, identifier: 'lib@master', retriever: modernSCM([
+library changelog: false, identifier: 'lib@PBM-350_add_notifications', retriever: modernSCM([
     $class: 'GitSCMSource',
-    remote: 'https://github.com/Percona-Lab/jenkins-pipelines.git'
+    remote: 'https://github.com/vorsel/jenkins-pipelines.git'
 ]) _
 
 void buildStage(String DOCKER_OS, String STAGE_PARAM) {
@@ -70,6 +70,7 @@ pipeline {
     stages {
         stage('Create PBM source tarball') {
             steps {
+                slackNotify("#releases", "#00FF00", "[${JOB_NAME}]: starting build for ${GIT_BRANCH}")
                 cleanUpWS()
                 buildStage("centos:6", "--get_sources=1")
                 sh '''
@@ -277,6 +278,14 @@ pipeline {
 
     }
     post {
+        success {
+            slackNotify("#releases", "#00FF00", "[${JOB_NAME}]: build has been finished successfully for ${GIT_BRANCH}")
+            deleteDir()
+        }
+        failure {
+            slackNotify("#releases", "#FF0000", "[${JOB_NAME}]: build failed for ${GIT_BRANCH}")
+            deleteDir()
+        }
         always {
             sh '''
                 sudo rm -rf ./*
