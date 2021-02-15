@@ -1,0 +1,15 @@
+- job:
+    name: test-groovy
+    project-type: pipeline
+    description: |
+        Do not edit this job through the web!
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/vorsel/jenkins-pipelines.git
+            branches:
+            - 'test'
+            wipe-workspace: false
+      lightweight-checkout: true
+      script-path: pxc/jenkins/test.groovy
+
