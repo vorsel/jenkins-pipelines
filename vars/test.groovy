@@ -24,6 +24,7 @@ def call(String REPO_NAME, String DESTINATION) {
                                  echo \${REPOPUSH_ARGS}
                                 done
                             done
+                        date +%s > /srv/repo-copy/wiggin_test
                     '
                 """
             }
