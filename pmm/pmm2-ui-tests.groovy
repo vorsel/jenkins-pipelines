@@ -3,60 +3,15 @@ library changelog: false, identifier: 'lib@master', retriever: modernSCM([
     remote: 'https://github.com/Percona-Lab/jenkins-pipelines.git'
 ]) _
 
-void runStagingServer(String DOCKER_VERSION, CLIENT_VERSION, CLIENTS, CLIENT_INSTANCE, SERVER_IP) {
-    stagingJob = build job: 'aws-staging-start', parameters: [
-        string(name: 'DOCKER_VERSION', value: DOCKER_VERSION),
-        string(name: 'CLIENT_VERSION', value: CLIENT_VERSION),
-        string(name: 'CLIENTS', value: CLIENTS),
-        string(name: 'CLIENT_INSTANCE', value: CLIENT_INSTANCE),
-        string(name: 'QUERY_SOURCE', value: 'slowlog'),
-        string(name: 'DOCKER_ENV_VARIABLE', value: '-e PMM_DEBUG=1 -e ENABLE_ALERTING=1 -e PERCONA_TEST_SAAS_HOST=check-dev.percona.com:443 -e PERCONA_TEST_CHECKS_PUBLIC_KEY=RWTg+ZmCCjt7O8eWeAmTLAqW+1ozUbpRSKSwNTmO+exlS5KEIPYWuYdX -e PERCONA_TEST_CHECKS_INTERVAL=10s -e PERCONA_TEST_DBAAS=1'),
-        string(name: 'SERVER_IP', value: SERVER_IP),
+void runClusterStaging(String PMM_QA_GIT_BRANCH) {
+    clusterJob = build job: 'kubernetes-cluster-staging', parameters: [
         string(name: 'NOTIFY', value: 'false'),
+        string(name: 'PMM_QA_GIT_BRANCH', value: PMM_QA_GIT_BRANCH),
         string(name: 'DAYS', value: '1')
     ]
-    env.VM_IP = stagingJob.buildVariables.IP
-    env.SERVER_IP = env.VM_IP
-    env.VM_NAME = stagingJob.buildVariables.VM_NAME
-    def clientInstance = "yes";
-    if ( CLIENT_INSTANCE == clientInstance ) {
-        env.PMM_URL = "http://admin:admin@${SERVER_IP}"
-        env.PMM_UI_URL = "http://${SERVER_IP}"
-    }
-    else
-    {
-        env.PMM_URL = "http://admin:admin@${VM_IP}"
-        env.PMM_UI_URL = "http://${VM_IP}"
-    }
+    env.CLUSTER_IP = clusterJob.buildVariables.IP
+    env.KUBECONFIG = clusterJob.buildVariables.KUBECONFIG
 }
-
-void runStagingClient(String DOCKER_VERSION, CLIENT_VERSION, CLIENTS, CLIENT_INSTANCE, SERVER_IP) {
-    stagingJob = build job: 'aws-staging-start', parameters: [
-        string(name: 'DOCKER_VERSION', value: DOCKER_VERSION),
-        string(name: 'CLIENT_VERSION', value: CLIENT_VERSION),
-        string(name: 'CLIENTS', value: CLIENTS),
-        string(name: 'CLIENT_INSTANCE', value: CLIENT_INSTANCE),
-        string(name: 'QUERY_SOURCE', value: 'slowlog'),
-        string(name: 'SERVER_IP', value: SERVER_IP),
-        string(name: 'NOTIFY', value: 'false'),
-        string(name: 'DAYS', value: '1')
-    ]
-    env.VM_CLIENT_IP = stagingJob.buildVariables.IP
-    env.VM_CLIENT_NAME = stagingJob.buildVariables.VM_NAME
-    env.VM_IP = stagingJob.buildVariables.SERVER_IP
-    def clientInstance = "yes";
-    if ( CLIENT_INSTANCE == clientInstance ) {
-        env.PMM_URL = "http://admin:admin@${SERVER_IP}"
-        env.PMM_UI_URL = "http://${SERVER_IP}"
-    }
-    else
-    {
-        env.PMM_URL = "http://admin:admin@${VM_IP}"
-        env.PMM_UI_URL = "http://${VM_IP}"
-    }
-}
-
-
 
 void destroyStaging(IP) {
     build job: 'aws-staging-stop', parameters: [
@@ -68,18 +23,30 @@ void uploadAllureArtifacts() {
     withCredentials([sshUserPrivateKey(credentialsId: 'aws-jenkins', keyFileVariable: 'KEY_PATH', passphraseVariable: '', usernameVariable: 'USER')]) {
         sh """
             scp -r -i "${KEY_PATH}" -o ConnectTimeout=1 -o StrictHostKeyChecking=no \
-                pmm-app/tests/output/allure aws-jenkins@${MONITORING_HOST}:/home/aws-jenkins/allure-reports
+                tests/output/allure aws-jenkins@${MONITORING_HOST}:/home/aws-jenkins/allure-reports
         """
     }
 }
 pipeline {
     agent {
-        label 'large-amazon'
+        label 'docker'
     }
     environment {
+        AZURE_CLIENT_ID=credentials('AZURE_CLIENT_ID');
+        AZURE_CLIENT_SECRET=credentials('AZURE_CLIENT_SECRET');
+        AZURE_MYSQL_HOST=credentials('AZURE_MYSQL_HOST');
+        AZURE_MYSQL_PASS=credentials('AZURE_MYSQL_PASS');
+        AZURE_MYSQL_USER=credentials('AZURE_MYSQL_USER');
+        AZURE_POSTGRES_HOST=credentials('AZURE_POSTGRES_HOST');
+        AZURE_POSTGRES_PASS=credentials('AZURE_POSTGRES_PASS');
+        AZURE_POSTGRES_USER=credentials('AZURE_POSTGRES_USER');
+        AZURE_SUBSCRIPTION_ID=credentials('AZURE_SUBSCRIPTION_ID');
+        AZURE_TENNANT_ID=credentials('AZURE_TENNANT_ID');
         REMOTE_AWS_MYSQL_USER=credentials('pmm-dev-mysql-remote-user')
         REMOTE_AWS_MYSQL_PASSWORD=credentials('pmm-dev-remote-password')
         REMOTE_AWS_MYSQL57_HOST=credentials('pmm-dev-mysql57-remote-host')
+        REMOTE_AWS_POSTGRES12_USER=credentials('pmm-qa-postgres-12-user')
+        REMOTE_AWS_POSTGRES12_PASSWORD=credentials('pmm-qa-postgres-12-password')
         REMOTE_MYSQL_HOST=credentials('mysql-remote-host')
         REMOTE_MYSQL_USER=credentials('mysql-remote-user')
         REMOTE_MYSQL_PASSWORD=credentials('mysql-remote-password')
@@ -97,11 +64,15 @@ pipeline {
         INFLUXDB_USER=credentials('influxdb-user')
         INFLUXDB_USER_PASSWORD=credentials('influxdb-user-password')
         MONITORING_HOST=credentials('monitoring-host')
+        EXTERNAL_EXPORTER_PORT=credentials('external-exporter-port')
+        MAILOSAUR_API_KEY=credentials('MAILOSAUR_API_KEY')
+        MAILOSAUR_SERVER_ID=credentials('MAILOSAUR_SERVER_ID')
+        MAILOSAUR_SMTP_PASSWORD=credentials('MAILOSAUR_SMTP_PASSWORD')
     }
     parameters {
         string(
-            defaultValue: 'PMM-2.0',
-            description: 'Tag/Branch for grafana-dashboard repository',
+            defaultValue: 'main',
+            description: 'Tag/Branch for pmm-ui-tests repository',
             name: 'GIT_BRANCH')
         string(
             defaultValue: '',
@@ -121,16 +92,43 @@ pipeline {
             name: 'CLIENT_INSTANCE')
         choice(
             choices: ['no', 'yes'],
-            description: "Run AMI Setup Wizard for AMI UI tests",
-            name: 'AMI_TEST')
-        string(
-            defaultValue: '',
-            description: 'AMI Instance ID',
-            name: 'AMI_INSTANCE_ID')
+            description: "Run Tests for OVF supported Features",
+            name: 'OVF_TEST')
         string (
             defaultValue: '',
             description: 'Value for Server Public IP, to use this instance just as client',
             name: 'SERVER_IP')
+        string(
+            defaultValue: 'percona:5.7.30',
+            description: 'Percona Server Docker Container Image',
+            name: 'MYSQL_IMAGE')
+        string(
+            defaultValue: 'perconalab/percona-distribution-postgresql:13.2-2',
+            description: 'Postgresql Docker Container Image',
+            name: 'POSTGRES_IMAGE')
+        string(
+            defaultValue: 'percona/percona-server-mongodb:4.2.8',
+            description: 'Percona Server MongoDb Docker Container Image',
+            name: 'MONGO_IMAGE')
+        string(
+            defaultValue: 'master',
+            description: 'Tag/Branch for pmm-qa repository',
+            name: 'PMM_QA_GIT_BRANCH')
+        text(
+            defaultValue: '--addclient=haproxy,1 --addclient=ps,1',
+            description: '''
+            Configure PMM Clients
+            ms - MySQL (ex. --addclient=ms,1),
+            ps - Percona Server for MySQL (ex. --addclient=ps,1),
+            pxc - Percona XtraDB Cluster, --with-proxysql (to be used with proxysql only ex. --addclient=pxc,1 --with-proxysql),
+            md - MariaDB Server (ex. --addclient=md,1),
+            mo - Percona Server for MongoDB(ex. --addclient=mo,1),
+            modb - Official MongoDB version from MongoDB Inc (ex. --addclient=modb,1),
+            pgsql - Postgre SQL Server (ex. --addclient=pgsql,1)
+            pdpgsql - Percona Distribution for PostgreSQL (ex. --addclient=pdpgsql,1)
+            An example: --addclient=ps,1 --addclient=mo,1 --addclient=md,1 --addclient=pgsql,2 --addclient=modb,2
+            ''',
+            name: 'CLIENTS')
     }
     options {
         skipDefaultCheckout()
@@ -141,21 +139,26 @@ pipeline {
     stages {
         stage('Prepare') {
             steps {
-                // clean up workspace and fetch pmm-qa repository
+                // clean up workspace and fetch pmm-ui-tests repository
                 deleteDir()
-                git poll: false, branch: GIT_BRANCH, url: 'https://github.com/percona/grafana-dashboards.git'
+                git poll: false, branch: GIT_BRANCH, url: 'https://github.com/percona/pmm-ui-tests.git'
 
-                slackSend botUser: true, channel: '#pmm-ci', color: '#FFFF00', message: "[${JOB_NAME}]: build started - ${BUILD_URL}"
                 installDocker()
                 sh '''
+                    sudo curl -L https://github.com/docker/compose/releases/download/1.29.0/docker-compose-`uname -s`-`uname -m` | sudo tee /usr/bin/docker-compose > /dev/null
+                    sudo chmod +x /usr/bin/docker-compose
+                    docker-compose --version
                     sudo yum -y update --security
-                    sudo yum -y install jq svn
-                    sudo usermod -aG docker ec2-user
-                    sudo service docker start
-                    sudo curl -L https://github.com/docker/compose/releases/download/1.21.0/docker-compose-`uname -s`-`uname -m` | sudo tee /usr/local/bin/docker-compose > /dev/null
-                    sudo chmod +x /usr/local/bin/docker-compose
-                    sudo ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose
-                    sudo docker-compose --version
+                    sudo yum -y install php php-mysqlnd php-pdo jq svn bats
+                    sudo amazon-linux-extras install epel -y
+                    sudo mkdir -p /srv/pmm-qa || :
+                    pushd /srv/pmm-qa
+                        sudo git clone --single-branch --branch \${PMM_QA_GIT_BRANCH} https://github.com/percona/pmm-qa.git .
+                        sudo git checkout \${PMM_QA_GIT_COMMIT_HASH}
+                        sudo chmod 755 pmm-tests/install-google-chrome.sh
+                        bash ./pmm-tests/install-google-chrome.sh
+                    popd
+                    sudo ln -s /usr/bin/google-chrome-stable /usr/bin/chromium
                 '''
             }
         }
@@ -167,17 +170,63 @@ pipeline {
                 sh 'git checkout ' + env.GIT_COMMIT_HASH
             }
         }
-        stage('Start PMM Server Instance') {
-            when {
-                expression { env.CLIENT_INSTANCE == "no" }
-            }
-            steps {
-                runStagingServer(DOCKER_VERSION, CLIENT_VERSION, '', CLIENT_INSTANCE, SERVER_IP)
+        stage('Setup PMM Server and Kubernetes Cluster') {
+            parallel {
+                stage('Start PMM Cluster Staging Instance') {
+                    when {
+                        expression { env.OVF_TEST == "no" }
+                    }
+                    steps {
+                        runClusterStaging('master')
+                    }
+                }
+                stage('Setup Server Instance') {
+                    when {
+                        expression { env.CLIENT_INSTANCE == "no" }
+                    }
+                    steps {
+                        sh """
+                            mkdir testdata
+                            sudo MYSQL_IMAGE=\${MYSQL_IMAGE} MONGO_IMAGE=\${MONGO_IMAGE} POSTGRES_IMAGE=\${POSTGRES_IMAGE} PMM_SERVER_IMAGE=\${DOCKER_VERSION} docker-compose up -d
+                        """
+                        script {
+                            env.SERVER_IP = "127.0.0.1"
+                            env.PMM_UI_URL = "http://${env.SERVER_IP}/"
+                            env.PMM_URL = "http://admin:admin@${env.SERVER_IP}"
+                        }
+                    }
+                }
+                stage('Setup PMM Server Information') {
+                    when {
+                        expression { env.CLIENT_INSTANCE == "yes" }
+                    }
+                    steps {
+                        script {
+                            env.PMM_URL = "http://admin:admin@${SERVER_IP}"
+                            env.PMM_UI_URL = "http://${SERVER_IP}/"
+                        }
+                    }
+                }
             }
         }
-        stage('Start PMM Client Instance') {
+        stage('Setup Client for PMM-Server') {
             steps {
-                runStagingClient(DOCKER_VERSION, CLIENT_VERSION, '--addclient=ps,1 --addclient=mo,2 --with-replica --addclient=pgsql,1 --addclient=pxc,3 --with-proxysql --pmm2 --setup-alertmanager --add-annotation --setup-replication-ps-pmm2', 'yes', env.SERVER_IP)
+                setupPMMClient(env.SERVER_IP, CLIENT_VERSION, 'pmm2', 'yes', 'no', 'yes')
+                sh """
+                    set -o errexit
+                    set -o xtrace
+                    export PATH=\$PATH:/usr/sbin
+                    if [[ \$CLIENT_VERSION != dev-latest ]]; then
+                        export PATH="`pwd`/pmm2-client/bin:$PATH"
+                    fi
+                    bash /srv/pmm-qa/pmm-tests/pmm-framework.sh \
+                        --download \
+                        ${CLIENTS} \
+                        --pmm2 \
+                        --pmm2-server-ip=\$SERVER_IP
+                    sleep 10
+                    pmm-admin list
+                """
             }
         }
         stage('Setup') {
@@ -190,69 +239,52 @@ pipeline {
                 stage('Setup Node') {
                     steps {
                         sh """
-                            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.34.0/install.sh | bash
-                            . ~/.nvm/nvm.sh
-                            nvm install 12.14.1
-                            sudo rm -f /usr/bin/node
-                            sudo ln -s ~/.nvm/versions/node/v12.14.1/bin/node /usr/bin/node
-                            pushd pmm-app/
+                            curl --silent --location https://rpm.nodesource.com/setup_14.x | sudo bash -
+                            sudo yum -y install nodejs
+
                             npm install
                             node -v
                             npm -v
                             sudo yum install -y gettext
                             envsubst < env.list > env.generated.list
-                            popd
-                        """
-                    }
-                }
-                stage('Sleep') {
-                    steps {
-                        sh """
-                        curl --data '{"enable_stt": true, "enable_telemetry": true}' -u admin:admin -X POST ${PMM_UI_URL}/v1/Settings/Change
-                        curl -u admin:admin -X POST ${PMM_UI_URL}/v1/management/SecurityChecks/Start
-                        """
-                        sleep 300
-                        sh """
-                        curl --data '{"disable_stt": true, "enable_telemetry": true}' -u admin:admin -X POST ${PMM_UI_URL}/v1/Settings/Change
                         """
                     }
                 }
             }
         }
-        stage('Run AMI Setup & UI Tests') {
-            when {
-                expression { env.AMI_TEST == "yes" }
-            }
-            steps {
-                sauce('SauceLabsKey') {
-                    sauceconnect(options: '', sauceConnectPath: '') {
-                        sh """
-                            pushd pmm-app/
-                            sed -i 's+http://localhost/+${PMM_UI_URL}/+g' pr.codecept.js
-                            export PWD=\$(pwd);
-                            sudo docker run --env --net=host -v \$PWD:/tests codeception/codeceptjs:2.6.1 codeceptjs run-multiple parallel --debug --steps --reporter mocha-multi -c pr.codecept.js --grep @pmm-ami
-                            sudo docker run --env VM_IP=${VM_IP} --env AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} --env AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} --env-file env.generated.list --net=host -v \$PWD:/tests codeception/codeceptjs:2.6.1 codeceptjs run-multiple parallel --debug --steps --reporter mocha-multi -c pr.codecept.js --grep '(?=.*)^(?!.*@visual-test)'
-                            popd
-                        """
-                    }
-                }
-            }
-        }
-        stage('Run UI Tests') {
+        stage('Run UI Tests OVF') {
             options {
-                timeout(time: 15, unit: "MINUTES")
+                timeout(time: 35, unit: "MINUTES")
             }
             when {
-                expression { env.AMI_TEST == "no" }
+                expression { env.OVF_TEST == "yes" }
             }
             steps {
                 withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'PMM_AWS_DEV', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     sh """
-                        pushd pmm-app/
                         sed -i 's+http://localhost/+${PMM_UI_URL}/+g' pr.codecept.js
                         export PWD=\$(pwd);
-                        sudo docker run --env VM_IP=${VM_IP} --env AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} --env AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} --env-file env.generated.list --net=host -v \$PWD:/tests -v \$PWD/node_modules:/node_modules  codeception/codeceptjs:2.6.1 codeceptjs run-multiple parallel --debug --steps --reporter mocha-multi -c pr.codecept.js --grep '(?=.*)^(?!.*@not-ui-pipeline)^(?!.*@qan)'
-                        popd
+                        export CHROMIUM_PATH=/usr/bin/chromium
+                        ./node_modules/.bin/codeceptjs run --debug --steps --reporter mocha-multi -c pr.codecept.js --grep '(?=.*)^(?!.*@not-ui-pipeline)^(?!.*@qan)^(?!.*@dbaas)'
+                    """
+                }
+            }
+        }
+        stage('Run UI Tests Docker') {
+            options {
+                timeout(time: 35, unit: "MINUTES")
+            }
+            when {
+                expression { env.OVF_TEST == "no" }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'PMM_AWS_DEV', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                    sh """
+                        sed -i 's+http://localhost/+${PMM_UI_URL}/+g' pr.codecept.js
+                        export PWD=\$(pwd);
+                        export CHROMIUM_PATH=/usr/bin/chromium
+                        export kubeconfig_minikube="${KUBECONFIG}"
+                        ./node_modules/.bin/codeceptjs run-multiple parallel --debug --steps --reporter mocha-multi -c pr.codecept.js --grep '(?=.*)^(?!.*@not-ui-pipeline)^(?!.*@qan)^(?!.*@nightly)'
                     """
                 }
             }
@@ -262,10 +294,13 @@ pipeline {
         always {
             // stop staging
             sh '''
-                curl --insecure ${PMM_URL}/logs.zip --output logs.zip
-                sudo chmod 777 -R pmm-app/tests/output
-                ./pmm-app/node_modules/.bin/mochawesome-merge pmm-app/tests/output/parallel_chunk*/*.json > pmm-app/tests/output/combine_results.json
-                ./pmm-app/node_modules/.bin/marge pmm-app/tests/output/combine_results.json --reportDir pmm-app/tests/output/ --inline --cdn --charts
+                curl --insecure ${PMM_URL}/logs.zip --output logs.zip || true
+                ./node_modules/.bin/mochawesome-merge tests/output/parallel_chunk*/*.json > tests/output/combine_results.json || true
+                ./node_modules/.bin/marge tests/output/combine_results.json --reportDir tests/output/ --inline --cdn --charts || true
+                docker-compose down
+                docker rm -f $(sudo docker ps -a -q) || true
+                docker volume rm $(sudo docker volume ls -q) || true
+                sudo chown -R ec2-user:ec2-user . || true
             '''
             script {
                 if(env.VM_NAME)
@@ -276,28 +311,36 @@ pipeline {
                 {
                     destroyStaging(VM_CLIENT_NAME)
                 }
-            }
-            uploadAllureArtifacts()
-            script {
-                if (currentBuild.result == null || currentBuild.result == 'SUCCESS') {
-                    junit 'pmm-app/tests/output/parallel_chunk*/*.xml'
-                    publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: false, reportDir: 'pmm-app/tests/output/', reportFiles: 'combine_results.html', reportName: 'HTML Report', reportTitles: ''])
-                    slackSend botUser: true, channel: '#pmm-ci', color: '#00FF00', message: "[${JOB_NAME}]: build finished - ${BUILD_URL}  & View Tests Run Report - http://${MONITORING_HOST}:9093/latest-report/"
-                    archiveArtifacts artifacts: 'pmm-app/tests/output/combine_results.html'
-                    archiveArtifacts artifacts: 'logs.zip'
-                } else {
-                    junit 'pmm-app/tests/output/parallel_chunk*/*.xml'
-                    publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: false, reportDir: 'pmm-app/tests/output/', reportFiles: 'combine_results.html', reportName: 'HTML Report', reportTitles: ''])
-                    slackSend botUser: true, channel: '#pmm-ci', color: '#FF0000', message: "[${JOB_NAME}]: build ${currentBuild.result} - ${BUILD_URL} & View Tests Run Report - http://${MONITORING_HOST}:9093/latest-report/"
-                    archiveArtifacts artifacts: 'pmm-app/tests/output/combine_results.html'
-                    archiveArtifacts artifacts: 'logs.zip'
-                    archiveArtifacts artifacts: 'pmm-app/tests/output/parallel_chunk*/*.png'
-                    archiveArtifacts artifacts: 'pmm-app/tests/output/video/*.mp4'
+                if(env.CLUSTER_IP)
+                {
+                    destroyStaging(CLUSTER_IP)
                 }
             }
+            script {
+                if (currentBuild.result == null || currentBuild.result == 'SUCCESS') {
+                    junit 'tests/output/parallel_chunk*/*.xml'
+                    publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: false, reportDir: 'tests/output/', reportFiles: 'combine_results.html', reportName: 'HTML Report', reportTitles: ''])
+                    archiveArtifacts artifacts: 'tests/output/combine_results.html'
+                    archiveArtifacts artifacts: 'logs.zip'
+                } else {
+                    junit 'tests/output/parallel_chunk*/*.xml'
+                    publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: false, reportDir: 'tests/output/', reportFiles: 'combine_results.html', reportName: 'HTML Report', reportTitles: ''])
+                    slackSend botUser: true, channel: '#pmm-ci', color: '#FF0000', message: "[${JOB_NAME}]: build ${currentBuild.result} - ${BUILD_URL}"
+                    archiveArtifacts artifacts: 'tests/output/combine_results.html'
+                    archiveArtifacts artifacts: 'logs.zip'
+                    archiveArtifacts artifacts: 'tests/output/parallel_chunk*/*.png'
+                }
+            }
+            allure([
+                includeProperties: false,
+                jdk: '',
+                properties: [],
+                reportBuildPolicy: 'ALWAYS',
+                results: [[path: 'tests/output/allure']]
+            ])
             sh '''
-                sudo rm -r pmm-app/node_modules/
-                sudo rm -r pmm-app/tests/output
+                sudo rm -r node_modules/
+                sudo rm -r tests/output
             '''
             deleteDir()
         }

@@ -9,9 +9,13 @@ pipeline {
             trim: true)
         string(
             defaultValue: '5.7',
-            description: 'Tag/Branch for PXC repository',
+            description: 'Tag/PR/Branch for PXC repository',
             name: 'PXC57_BRANCH',
             trim: true)
+        booleanParam(
+            defaultValue: false, 
+            description: 'Check only if you pass PR number to PXC57_BRANCH field',
+            name: 'USE_PR') 
         string(
             defaultValue: 'https://github.com/percona/percona-xtrabackup',
             description: 'URL to PXB24 repository',
@@ -92,6 +96,18 @@ pipeline {
                 sh '''
                     MY_BRANCH_BASE_MAJOR=5
                     MY_BRANCH_BASE_MINOR=7
+
+                    if [[ ${USE_PR} == "true" ]]; then
+                        if [ -f /usr/bin/yum ]; then
+                            sudo yum -y install jq
+                        else
+                            sudo apt-get install -y jq
+                        fi
+
+                        PXC57_REPO=$(curl https://api.github.com/repos/percona/percona-xtradb-cluster/pulls/${BRANCH} | jq -r '.head.repo.html_url')
+                        PXC57_BRANCH=$(curl https://api.github.com/repos/percona/percona-xtradb-cluster/pulls/${BRANCH} | jq -r '.head.ref')
+                    fi
+
                     RAW_VERSION_LINK=$(echo ${PXC57_REPO%.git} | sed -e "s:github.com:raw.githubusercontent.com:g")
                     REPLY=$(curl -Is ${RAW_VERSION_LINK}/${PXC57_BRANCH}/MYSQL_VERSION | head -n 1 | awk '{print $2}')
                     if [[ ${REPLY} != 200 ]]; then
@@ -128,6 +144,7 @@ pipeline {
                         echo 'Build PXB23'
                         withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'c42456e5-c28d-4962-b32c-b75d161bff27', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                             sh '''
+                                aws ecr-public get-login-password --region us-east-1 | docker login -u AWS --password-stdin public.ecr.aws/e7j3v3n0
                                 sg docker -c "
                                     if [ \$(docker ps -q | wc -l) -ne 0 ]; then
                                         docker ps -q | xargs docker stop --time 1 || :
@@ -166,6 +183,7 @@ pipeline {
                     echo 'Build PXC57'
                     withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'c42456e5-c28d-4962-b32c-b75d161bff27', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                         sh '''							
+                            aws ecr-public get-login-password --region us-east-1 | docker login -u AWS --password-stdin public.ecr.aws/e7j3v3n0
                             sg docker -c "
                                 if [ \$(docker ps -q | wc -l) -ne 0 ]; then
                                     docker ps -q | xargs docker stop --time 1 || :
@@ -199,6 +217,7 @@ pipeline {
                                 sleep 5
                             done
 
+                            aws ecr-public get-login-password --region us-east-1 | docker login -u AWS --password-stdin public.ecr.aws/e7j3v3n0
                             sg docker -c "
                                 if [ \$(docker ps -q | wc -l) -ne 0 ]; then
                                     docker ps -q | xargs docker stop --time 1 || :

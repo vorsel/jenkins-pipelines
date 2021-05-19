@@ -17,7 +17,7 @@ docker run --rm \
     --security-opt seccomp=unconfined \
     --mount type=bind,source=${ROOT_DIR},destination=/tmp/pxb \
     --mount type=bind,source=${SCRIPTS_DIR},destination=/tmp/scripts \
-    perconalab/pxc-build:${SOURCE_IMAGE//[:\/]/-} \
+    public.ecr.aws/e7j3v3n0/pxc-build:${SOURCE_IMAGE//[:\/]/-} \
     sh -c "
     set -o errexit
     set -o xtrace
@@ -33,6 +33,6 @@ docker run --rm \
 
     bash -x /tmp/scripts/test-binary /tmp/results
 
-    sudo mv /tmp/results/*.xml /tmp/results/*.output /tmp/results/PXB/percona-xtrabackup-*/results/* /tmp/pxb/results/ || true
+    sudo mv /tmp/results/*.xml /tmp/results/*.output /tmp/results/test_results.subunit /tmp/results/PXB/percona-xtrabackup-*/results/* /tmp/pxb/results/ || true
     sudo chown $(id -u):$(id -g) -R /tmp/pxb/results/
 "

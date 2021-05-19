@@ -27,6 +27,10 @@ def call(String REPO_NAME, String DESTINATION) {
                                         rsync -aHv redhat/\${rhel}/\${arch}/*.rpm \${repo_path}/
                                     fi
                                     createrepo --update \${repo_path}
+                                    if [ -f \${repo_path}/repodata/repomd.xml.asc ]; then
+                                        rm -f \${repo_path}/repodata/repomd.xml.asc
+                                    fi
+                                    gpg --detach-sign --armor --passphrase ${SIGN_PASSWORD} \${repo_path}/repodata/repomd.xml 
                                 done
 
                                 # SRPMS
@@ -35,6 +39,10 @@ def call(String REPO_NAME, String DESTINATION) {
                                     cp -v `find ../source/redhat -name '*.src.rpm' \${find_exclude}` \${rpm_dest_path}/SRPMS/
                                 fi
                                 createrepo --update \${rpm_dest_path}/SRPMS
+                                if [ -f \${rpm_dest_path}/SRPMS/repodata/repomd.xml.asc ]; then
+                                    rm -f \${rpm_dest_path}/SRPMS/repodata/repomd.xml.asc
+                                fi
+                                gpg --detach-sign --armor --passphrase ${SIGN_PASSWORD} \${rpm_dest_path}/SRPMS/repodata/repomd.xml 
                             done
 
                             if [ "x${DESTINATION}" == "xrelease" ]; then
@@ -44,7 +52,7 @@ def call(String REPO_NAME, String DESTINATION) {
                                 for deb in `find debian/\${dist} -name '*.deb'`; do
                                  pkg_fname=\$(basename \${deb})
                                  EC=0
-                                 /usr/local/reprepro5/bin/reprepro --list-format '"'"'\${package}_\${version}_\${architecture}.deb\\n'"'"' -Vb /srv/repo-copy/${REPO_NAME}/apt -C ${DESTINATION} list \${dist} | grep \${pkg_fname} > /dev/null || EC=\$?
+                                 /usr/local/reprepro5/bin/reprepro --list-format '"'"'\${package}_\${version}_\${architecture}.deb\\n'"'"' -Vb /srv/repo-copy/${REPO_NAME}/apt -C ${DESTINATION} list \${dist} | sed -re "s|[0-9]:||" | grep \${pkg_fname} > /dev/null || EC=\$?
                                  REPOPUSH_ARGS=""
                                  if [ \${EC} -eq 0 ]; then
                                      REPOPUSH_ARGS=" --remove-package "

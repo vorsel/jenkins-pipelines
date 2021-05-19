@@ -55,7 +55,7 @@ pipeline {
         stage('Run VM with PMM server') {
             steps 
             {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID',  credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID',  credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     sh '''
                         export VM_NAME=\$(cat VM_NAME)
                         export OWNER=\$(cat OWNER)
@@ -97,7 +97,7 @@ pipeline {
                             aws ec2 run-instances \
                             --image-id $AMI_ID \
                             --security-group-ids $SG1 $SG2\
-                            --instance-type t2.micro \
+                            --instance-type t2.large \
                             --subnet-id $SS1 \
                             --region us-east-1 \
                             --key-name jenkins-admin \
@@ -179,7 +179,7 @@ pipeline {
             }
         }
         failure {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                 sh '''
                     export INSTANCE_ID=\$(cat INSTANCE_ID)
                     

@@ -247,6 +247,7 @@ EOF
                 runTest('service-per-pod')
                 runTest('liveness')
                 runTest('users')
+                runTest('data-sharded')
            }
         }
         stage('E2E SelfHealing') {
@@ -264,6 +265,8 @@ EOF
                 runTest('demand-backup-sharded')
                 runTest('scheduled-backup')
                 runTest('upgrade-sharded')
+                runTest('pitr')
+                runTest('pitr-sharded')
             }
         }
         stage('Make report') {

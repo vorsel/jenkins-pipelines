@@ -271,6 +271,7 @@ pipeline {
                         runTest('service-per-pod', 'basic')
                         runTest('liveness', 'basic')
                         runTest('users', 'basic')
+                        runTest('data-sharded', 'basic')
                         ShutdownCluster('basic')
                     }
                 }
@@ -292,6 +293,8 @@ pipeline {
                         runTest('demand-backup-sharded', 'backups')
                         runTest('scheduled-backup', 'backups')
                         runTest('upgrade-sharded', 'backups')
+                        runTest('pitr', 'backups')
+                        runTest('pitr-sharded', 'backups')
                         ShutdownCluster('backups')
                     }
                 }

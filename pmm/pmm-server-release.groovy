@@ -79,11 +79,19 @@ pipeline {
         }
         stage('Createrepo') {
             steps {
-                withCredentials([sshUserPrivateKey(credentialsId: 'repo.ci.percona.com', keyFileVariable: 'KEY_PATH', usernameVariable: 'USER')]) {
-                    sh '''
-                        ssh -o StrictHostKeyChecking=no -i ${KEY_PATH} ${USER}@repo.ci.percona.com \
+                withCredentials([string(credentialsId: 'SIGN_PASSWORD', variable: 'SIGN_PASSWORD')]) {
+                    withCredentials([sshUserPrivateKey(credentialsId: 'repo.ci.percona.com', keyFileVariable: 'KEY_PATH', usernameVariable: 'USER')]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no -i ${KEY_PATH} ${USER}@repo.ci.percona.com " \
                             createrepo --update /srv/repo-copy/pmm/7/RPMS/x86_64/
-                    '''
+                            if [ -f /srv/repo-copy/pmm/yum/release/7/RPMS/x86_64/repodata/repomd.xml.asc ]; then
+                                rm -f /srv/repo-copy/pmm/yum/release/7/RPMS/x86_64/repodata/repomd.xml.asc
+                            fi
+                            export SIGN_PASSWORD=\${SIGN_PASSWORD}
+                            gpg --detach-sign --no-tty --armor --passphrase \${SIGN_PASSWORD} /srv/repo-copy/pmm/yum/release/7/RPMS/x86_64/repodata/repomd.xml
+                        "
+                    """
+                    }
                 }
             }
         }
@@ -174,20 +182,15 @@ pipeline {
                         docker tag \${DOCKER_VERSION} percona/pmm-server:\${VERSION}
                         docker tag \${DOCKER_VERSION} percona/pmm-server:\${DOCKER_MID}
                         docker tag \${DOCKER_VERSION} percona/pmm-server:\${TOP_VER}
-                        docker tag \${DOCKER_VERSION} percona/pmm-server:latest
                         docker push percona/pmm-server:\${VERSION}
                         docker push percona/pmm-server:\${DOCKER_MID}
                         docker push percona/pmm-server:\${TOP_VER}
-                        if [ \${TOP_VER} = 1 ]; then
-                            docker push percona/pmm-server:latest
-                        fi
+
                         docker save percona/pmm-server:\${VERSION} | xz > pmm-server-\${VERSION}.docker
 
                         docker pull \${DOCKER_CLIENT_VERSION}
                         docker tag \${DOCKER_CLIENT_VERSION} perconalab/pmm-client:\${VERSION}
-                        docker tag \${DOCKER_CLIENT_VERSION} perconalab/pmm-client:latest
                         docker push perconalab/pmm-client:\${VERSION}
-                        docker push perconalab/pmm-client:latest
                         docker save perconalab/pmm-client:\${VERSION} | xz > pmm-client-\${VERSION}.docker
                     "
                 """

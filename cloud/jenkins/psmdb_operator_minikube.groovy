@@ -234,7 +234,9 @@ pipeline {
                     runTest('smart-update')
                     runTest('version-service')
                     runTest('users')
-                    runTest('rs-shard-migration')
+                    runTest('data-sharded')
+                    runTest('pitr')
+                    runTest('pitr-sharded')
             }
             post {
                 always {

@@ -24,7 +24,7 @@ void runGKEclusterAlpha(String CLUSTER_PREFIX) {
             source $HOME/google-cloud-sdk/path.bash.inc
             gcloud auth activate-service-account alpha-svc-acct@"${GCP_PROJECT}".iam.gserviceaccount.com --key-file=$CLIENT_SECRET_FILE
             gcloud config set project $GCP_PROJECT
-            gcloud alpha container clusters create --release-channel rapid $CLUSTER_NAME-${CLUSTER_PREFIX} --zone us-central1-a --project $GCP_PROJECT --preemptible --machine-type n1-standard-4 --num-nodes=4 --enable-autoscaling --min-nodes=4 --max-nodes=6 --network=jenkins-vpc --subnetwork=jenkins-${CLUSTER_PREFIX}
+            gcloud alpha container clusters create --release-channel rapid $CLUSTER_NAME-${CLUSTER_PREFIX} --zone us-central1-a --cluster-version $GKE_VERSION --project $GCP_PROJECT --preemptible --machine-type n1-standard-4 --num-nodes=4 --enable-autoscaling --min-nodes=4 --max-nodes=6 --network=jenkins-vpc --subnetwork=jenkins-${CLUSTER_PREFIX}
             kubectl create clusterrolebinding cluster-admin-binding1 --clusterrole=cluster-admin --user=\$(gcloud config get-value core/account)
         """
    }
@@ -125,6 +125,17 @@ void runTest(String TEST_NAME, String CLUSTER_PREFIX) {
 
     echo "The $TEST_NAME test was finished!"
 }
+
+void conditionalRunTest(String TEST_NAME, String CLUSTER_PREFIX) {
+    if ( TEST_NAME == 'default-cr' ) {
+        if ( params.GIT_BRANCH.contains('release-') ) {
+            runTest(TEST_NAME, CLUSTER_PREFIX)
+        }
+        return 0
+    }
+    runTest(TEST_NAME, CLUSTER_PREFIX)
+}
+
 void installRpms() {
     sh '''
         sudo yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm || true
@@ -263,12 +274,14 @@ pipeline {
                 stage('E2E Basic Tests') {
                     steps {
                         CreateCluster('basic')
+//                        conditionalRunTest('default-cr', 'basic')
                         runTest('one-pod', 'basic')
                         runTest('monitoring-2-0', 'basic')
                         runTest('arbiter', 'basic')
                         runTest('service-per-pod', 'basic')
                         runTest('liveness', 'basic')
                         runTest('users', 'basic')
+                        runTest('data-sharded', 'basic')
                         ShutdownCluster('basic')
                     }
                 }
@@ -291,6 +304,8 @@ pipeline {
                         runTest('demand-backup-sharded', 'backups')
                         runTest('scheduled-backup', 'backups')
                         runTest('upgrade-sharded', 'backups')
+                        runTest('pitr', 'backups')
+                        runTest('pitr-sharded', 'backups')
                         ShutdownCluster('backups')
                     }
                 }

@@ -21,23 +21,22 @@ netMap['eu-west-1b'] = 'subnet-02e8446080b5a52ef'
 netMap['eu-west-1c'] = 'subnet-0eb939327a262a348'
 
 imageMap = [:]
-imageMap['eu-west-1a.docker'] = 'ami-0bfe21f21a54b82f9'
-imageMap['eu-west-1a.docker-32gb'] = 'ami-0bfe21f21a54b82f9'
-imageMap['eu-west-1a.docker2'] = 'ami-0bfe21f21a54b82f9'
-imageMap['eu-west-1a.micro-amazon'] = 'ami-0bfe21f21a54b82f9'
-imageMap['eu-west-1a.min-centos-7-x64'] = 'ami-0ff760d16d9497662'
-imageMap['eu-west-1a.fips-centos-7-x64'] = 'ami-0ff760d16d9497662'
+imageMap['eu-west-1a.docker'] = 'ami-0d712b3e6e1f798ef'
+imageMap['eu-west-1a.docker-32gb'] = 'ami-0d712b3e6e1f798ef'
+imageMap['eu-west-1a.docker2'] = 'ami-0d712b3e6e1f798ef'
+imageMap['eu-west-1a.micro-amazon'] = 'ami-0d712b3e6e1f798ef'
 
-imageMap['eu-west-1a.min-centos-6-x64'] = 'ami-0451e9d3427711cb1'
-imageMap['eu-west-1a.min-centos-6-x32'] = 'ami-25839351'
-imageMap['eu-west-1a.min-centos-7-x64'] = 'ami-0d4002a13019b7703'
-imageMap['eu-west-1a.min-centos-8-x64'] = 'ami-0bfa4fefe067b7946'
-imageMap['eu-west-1a.min-buster-x64']   = 'ami-093185e1a0acee74b'
-imageMap['eu-west-1a.min-focal-x64']    = 'ami-06fd8a495a537da8b'
-imageMap['eu-west-1a.min-bionic-x64']   = 'ami-0823c236601fef765'
-imageMap['eu-west-1a.min-stretch-x64']  = 'ami-0442db6463774080a'
-imageMap['eu-west-1a.min-xenial-x64']   = 'ami-07aba4cc9cb368364'
-imageMap['eu-west-1a.min-xenial-x32']   = 'ami-0d842b54e0120f205'
+imageMap['eu-west-1a.min-centos-6-x64']  = 'ami-0451e9d3427711cb1'
+imageMap['eu-west-1a.min-centos-6-x32']  = 'ami-25839351'
+imageMap['eu-west-1a.min-centos-7-x64']  = 'ami-04f5641b0d178a27a'
+imageMap['eu-west-1a.fips-centos-7-x64'] = 'ami-04f5641b0d178a27a'
+imageMap['eu-west-1a.min-centos-8-x64']  = 'ami-0a75a5a43b05b4d5f'
+imageMap['eu-west-1a.min-buster-x64']    = 'ami-09ea48ee08b5fd32c'
+imageMap['eu-west-1a.min-stretch-x64']   = 'ami-07b6f61657bc90905'
+imageMap['eu-west-1a.min-focal-x64']     = 'ami-075d4aa9d88dbfb75'
+imageMap['eu-west-1a.min-bionic-x64']    = 'ami-0d40053470cce7b92'
+imageMap['eu-west-1a.min-xenial-x64']    = 'ami-0a9aac550bc5711d3'
+imageMap['eu-west-1a.min-xenial-x32']    = 'ami-0d842b54e0120f205'
 
 imageMap['eu-west-1b.docker'] = imageMap['eu-west-1a.docker']
 imageMap['eu-west-1b.docker-32gb'] = imageMap['eu-west-1a.docker-32gb']
@@ -90,7 +89,6 @@ userMap['docker']            = 'ec2-user'
 userMap['docker-32gb']       = userMap['docker']
 userMap['docker2']           = userMap['docker']
 userMap['micro-amazon']      = userMap['docker']
-userMap['min-artful-x64']    = 'ubuntu'
 userMap['min-focal-x64']     = 'ubuntu'
 userMap['min-bionic-x64']    = 'ubuntu'
 userMap['min-xenial-x64']    = 'ubuntu'
@@ -103,27 +101,48 @@ userMap['fips-centos-7-x64'] = 'centos'
 userMap['min-stretch-x64']   = 'admin'
 userMap['min-buster-x64']    = 'admin'
 
-userMap['psmdb'] = userMap['min-xenial-x64']
 
 initMap = [:]
 initMap['docker'] = '''
     set -o xtrace
 
     if ! mountpoint -q /mnt; then
-        DEVICE=$(ls /dev/xvdd /dev/xvdh /dev/nvme1n1 | head -1)
-        sudo mkfs.ext4 ${DEVICE}
-        sudo mount -o noatime ${DEVICE} /mnt
+        for DEVICE_NAME in $(lsblk -ndpbo NAME,SIZE | sort -n -r | awk '{print $1}'); do
+            if ! grep -qs "${DEVICE_NAME}" /proc/mounts; then
+                DEVICE="${DEVICE_NAME}"
+                break
+            fi
+        done
+        if [ -n "${DEVICE}" ]; then
+            sudo mkfs.ext4 ${DEVICE}
+            sudo mount -o noatime ${DEVICE} /mnt
+        fi
     fi
     sudo ethtool -K eth0 sg off
+
+    echo '10.30.6.9 repo.ci.percona.com' | sudo tee -a /etc/hosts
+
     until sudo yum makecache; do
         sleep 1
         echo try again
     done
 
-    echo '10.30.6.9 repo.ci.percona.com' | sudo tee -a /etc/hosts
+    sudo amazon-linux-extras install epel -y
+    sudo yum -y install java-1.8.0-openjdk git docker p7zip
+    sudo yum -y remove java-1.7.0-openjdk awscli
 
-    sudo yum -y install java-1.8.0-openjdk git aws-cli docker
-    sudo yum -y remove java-1.7.0-openjdk
+    if ! $(aws --version | grep -q 'aws-cli/2'); then
+        find /tmp -maxdepth 1 -name "*aws*" | xargs sudo rm -rf
+
+        until curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"; do
+            sleep 1
+            echo try again
+        done
+
+        7za -o/tmp x /tmp/awscliv2.zip 
+        cd /tmp/aws && sudo ./install
+    fi
+
     sudo install -o $(id -u -n) -g $(id -g -n) -d /mnt/jenkins
 
     sudo sysctl net.ipv4.tcp_fin_timeout=15
@@ -151,9 +170,16 @@ initMap['docker2'] = initMap['docker']
 initMap['micro-amazon'] = '''
     set -o xtrace
     if ! mountpoint -q /mnt; then
-        DEVICE=$(ls /dev/xvdd /dev/xvdh /dev/nvme1n1 | head -1)
-        sudo mkfs.ext2 ${DEVICE}
-        sudo mount ${DEVICE} /mnt
+        for DEVICE_NAME in $(lsblk -ndpbo NAME,SIZE | sort -n -r | awk '{print $1}'); do
+            if ! grep -qs "${DEVICE_NAME}" /proc/mounts; then
+                DEVICE="${DEVICE_NAME}"
+                break
+            fi
+        done
+        if [ -n "${DEVICE}" ]; then
+            sudo mkfs.ext2 ${DEVICE}
+            sudo mount ${DEVICE} /mnt
+        fi
     fi
 
     echo '10.30.6.9 repo.ci.percona.com' | sudo tee -a /etc/hosts
@@ -169,9 +195,16 @@ initMap['micro-amazon'] = '''
 initMap['min-centos-6-x64'] = '''
     set -o xtrace
     if ! mountpoint -q /mnt; then
-        DEVICE=$(ls /dev/xvdd /dev/xvdh /dev/nvme1n1 | head -1)
-        sudo mkfs.ext2 ${DEVICE}
-        sudo mount ${DEVICE} /mnt
+        for DEVICE_NAME in $(lsblk -ndbo NAME,SIZE | sort -n -r | awk '{print $1}'); do
+            if ! grep -qs "${DEVICE_NAME}" /proc/mounts; then
+                DEVICE="/dev/${DEVICE_NAME}"
+                break
+            fi
+        done
+        if [ -n "${DEVICE}" ]; then
+            sudo mkfs.ext2 ${DEVICE}
+            sudo mount ${DEVICE} /mnt
+        fi
     fi
 
     echo '10.30.6.9 repo.ci.percona.com' | sudo tee -a /etc/hosts
@@ -200,9 +233,16 @@ initMap['min-centos-8-x64'] = initMap['micro-amazon']
 initMap['min-centos-6-x32'] = '''
     set -o xtrace
     if ! mountpoint -q /mnt; then
-        DEVICE=$(ls /dev/xvdd /dev/xvdh /dev/nvme1n1 | head -1)
-        sudo mkfs.ext2 ${DEVICE}
-        sudo mount ${DEVICE} /mnt
+        for DEVICE_NAME in $(lsblk -ndpbo NAME,SIZE | sort -n -r | awk '{print $1}'); do
+            if ! grep -qs "${DEVICE_NAME}" /proc/mounts; then
+                DEVICE="${DEVICE_NAME}"
+                break
+            fi
+        done
+        if [ -n "${DEVICE}" ]; then
+            sudo mkfs.ext2 ${DEVICE}
+            sudo mount ${DEVICE} /mnt
+        fi
     fi
 
     echo '10.30.6.9 repo.ci.percona.com' | sudo tee -a /etc/hosts
@@ -239,12 +279,19 @@ initMap['min-centos-6-x32'] = '''
     sudo umount /dev/shm
     sudo mount /dev/shm
 '''
-initMap['min-artful-x64'] = '''
+initMap['min-bionic-x64'] = '''
     set -o xtrace
     if ! mountpoint -q /mnt; then
-        DEVICE=$(ls /dev/xvdd /dev/xvdh /dev/nvme1n1 | head -1)
-        sudo mkfs.ext2 ${DEVICE}
-        sudo mount ${DEVICE} /mnt
+        for DEVICE_NAME in $(lsblk -ndpbo NAME,SIZE | sort -n -r | awk '{print $1}'); do
+            if ! grep -qs "${DEVICE_NAME}" /proc/mounts; then
+                DEVICE="${DEVICE_NAME}"
+                break
+            fi
+        done
+        if [ -n "${DEVICE}" ]; then
+            sudo mkfs.ext2 ${DEVICE}
+            sudo mount ${DEVICE} /mnt
+        fi
     fi
 
     echo '10.30.6.9 repo.ci.percona.com' | sudo tee -a /etc/hosts
@@ -262,9 +309,16 @@ initMap['min-artful-x64'] = '''
 initMap['min-buster-x64'] = '''
     set -o xtrace
     if ! mountpoint -q /mnt; then
-        DEVICE=$(ls /dev/xvdd /dev/xvdh /dev/nvme1n1 | head -1)
-        sudo mkfs.ext2 ${DEVICE}
-        sudo mount ${DEVICE} /mnt
+        for DEVICE_NAME in $(lsblk -ndpbo NAME,SIZE | sort -n -r | awk '{print $1}'); do
+            if ! grep -qs "${DEVICE_NAME}" /proc/mounts; then
+                DEVICE="${DEVICE_NAME}"
+                break
+            fi
+        done
+        if [ -n "${DEVICE}" ]; then
+            sudo mkfs.ext2 ${DEVICE}
+            sudo mount ${DEVICE} /mnt
+        fi
     fi
 
     echo '10.30.6.9 repo.ci.percona.com' | sudo tee -a /etc/hosts
@@ -276,12 +330,10 @@ initMap['min-buster-x64'] = '''
     sudo apt-get -y install openjdk-11-jre-headless git
     sudo install -o $(id -u -n) -g $(id -g -n) -d /mnt/jenkins
 '''
-initMap['min-focal-x64'] = initMap['min-artful-x64']
-initMap['min-bionic-x64'] = initMap['min-artful-x64']
-initMap['min-stretch-x64'] = initMap['min-artful-x64']
-initMap['min-xenial-x64'] = initMap['min-artful-x64']
-initMap['min-xenial-x32'] = initMap['min-artful-x64']
-initMap['psmdb'] = initMap['min-xenial-x64']
+initMap['min-focal-x64'] = initMap['min-bionic-x64']
+initMap['min-stretch-x64'] = initMap['min-bionic-x64']
+initMap['min-xenial-x64'] = initMap['min-bionic-x64']
+initMap['min-xenial-x32'] = initMap['min-bionic-x64']
 
 capMap = [:]
 capMap['c5.xlarge']  = '60'
@@ -298,7 +350,6 @@ typeMap['docker2']           = 'r4.4xlarge'
 typeMap['min-centos-7-x64']  = typeMap['docker-32gb']
 typeMap['min-centos-8-x64']  = typeMap['min-centos-7-x64']
 typeMap['fips-centos-7-x64'] = typeMap['min-centos-7-x64']
-typeMap['min-artful-x64']    = typeMap['min-centos-7-x64']
 typeMap['min-focal-x64']     = typeMap['min-centos-7-x64']
 typeMap['min-bionic-x64']    = typeMap['min-centos-7-x64']
 typeMap['min-centos-6-x32']  = 'm1.medium'
@@ -307,14 +358,12 @@ typeMap['min-buster-x64']    = typeMap['min-centos-7-x64']
 typeMap['min-stretch-x64']   = typeMap['min-centos-7-x64']
 typeMap['min-xenial-x64']    = typeMap['min-centos-7-x64']
 typeMap['min-xenial-x32']    = 'm1.medium'
-typeMap['psmdb']             = typeMap['docker-32gb']
 
 execMap = [:]
 execMap['docker']            = '1'
 execMap['docker-32gb']       = execMap['docker']
 execMap['docker2']           = execMap['docker']
 execMap['micro-amazon']      = '30'
-execMap['min-artful-x64']    = '1'
 execMap['min-bionic-x64']    = '1'
 execMap['min-focal-x64']     = '1'
 execMap['min-centos-6-x32']  = '1'
@@ -326,33 +375,29 @@ execMap['min-stretch-x64']   = '1'
 execMap['min-xenial-x64']    = '1'
 execMap['min-xenial-x32']    = '1'
 execMap['min-buster-x64']    = '1'
-execMap['psmdb']             = '1'
 
 devMap = [:]
-devMap['docker']            = '/dev/xvda=:8:true:gp2,/dev/xvdd=:80:true:gp2'
-devMap['docker2']           = '/dev/xvda=:8:true:gp2,/dev/xvdd=:80:true:gp2'
+devMap['docker']            = '/dev/xvda=:8:true:gp2,/dev/xvdd=:180:true:gp2'
+devMap['docker2']           = '/dev/xvda=:8:true:gp2,/dev/xvdd=:180:true:gp2'
 devMap['docker-32gb']       = devMap['docker']
 devMap['micro-amazon']      = devMap['docker']
-devMap['min-artful-x64']    = '/dev/sda1=:8:true:gp2,/dev/sdd=:80:true:gp2'
-devMap['min-bionic-x64']    = devMap['min-artful-x64']
-devMap['min-focal-x64']     = devMap['min-artful-x64']
-devMap['min-centos-6-x64']  = devMap['min-artful-x64']
-devMap['min-centos-7-x64']  = devMap['min-artful-x64']
-devMap['fips-centos-7-x64'] = devMap['min-artful-x64']
-devMap['min-centos-8-x64']  = '/dev/sda1=:10:true:gp2,/dev/sdd=:80:true:gp2'
-devMap['min-stretch-x64']   = 'xvda=:8:true:gp2,xvdd=:80:true:gp2'
-devMap['min-xenial-x64']    = devMap['min-artful-x64']
-devMap['min-xenial-x32']    = '/dev/sda1=:10:false:gp2,/dev/sdd=:80:false:gp2'
-devMap['min-centos-6-x32']  = '/dev/sda=:8:true:gp2,/dev/sdd=:80:true:gp2'
+devMap['min-bionic-x64']    = '/dev/sda1=:8:true:gp2,/dev/sdd=:180:true:gp2'
+devMap['min-focal-x64']     = devMap['min-bionic-x64']
+devMap['min-centos-6-x64']  = devMap['min-bionic-x64']
+devMap['min-centos-7-x64']  = devMap['min-bionic-x64']
+devMap['fips-centos-7-x64'] = devMap['min-bionic-x64']
+devMap['min-centos-8-x64']  = '/dev/sda1=:10:true:gp2,/dev/sdd=:180:true:gp2'
+devMap['min-stretch-x64']   = 'xvda=:8:true:gp2,xvdd=:180:true:gp2'
+devMap['min-xenial-x64']    = devMap['min-bionic-x64']
+devMap['min-xenial-x32']    = '/dev/sda1=:10:false:gp2,/dev/sdd=:180:false:gp2'
+devMap['min-centos-6-x32']  = '/dev/sda=:8:true:gp2,/dev/sdd=:180:true:gp2'
 devMap['min-buster-x64']    = devMap['docker']
-devMap['psmdb']             = '/dev/sda1=:8:true:gp2,/dev/sdd=:160:true:gp2'
 
 labelMap = [:]
 labelMap['docker']            = ''
 labelMap['docker-32gb']       = ''
 labelMap['docker2']           = 'docker-32gb'
 labelMap['micro-amazon']      = 'master'
-labelMap['min-artful-x64']    = ''
 labelMap['min-bionic-x64']    = 'asan'
 labelMap['min-focal-x64']     = ''
 labelMap['min-centos-6-x32']  = ''
@@ -364,7 +409,6 @@ labelMap['min-stretch-x64']   = ''
 labelMap['min-xenial-x64']    = ''
 labelMap['min-xenial-x32']    = ''
 labelMap['min-buster-x64']    = ''
-labelMap['psmdb']             = ''
 
 // https://github.com/jenkinsci/ec2-plugin/blob/ec2-1.41/src/main/java/hudson/plugins/ec2/SlaveTemplate.java
 SlaveTemplate getTemplate(String OSType, String AZ) {
@@ -435,6 +479,7 @@ String region = 'eu-west-1'
         '240',                                   // String instanceCapStr
         [
             getTemplate('docker',           "${region}${it}"),
+            getTemplate('docker-32gb',      "${region}${it}"),
             getTemplate('micro-amazon',     "${region}${it}"),
             getTemplate('min-xenial-x64',     "${region}${it}"),
             getTemplate('min-xenial-x32',     "${region}${it}"),

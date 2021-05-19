@@ -43,9 +43,9 @@ Parameters:
 Mappings:
   AmazonLinux2:
     eu-west-1:
-      x64: ami-0fc970315c2d38f01
+      x64: ami-0d712b3e6e1f798ef
     eu-central-1:
-      x64: ami-0a6dc7529cd559185
+      x64: ami-013fffc873b1eaa1c
 
 Resources:
 
@@ -211,6 +211,26 @@ Resources:
         FromPort: 22
         ToPort: 22
         CidrIp: 176.37.55.60/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 188.163.20.103/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 213.159.239.48/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 46.149.86.84/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 54.214.47.252/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 54.214.47.254/32
       Tags:
       - Key: iit-billing-tag
         Value: !Ref JShortName
@@ -530,7 +550,7 @@ Resources:
                   rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io.key
                   amazon-linux-extras install epel -y
                   yum -y update --security
-                  yum -y install java-1.8.0-openjdk-1.8.0.272.b10 jenkins-2.263.3 certbot git yum-cron aws-cli xfsprogs openresty
+                  yum -y install java-1.8.0-openjdk jenkins-2.277.2 certbot git yum-cron aws-cli xfsprogs openresty
 
                   sed -i 's/update_cmd = default/update_cmd = security/' /etc/yum/yum-cron.conf
                   sed -i 's/apply_updates = no/apply_updates = yes/'     /etc/yum/yum-cron.conf
@@ -665,16 +685,9 @@ Resources:
               			  ssl_trusted_certificate     /etc/nginx/ssl/ca-certs.pem;
               			  ssl_dhparam                 /etc/nginx/ssl/dhparam.pem;
 
-              			  set \$ngo_client_id          "<-- SETUP MANUALLY -->";
-              			  set \$ngo_client_secret      "<-- SETUP MANUALLY -->";
-              			  set \$ngo_token_secret       "<-- SETUP MANUALLY -->";
-              			  set \$ngo_domain             percona.com;
-              			  set \$ngo_secure_cookies     true;
-              			  set \$ngo_http_only_cookies  true;
               			  resolver                    8.8.8.8 ipv6=off;
               			  lua_ssl_trusted_certificate /etc/pki/tls/certs/ca-bundle.crt;
               			  lua_ssl_verify_depth        3;
-              			  access_by_lua_file          /mnt/$JENKINS_HOST/nginx-google-oauth.lua;
               			  include                     /mnt/$JENKINS_HOST/ssl/*-list.conf;
               			  satisfy                     any;
 
@@ -698,13 +711,6 @@ Resources:
 
                   ln -s /mnt/$JENKINS_HOST/ssl/nginx.conf /usr/local/openresty/nginx/conf/jenkins.conf
                   sed -i'' -e 's/listen/#listen/; s/mime.types/jenkins.conf/' /usr/local/openresty/nginx/conf/nginx.conf
-
-                  wget -O /usr/local/openresty/lualib/resty/http.lua \
-                    https://raw.githubusercontent.com/pintsized/lua-resty-http/master/lib/resty/http.lua
-                  wget -O /usr/local/openresty/lualib/resty/http_headers.lua \
-                    https://raw.githubusercontent.com/pintsized/lua-resty-http/master/lib/resty/http_headers.lua
-                  wget -O /mnt/$JENKINS_HOST/nginx-google-oauth.lua \
-                    https://raw.githubusercontent.com/cloudflare/nginx-google-oauth/master/access.lua
 
                   systemctl enable --now openresty
               }
@@ -757,6 +763,27 @@ Resources:
                   fi
               }
 
+              setup_ssh_keys() {
+                KEYS_LIST="mykola.marzhan evgeniy.patlan slava.sarzhan illia.pshonkin alex.miroshnychenko eduardo.casarero santiago.ruiz andrew.siemen kamil.babayev"
+
+                for KEY in $KEYS_LIST; do
+                    RETRY="3"
+                    while [ $RETRY != "0" ]; do
+                        STATUS=$(curl -Is https://www.percona.com/get/engineer/KEY/$KEY.pub | head -n1 | awk '{print $2}')
+                        if [[ $STATUS -eq 200 ]]; then
+                            curl -s https://www.percona.com/get/engineer/KEY/$KEY.pub | tee -a /home/ec2-user/.ssh/authorized_keys
+                            RETRY="0"
+                        elif [[ $STATUS -eq 404 ]]; then
+                            echo "Skipping key $KEY"
+                            RETRY=0
+                        else
+                            echo "Got $STATUS, retrying"
+                            RETRY=$(($RETRY-1))
+                        fi
+                    done
+                done
+              }
+
               main() {
                   setup_aws
                   install_software
@@ -767,6 +794,7 @@ Resources:
                   setup_dhparam
                   setup_letsencrypt
                   setup_nginx_allow_list
+                  setup_ssh_keys
               }
 
               main

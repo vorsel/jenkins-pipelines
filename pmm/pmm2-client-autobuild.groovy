@@ -13,8 +13,8 @@ pipeline {
             description: 'Tag/Branch for pmm-submodules repository',
             name: 'GIT_BRANCH')
         choice(
-            choices: 'testing\nlaboratory',
-            description: 'publish result package to internal (testing) or external (laboratory) repository',
+            choices: ['experimental', 'testing'],
+            description: 'publish result package to internal RC (testing) or experimental (dev-latest) repository',
             name: 'DESTINATION')
     }
     options {
@@ -39,6 +39,16 @@ pipeline {
                     git rev-parse --short HEAD > shortCommit
                     echo "UPLOAD/${DESTINATION}/${JOB_NAME}/pmm2/\$(cat VERSION)/${GIT_BRANCH}/\$(cat shortCommit)/${BUILD_NUMBER}" > uploadPath
                 '''
+                script {
+                    def versionTag = sh(returnStdout: true, script: "cat VERSION").trim()
+                    if ("${DESTINATION}" == "testing") {
+                        env.DOCKER_LATEST_TAG = "${versionTag}-rc${BUILD_NUMBER}"
+                        env.DOCKER_RC_TAG = "${versionTag}-rc"
+                    } else {
+                        env.DOCKER_LATEST_TAG = "dev-latest"
+                    }
+                }
+
                 archiveArtifacts 'uploadPath'
                 stash includes: 'uploadPath', name: 'uploadPath'
                 archiveArtifacts 'shortCommit'
@@ -87,11 +97,16 @@ pipeline {
 
                         ./build/bin/build-client-docker
 
-                        docker tag  \\${DOCKER_CLIENT_TAG} perconalab/pmm-client:dev-latest
+                        if [ ! -z \${DOCKER_RC_TAG+x} ]; then
+                            docker tag  \\${DOCKER_CLIENT_TAG} perconalab/pmm-client:\${DOCKER_RC_TAG}
+                            docker push perconalab/pmm-client:\${DOCKER_RC_TAG}
+                            docker rmi perconalab/pmm-client:\${DOCKER_RC_TAG}
+                        fi
+                        docker tag  \\${DOCKER_CLIENT_TAG} perconalab/pmm-client:\${DOCKER_LATEST_TAG}
                         docker push \\${DOCKER_CLIENT_TAG}
-                        docker push perconalab/pmm-client:dev-latest
+                        docker push perconalab/pmm-client:\${DOCKER_LATEST_TAG}
                         docker rmi  \\${DOCKER_CLIENT_TAG}
-                        docker rmi  perconalab/pmm-client:dev-latest
+                        docker rmi  perconalab/pmm-client:\${DOCKER_LATEST_TAG}
                     "
                 '''
                 stash includes: 'results/docker/CLIENT_TAG', name: 'CLIENT_IMAGE'
@@ -110,7 +125,6 @@ pipeline {
                 sh '''
                     sg docker -c "
                         env
-                        ./build/bin/build-client-rpm centos:6
                         ./build/bin/build-client-rpm centos:7
                         ./build/bin/build-client-rpm centos:8
                     "
@@ -167,6 +181,11 @@ pipeline {
                 if (currentBuild.result == null || currentBuild.result == 'SUCCESS') {
                     slackSend botUser: true, channel: '#pmm-ci', color: '#00FF00', message: "[${JOB_NAME}]: build finished, pushed to ${DESTINATION} repo - ${BUILD_URL}"
                     slackSend botUser: true, channel: '@nailya.kutlubaeva', color: '#00FF00', message: "[${JOB_NAME}]: build finished, pushed to ${DESTINATION} repo"
+                    if ("${DESTINATION}" == "testing")
+                    {
+                      currentBuild.description = "Release Candidate Build"
+                      slackSend botUser: true, channel: '#pmm-qa', color: '#00FF00', message: "[${JOB_NAME}]: ${BUILD_URL} Release Candidate build finished"
+                    }
                 } else {
                     slackSend botUser: true, channel: '#pmm-ci', color: '#FF0000', message: "[${JOB_NAME}]: build ${currentBuild.result} - ${BUILD_URL}"
                     slackSend botUser: true, channel: '#pmm-qa', color: '#FF0000', message: "[${JOB_NAME}]: build ${currentBuild.result} - ${BUILD_URL}"

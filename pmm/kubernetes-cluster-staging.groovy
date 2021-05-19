@@ -22,7 +22,7 @@ pipeline {
             description: 'Stop the instance after, days ("0" value disables autostop and recreates instance in case of AWS failure)',
             name: 'DAYS')
         choice(
-            choices: ['1.6.0', '1.7.0'],
+            choices: ['1.7.0', '1.6.0'],
             description: 'Operator Version to be used for Deployment',
             name: 'OPERATOR_VERSION')
         string(
@@ -69,7 +69,7 @@ pipeline {
 
         stage('Run VM') {
             steps {
-                launchSpotInstance('c4.4xlarge', '0.1548', 50)
+                launchSpotInstance('c5n.4xlarge', '0.170', 70)
                 withCredentials([sshUserPrivateKey(credentialsId: 'aws-jenkins', keyFileVariable: 'KEY_PATH', passphraseVariable: '', usernameVariable: 'USER')]) {
                     sh """
                         until ssh -i "${KEY_PATH}" -o ConnectTimeout=1 -o StrictHostKeyChecking=no ${USER}@\$(cat IP) 'java -version; sudo yum install -y java-1.8.0-openjdk; sudo /usr/sbin/alternatives --set java /usr/lib/jvm/jre-1.8.0-openjdk.x86_64/bin/java; java -version;' ; do
@@ -181,8 +181,8 @@ pipeline {
                                 export PATH=\$PATH:/usr/sbin
                                 minikube kubectl -- get nodes
                                 minikube kubectl -- get pods
-                                minikube kubectl -- wait --for=condition=Available deployment percona-xtradb-cluster-operator
-                                minikube kubectl -- wait --for=condition=Available deployment percona-server-mongodb-operator
+                                minikube kubectl -- wait --for=condition=Available --timeout=60s deployment percona-xtradb-cluster-operator
+                                minikube kubectl -- wait --for=condition=Available --timeout=60s deployment percona-server-mongodb-operator
                             """
                         }
                     }
@@ -209,11 +209,14 @@ pipeline {
                             sh """
                                 scp -i "${KEY_PATH}" -o ConnectTimeout=1 -o StrictHostKeyChecking=no \
                                     ${USER}@${IP}:workspace/kubernetes-cluster-staging/kubeconfig.yml \
-                                    kubeconfig.yml
+                                    kubeconfig
                             """
                         }
-                        stash includes: 'kubeconfig.yml', name: 'kubeconfig'
-                        archiveArtifacts 'kubeconfig.yml'
+                        script {
+                            env.KUBECONFIG = sh(returnStdout: true, script: "cat kubeconfig").trim()
+                        }
+                        stash includes: 'kubeconfig', name: 'kubeconfig'
+                        archiveArtifacts 'kubeconfig'
                     }
                 }
             }
@@ -241,7 +244,7 @@ pipeline {
             }
         }
         failure {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                 sh '''
                     set -o xtrace
                     export REQUEST_ID=\$(cat REQUEST_ID)

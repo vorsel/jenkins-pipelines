@@ -9,9 +9,13 @@ pipeline {
             trim: true)
         string(
             defaultValue: '8.0',
-            description: 'Tag/Branch for PXC repository',
+            description: 'Tag/PR/Branch for PXC repository',
             name: 'BRANCH',
             trim: true)
+        booleanParam(
+            defaultValue: false, 
+            description: 'Check only if you pass PR number to BRANCH field',
+            name: 'USE_PR') 
         string(
             defaultValue: 'https://github.com/percona/percona-xtrabackup',
             description: 'URL to PXB80 repository',
@@ -22,6 +26,10 @@ pipeline {
             description: 'Tag/Branch for PXB80 repository',
             name: 'PXB80_BRANCH',
             trim: true)
+        booleanParam(
+            defaultValue: false, 
+            description: 'If checked, the PXB80_BRANCH will be ignored and latest available version will be used',
+            name: 'PXB80_LATEST') 
         string(
             defaultValue: 'https://github.com/percona/percona-xtrabackup',
             description: 'URL to PXB24 repository',
@@ -102,6 +110,18 @@ pipeline {
                 sh '''
                     MY_BRANCH_BASE_MAJOR=8
                     MY_BRANCH_BASE_MINOR=0
+
+                    if [[ ${USE_PR} == "true" ]]; then
+                        if [ -f /usr/bin/yum ]; then
+                            sudo yum -y install jq
+                        else
+                            sudo apt-get install -y jq
+                        fi
+
+                        GIT_REPO=$(curl https://api.github.com/repos/percona/percona-xtradb-cluster/pulls/${BRANCH} | jq -r '.head.repo.html_url')
+                        BRANCH=$(curl https://api.github.com/repos/percona/percona-xtradb-cluster/pulls/${BRANCH} | jq -r '.head.ref')
+                    fi
+
                     RAW_VERSION_LINK=$(echo ${GIT_REPO%.git} | sed -e "s:github.com:raw.githubusercontent.com:g")
                     REPLY=$(curl -Is ${RAW_VERSION_LINK}/${BRANCH}/MYSQL_VERSION | head -n 1 | awk '{print $2}')
                     if [[ ${REPLY} != 200 ]]; then
@@ -118,6 +138,48 @@ pipeline {
                     fi
                     rm -f ${WORKSPACE}/VERSION-${BUILD_NUMBER}
                 '''
+                echo 'Checking PXB80 branch version'
+                sh '''
+                    MY_BRANCH_BASE_MAJOR=8
+                    MY_BRANCH_BASE_MINOR=0
+                    RAW_VERSION_LINK=$(echo ${PXB80_REPO%.git} | sed -e "s:github.com:raw.githubusercontent.com:g")
+                    REPLY=$(curl -Is ${RAW_VERSION_LINK}/${PXB80_BRANCH}/XB_VERSION | head -n 1 | awk '{print $2}')
+                    if [[ ${REPLY} == 200 ]]; then
+                        wget ${RAW_VERSION_LINK}/${PXB80_BRANCH}/XB_VERSION -O ${WORKSPACE}/VERSION-${BUILD_NUMBER}
+                    else
+                        echo "Can not find XB_VERSION file in repository specified in ${PXB80_REPO}"
+                        exit 1
+                    fi
+                    source ${WORKSPACE}/VERSION-${BUILD_NUMBER}
+                    if [[ ${XB_VERSION_MAJOR} -lt ${MY_BRANCH_BASE_MAJOR} ]] ; then
+                        echo "Are you trying to build wrong branch of PXB?"
+                        echo "You are trying to build ${XB_VERSION_MAJOR}.${XB_VERSION_MINOR} instead of ${MY_BRANCH_BASE_MAJOR}.${MY_BRANCH_BASE_MINOR}!"
+                        rm -f ${WORKSPACE}/VERSION-${BUILD_NUMBER}
+                        exit 1
+                    fi
+                    rm -f ${WORKSPACE}/VERSION-${BUILD_NUMBER}     
+                '''
+                echo 'Checking PXB24 branch version'
+                sh '''
+                    MY_BRANCH_BASE_MAJOR=2
+                    MY_BRANCH_BASE_MINOR=4
+                    RAW_VERSION_LINK=$(echo ${PXB24_REPO%.git} | sed -e "s:github.com:raw.githubusercontent.com:g")
+                    REPLY=$(curl -Is ${RAW_VERSION_LINK}/${PXB24_BRANCH}/XB_VERSION | head -n 1 | awk '{print $2}')
+                    if [[ ${REPLY} == 200 ]]; then
+                        wget ${RAW_VERSION_LINK}/${PXB24_BRANCH}/XB_VERSION -O ${WORKSPACE}/VERSION-${BUILD_NUMBER}
+                    else
+                        echo "Can not find XB_VERSION file in repository specified in ${PXB24_REPO}"
+                        exit 1
+                    fi
+                    source ${WORKSPACE}/VERSION-${BUILD_NUMBER}
+                    if [[ ${XB_VERSION_MAJOR} -lt ${MY_BRANCH_BASE_MAJOR} ]] ; then
+                        echo "Are you trying to build wrong branch of PXB?"
+                        echo "You are trying to build ${XB_VERSION_MAJOR}.${XB_VERSION_MINOR} instead of ${MY_BRANCH_BASE_MAJOR}.${MY_BRANCH_BASE_MINOR}!"
+                        rm -f ${WORKSPACE}/VERSION-${BUILD_NUMBER}
+                        exit 1
+                    fi
+                    rm -f ${WORKSPACE}/VERSION-${BUILD_NUMBER}     
+                ''' 
             }
         }
         stage('Check out and Build PXB') {
@@ -138,6 +200,7 @@ pipeline {
                         echo 'Build PXB24'
                         withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'c42456e5-c28d-4962-b32c-b75d161bff27', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                             sh '''
+                                aws ecr-public get-login-password --region us-east-1 | docker login -u AWS --password-stdin public.ecr.aws/e7j3v3n0
                                 sg docker -c "
                                     if [ \$(docker ps -q | wc -l) -ne 0 ]; then
                                         docker ps -q | xargs docker stop --time 1 || :
@@ -173,6 +236,7 @@ pipeline {
                         echo 'Build PXB80'
                         withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'c42456e5-c28d-4962-b32c-b75d161bff27', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                             sh '''
+                                aws ecr-public get-login-password --region us-east-1 | docker login -u AWS --password-stdin public.ecr.aws/e7j3v3n0
                                 sg docker -c "
                                     if [ \$(docker ps -q | wc -l) -ne 0 ]; then
                                         docker ps -q | xargs docker stop --time 1 || :
@@ -219,6 +283,7 @@ pipeline {
                                 sleep 5
                             done
 
+                            aws ecr-public get-login-password --region us-east-1 | docker login -u AWS --password-stdin public.ecr.aws/e7j3v3n0
                             sg docker -c "
                                 if [ \$(docker ps -q | wc -l) -ne 0 ]; then
                                     docker ps -q | xargs docker stop --time 1 || :
@@ -249,6 +314,7 @@ pipeline {
                                 sleep 5
                             done
 
+                            aws ecr-public get-login-password --region us-east-1 | docker login -u AWS --password-stdin public.ecr.aws/e7j3v3n0
                             sg docker -c "
                                 if [ \$(docker ps -q | wc -l) -ne 0 ]; then
                                     docker ps -q | xargs docker stop --time 1 || :

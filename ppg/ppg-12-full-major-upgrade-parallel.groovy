@@ -3,11 +3,11 @@ library changelog: false, identifier: "lib@master", retriever: modernSCM([
     remote: 'https://github.com/Percona-Lab/jenkins-pipelines.git'
 ])
 
-def moleculeDir = "molecule/ppg/pg-12-full-major-upgrade"
+def moleculeDir = "ppg/pg-12-full-major-upgrade"
 
 pipeline {
   agent {
-      label 'micro-amazon'
+      label 'min-centos-7-x64'
   }
   environment {
       PATH = '/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/home/ec2-user/.local/bin'

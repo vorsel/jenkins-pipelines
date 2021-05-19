@@ -4,9 +4,6 @@ library changelog: false, identifier: 'lib@master', retriever: modernSCM([
 ]) _
 
 pipeline {
-    environment {
-        DESTINATION = 'pmm2-components/yum/laboratory'
-    }
     agent {
         label 'large-amazon'
     }
@@ -15,6 +12,11 @@ pipeline {
             defaultValue: 'PMM-2.0',
             description: 'Tag/Branch for pmm-submodules repository',
             name: 'GIT_BRANCH')
+        choice(
+            // default is choices.get(0) - experimental
+            choices: ['experimental', 'testing'],
+            description: 'Repo component to push packages to',
+            name: 'DESTINATION')
     }
     options {
         skipDefaultCheckout()
@@ -36,6 +38,7 @@ pipeline {
                     cd ../
                     wget https://github.com/git-lfs/git-lfs/releases/download/v2.7.1/git-lfs-linux-amd64-v2.7.1.tar.gz
                     tar -zxvf git-lfs-linux-amd64-v2.7.1.tar.gz
+                    rm git-lfs-linux-amd64-v2.7.1.tar.gz
                     sudo ./install.sh
                     cd $curdir
 
@@ -43,15 +46,28 @@ pipeline {
                     git clean -xdf
                     git submodule update --init --jobs 10
                     git submodule status
-                    cd sources/pmm-server-packaging/
+
+                    # install git-lfs to download binary packages from git
+                    pushd sources/pmm-server
                     git lfs install
                     git lfs pull
                     git lfs checkout
-                    cd $curdir
+                    popd
 
                     git rev-parse --short HEAD > shortCommit
-                    echo "UPLOAD/${DESTINATION}/${JOB_NAME}/pmm/\$(cat VERSION)/${GIT_BRANCH}/\$(cat shortCommit)/${BUILD_NUMBER}" > uploadPath
+                    echo "UPLOAD/pmm2-components/yum/${DESTINATION}/${JOB_NAME}/pmm/\$(cat VERSION)/${GIT_BRANCH}/\$(cat shortCommit)/${BUILD_NUMBER}" > uploadPath
                 '''
+
+                script {
+                    def versionTag = sh(returnStdout: true, script: "cat VERSION").trim()
+                    if ("${DESTINATION}" == "testing") {
+                        env.DOCKER_LATEST_TAG = "${versionTag}-rc${BUILD_NUMBER}"
+                        env.DOCKER_RC_TAG = "${versionTag}-rc"
+                    } else {
+                        env.DOCKER_LATEST_TAG = "dev-latest"
+                    }
+                }
+
                 archiveArtifacts 'uploadPath'
                 stash includes: 'uploadPath', name: 'uploadPath'
                 archiveArtifacts 'shortCommit'
@@ -111,7 +127,7 @@ pipeline {
         }
         stage('Build server packages') {
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     sh '''
                         sg docker -c "
                             set -o errexit
@@ -122,7 +138,6 @@ pipeline {
                             build-server-rpm percona-dashboards grafana-dashboards
                             build-server-rpm pmm-managed
                             build-server-rpm percona-qan-api2 qan-api2
-                            build-server-rpm percona-qan-app qan-app
                             build-server-rpm pmm-server
                             build-server-rpm pmm-update
                             build-server-rpm dbaas-controller
@@ -146,7 +161,7 @@ pipeline {
                 withCredentials([usernamePassword(credentialsId: 'hub.docker.com', passwordVariable: 'PASS', usernameVariable: 'USER')]) {
                     sh """
                         sg docker -c "
-                            docker login -u "${USER}" -p "${PASS}"
+                            echo "${PASS}" | docker login -u "${USER}" --password-stdin
                         "
                     """
                 }
@@ -159,11 +174,16 @@ pipeline {
 
                         ./build/bin/build-server-docker
 
-                        docker tag  \\${DOCKER_TAG} perconalab/pmm-server:dev-latest
+                        if [ ! -z \${DOCKER_RC_TAG+x} ]; then
+                            docker tag  \\${DOCKER_TAG} perconalab/pmm-server:${DOCKER_RC_TAG}
+                            docker push perconalab/pmm-server:\${DOCKER_RC_TAG}
+                            docker rmi perconalab/pmm-server:\${DOCKER_RC_TAG}
+                        fi
+                        docker tag  \\${DOCKER_TAG} perconalab/pmm-server:${DOCKER_LATEST_TAG}
                         docker push \\${DOCKER_TAG}
-                        docker push perconalab/pmm-server:dev-latest
+                        docker push perconalab/pmm-server:${DOCKER_LATEST_TAG}
                         docker rmi  \\${DOCKER_TAG}
-                        docker rmi  perconalab/pmm-server:dev-latest
+                        docker rmi  perconalab/pmm-server:${DOCKER_LATEST_TAG}
                     "
                 '''
                 stash includes: 'results/docker/TAG', name: 'IMAGE'
@@ -177,7 +197,7 @@ pipeline {
         }
         stage('Push to public repository') {
             steps {
-                sync2ProdPMM(DESTINATION, 'no')
+                sync2ProdPMM("pmm2-components/yum/${DESTINATION}", 'no')
             }
         }
     }
@@ -189,6 +209,11 @@ pipeline {
                     def IMAGE = sh(returnStdout: true, script: "cat results/docker/TAG").trim()
                     slackSend botUser: true, channel: '#pmm-ci', color: '#00FF00', message: "[${JOB_NAME}]: build finished - ${IMAGE} - ${BUILD_URL}"
                     slackSend botUser: true, channel: '@nailya.kutlubaeva', color: '#00FF00', message: "[${JOB_NAME}]: build finished - ${IMAGE}"
+                    if ("${DESTINATION}" == "testing")
+                    {
+                      currentBuild.description = "Release Candidate Build"
+                      slackSend botUser: true, channel: '#pmm-qa', color: '#00FF00', message: "[${JOB_NAME}]: ${BUILD_URL} Release Candidate build finished"
+                    }
                 } else {
                     slackSend botUser: true, channel: '#pmm-ci', color: '#FF0000', message: "[${JOB_NAME}]: build ${currentBuild.result} - ${BUILD_URL}"
                     slackSend botUser: true, channel: '#pmm-qa', color: '#FF0000', message: "[${JOB_NAME}]: build ${currentBuild.result} - ${BUILD_URL}"

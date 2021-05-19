@@ -12,7 +12,8 @@ pipeline {
     }
     parameters {
         choice(
-            choices: 'laboratory',
+            // default choice should be testing, since we publish RC on testing Repo
+            choices: ['testing', 'experimental'],
             description: 'publish pmm2-server packages from regular(laboratory) repository',
             name: 'UPDATER_REPO')
         string(
@@ -82,11 +83,19 @@ pipeline {
         }
         stage('Createrepo') {
             steps {
-                withCredentials([sshUserPrivateKey(credentialsId: 'repo.ci.percona.com', keyFileVariable: 'KEY_PATH', usernameVariable: 'USER')]) {
-                    sh '''
-                        ssh -o StrictHostKeyChecking=no -i ${KEY_PATH} ${USER}@repo.ci.percona.com \
+                withCredentials([string(credentialsId: 'SIGN_PASSWORD', variable: 'SIGN_PASSWORD')]) {
+                    withCredentials([sshUserPrivateKey(credentialsId: 'repo.ci.percona.com', keyFileVariable: 'KEY_PATH', usernameVariable: 'USER')]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no -i ${KEY_PATH} ${USER}@repo.ci.percona.com " \
                             createrepo --update /srv/repo-copy/pmm2-components/yum/release/7/RPMS/x86_64/
-                    '''
+                            if [ -f /srv/repo-copy/pmm2-components/yum/release/7/RPMS/x86_64/repodata/repomd.xml.asc ]; then
+                                rm -f /srv/repo-copy/pmm2-components/yum/release/7/RPMS/x86_64/repodata/repomd.xml.asc
+                            fi
+                            export SIGN_PASSWORD=\${SIGN_PASSWORD}
+                            gpg --detach-sign --armor --passphrase \${SIGN_PASSWORD} /srv/repo-copy/pmm2-components/yum/release/7/RPMS/x86_64/repodata/repomd.xml
+                        "
+                    """
+                    }
                 }
             }
         }
@@ -171,43 +180,50 @@ pipeline {
                     DOCKER_MID="\$TOP_VER.\$MID_VER"
                     sg docker -c "
                         set -ex
+                        # push pmm-server
                         docker pull \${DOCKER_VERSION}
-                        docker tag \${DOCKER_VERSION} percona/pmm-server:\${VERSION}
-                        docker tag \${DOCKER_VERSION} percona/pmm-server:\${DOCKER_MID}
+                        docker tag \${DOCKER_VERSION} percona/pmm-server:latest
+                        docker push percona/pmm-server:latest
+
                         docker tag \${DOCKER_VERSION} percona/pmm-server:\${TOP_VER}
-                        docker push percona/pmm-server:\${VERSION}
-                        docker push percona/pmm-server:\${DOCKER_MID}
+                        docker tag \${DOCKER_VERSION} percona/pmm-server:\${DOCKER_MID}
+                        docker tag \${DOCKER_VERSION} percona/pmm-server:\${VERSION}
                         docker push percona/pmm-server:\${TOP_VER}
-                        if [ \${TOP_VER} = 1 ]; then
-                            docker push percona/pmm-server:latest
-                        fi
+                        docker push percona/pmm-server:\${DOCKER_MID}
+                        docker push percona/pmm-server:\${VERSION}
+
+                        docker tag \${DOCKER_VERSION} perconalab/pmm-server:\${TOP_VER}
+                        docker tag \${DOCKER_VERSION} perconalab/pmm-server:\${DOCKER_MID}
+                        docker tag \${DOCKER_VERSION} perconalab/pmm-server:\${VERSION}
+                        docker push perconalab/pmm-server:\${TOP_VER}
+                        docker push perconalab/pmm-server:\${DOCKER_MID}
+                        docker push perconalab/pmm-server:\${VERSION}
+
                         docker save percona/pmm-server:\${VERSION} | xz > pmm-server-\${VERSION}.docker
 
+                        # push pmm-client
                         docker pull \${DOCKER_CLIENT_VERSION}
+                        docker tag \${DOCKER_CLIENT_VERSION} percona/pmm-client:latest
+                        docker push percona/pmm-client:latest
 
-                        if [ \${TOP_VER} = 1 ]; then
-                            docker tag \${DOCKER_CLIENT_VERSION} perconalab/pmm-client:latest
-                            docker push perconalab/pmm-client:latest
-                        fi
-
-                        docker tag \${DOCKER_CLIENT_VERSION} percona/pmm-client:\${VERSION}
-                        docker tag \${DOCKER_CLIENT_VERSION} percona/pmm-client:\${DOCKER_MID}
                         docker tag \${DOCKER_CLIENT_VERSION} percona/pmm-client:\${TOP_VER}
-                        docker push percona/pmm-client:\${VERSION}
-                        docker push percona/pmm-client:\${DOCKER_MID}
+                        docker tag \${DOCKER_CLIENT_VERSION} percona/pmm-client:\${DOCKER_MID}
+                        docker tag \${DOCKER_CLIENT_VERSION} percona/pmm-client:\${VERSION}
                         docker push percona/pmm-client:\${TOP_VER}
+                        docker push percona/pmm-client:\${DOCKER_MID}
+                        docker push percona/pmm-client:\${VERSION}
 
-                        docker tag \${DOCKER_CLIENT_VERSION} perconalab/pmm-client:\${VERSION}
-                        docker tag \${DOCKER_CLIENT_VERSION} perconalab/pmm-client:\${DOCKER_MID}
                         docker tag \${DOCKER_CLIENT_VERSION} perconalab/pmm-client:\${TOP_VER}
-                        docker push perconalab/pmm-client:\${VERSION}
-                        docker push perconalab/pmm-client:\${DOCKER_MID}
+                        docker tag \${DOCKER_CLIENT_VERSION} perconalab/pmm-client:\${DOCKER_MID}
+                        docker tag \${DOCKER_CLIENT_VERSION} perconalab/pmm-client:\${VERSION}
                         docker push perconalab/pmm-client:\${TOP_VER}
+                        docker push perconalab/pmm-client:\${DOCKER_MID}
+                        docker push perconalab/pmm-client:\${VERSION}
 
                         docker save percona/pmm-client:\${VERSION} | xz > pmm-client-\${VERSION}.docker
                     "
                 """
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     sh """
                         set -ex
                         aws s3 cp --only-show-errors pmm-server-\${VERSION}.docker s3://percona-vm/pmm-server-\${VERSION}.docker
@@ -222,7 +238,7 @@ pipeline {
                 label 'virtualbox'
             }
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     sh """
                         set -ex
                         aws s3 cp --only-show-errors s3://percona-vm/pmm-server-\${VERSION}.docker pmm-server-\${VERSION}.docker
@@ -258,7 +274,7 @@ pipeline {
                 label 'virtualbox'
             }
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     sh """
                         aws s3 cp --only-show-errors s3://percona-vm/\${OVF_IMAGE} pmm-server-\${VERSION}.ova
                     """
@@ -273,7 +289,7 @@ pipeline {
         }
         stage('Copy AMI') {
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     sh """
                         set -ex
                         get_image_id() {
@@ -328,7 +344,7 @@ pipeline {
         }
         stage('Publish AMI') {
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     sh """
                         set -ex
                         get_image_id() {

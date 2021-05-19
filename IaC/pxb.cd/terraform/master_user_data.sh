@@ -29,7 +29,7 @@ install_software() {
     yum -y update --security
     amazon-linux-extras install -y nginx1.12
     amazon-linux-extras install -y epel
-    yum -y install java-1.8.0-openjdk-1.8.0.272.b10 jenkins-2.263.3 certbot git yum-cron aws-cli xfsprogs
+    yum -y install java-1.8.0-openjdk jenkins-2.277.2 certbot git yum-cron aws-cli xfsprogs
 
     sed -i 's/update_cmd = default/update_cmd = security/' /etc/yum/yum-cron.conf
     sed -i 's/apply_updates = no/apply_updates = yes/'     /etc/yum/yum-cron.conf
@@ -235,6 +235,27 @@ EOF
     fi
 }
 
+setup_ssh_keys() {
+    KEYS_LIST="mykola.marzhan evgeniy.patlan slava.sarzhan illia.pshonkin alex.miroshnychenko eduardo.casarero santiago.ruiz andrew.siemen kamil.babayev"
+
+    for KEY in $KEYS_LIST; do
+        RETRY="3"
+        while [ $RETRY != "0" ]; do
+            STATUS=$(curl -Is https://www.percona.com/get/engineer/KEY/$KEY.pub | head -n1 | awk '{print $2}')
+            if [[ $STATUS -eq 200 ]]; then
+                curl -s https://www.percona.com/get/engineer/KEY/$KEY.pub | tee -a /home/ec2-user/.ssh/authorized_keys
+                RETRY="0"
+            elif [[ $STATUS -eq 404 ]]; then
+                echo "Skipping key $KEY"
+                RETRY=0
+            else
+                echo "Got $STATUS, retrying"
+                RETRY=$(($RETRY-1))
+            fi
+        done
+    done
+}
+
 main() {
     setup_aws
     install_software
@@ -245,6 +266,7 @@ main() {
     setup_dhparam
     setup_letsencrypt
     setup_nginx_allow_list
+    setup_ssh_keys
 }
 
 main

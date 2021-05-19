@@ -77,6 +77,7 @@ pipeline {
                             sudo rm -rf sources
                             ./local/checkout
 
+                            aws ecr-public get-login-password --region us-east-1 | docker login -u AWS --password-stdin public.ecr.aws/e7j3v3n0
                             echo Build: \$(date -u "+%s")
                             sg docker -c "
                                 if [ \$(docker ps -q | wc -l) -ne 0 ]; then
@@ -129,7 +130,7 @@ pipeline {
                                 " > public_url
                             '''
                         }
-                        warnings canComputeNew: false, canResolveRelativePaths: false, categoriesPattern: '', defaultEncoding: '', excludePattern: '', healthy: '', includePattern: '', messagesPattern: '', parserConfigurations: [[parserName: 'GNU C Compiler 4 (gcc)', pattern: 'build.log']], unHealthy: ''
+                        recordIssues enabledForFailure: true, tools: [gcc(pattern: 'build.log')]
                         archiveArtifacts 'build.log.gz,public_url'
                     }
                 }

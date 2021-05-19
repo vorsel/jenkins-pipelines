@@ -30,9 +30,13 @@ pipeline {
             description: 'Which Version of PMM-Server',
             name: 'PMM_VERSION')
         choice(
-            choices: ['yes', 'no'],
-            description: 'Enable Testing Repo?',
+            choices: ['no', 'yes'],
+            description: 'Enable Testing Repo, for RC testing',
             name: 'ENABLE_TESTING_REPO')
+        choice(
+            choices: ['yes', 'no'],
+            description: 'Enable Experimental Repo, for dev-latest',
+            name: 'ENABLE_EXPERIMENTAL_REPO')
         choice(
             choices: ['no', 'yes'],
             description: 'Enable Push Mode, if you are using this instance as Client Node',
@@ -46,7 +50,7 @@ pipeline {
             description: 'Percona XtraDB Cluster version',
             name: 'PXC_VERSION')
         choice(
-            choices: ['8.0', '5.7', '5.6'],
+            choices: ['8.0', '5.7', '5.7.30', '5.6'],
             description: "Percona Server for MySQL version",
             name: 'PS_VERSION')
         choice(
@@ -54,11 +58,11 @@ pipeline {
             description: 'MySQL Community Server version',
             name: 'MS_VERSION')
         choice(
-            choices: ['12', '11', '10.8'],
+            choices: ['13', '12', '11', '10.8'],
             description: "Which version of PostgreSQL",
             name: 'PGSQL_VERSION')
         choice(
-            choices: ['12','11'],
+            choices: ['13.2-2', '12', '11'],
             description: 'Percona Distribution for PostgreSQL',
             name: 'PDPGSQL_VERSION')
         choice(
@@ -256,6 +260,7 @@ pipeline {
                                     docker run -d \
                                         -p 80:80 \
                                         -p 443:443 \
+                                        -p 9000:9000 \
                                         --volumes-from \${VM_NAME}-data \
                                         --name \${VM_NAME}-server \
                                         --restart always \
@@ -304,8 +309,32 @@ pipeline {
                             sh """
                                 set -o errexit
                                 set -o xtrace
-                                docker exec \${VM_NAME}-server sed -i'' -e 's^/release/^/laboratory/^' /etc/yum.repos.d/pmm2-server.repo
+                                docker exec \${VM_NAME}-server sed -i'' -e 's^/release/^/testing/^' /etc/yum.repos.d/pmm2-server.repo
                                 docker exec \${VM_NAME}-server percona-release enable original testing
+                                docker exec \${VM_NAME}-server yum clean all
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        stage('Enable Experimental Repo') {
+            when {
+                expression { env.PMM_VERSION == "pmm2" && env.CLIENT_INSTANCE == "no" && env.ENABLE_EXPERIMENTAL_REPO == "yes" && env.ENABLE_TESTING_REPO == "no" }
+            }
+            steps {
+                script {
+                    withEnv(['JENKINS_NODE_COOKIE=dontKillMe']) {
+                        sh """
+                            export IP=\$(cat IP)
+                            export VM_NAME=\$(cat VM_NAME)
+                        """
+                        node(env.VM_NAME){
+                            sh """
+                                set -o errexit
+                                set -o xtrace
+                                docker exec \${VM_NAME}-server sed -i'' -e 's^/release/^/experimental/^' /etc/yum.repos.d/pmm2-server.repo
+                                docker exec \${VM_NAME}-server percona-release enable original experimental
                                 docker exec \${VM_NAME}-server yum clean all
                             """
                         }
@@ -316,101 +345,11 @@ pipeline {
         stage('Run Clients') {
             steps {
                 node(env.VM_NAME){
+                    setupPMMClient(SERVER_IP, CLIENT_VERSION, PMM_VERSION, ENABLE_PUSH_MODE, ENABLE_TESTING_REPO, CLIENT_INSTANCE)
                     sh """
                         set -o errexit
                         set -o xtrace
                         export PATH=\$PATH:/usr/sbin
-                        test -f /usr/lib64/libsasl2.so.2 || sudo ln -s /usr/lib64/libsasl2.so.3.0.0 /usr/lib64/libsasl2.so.2
-                        export CLIENT_IP=\$(curl ifconfig.me);
-                        sudo yum -y install https://repo.percona.com/yum/percona-release-latest.noarch.rpm || true
-                        if [[ \$CLIENT_VERSION = dev-latest ]]; then
-                            sudo percona-release enable-only original testing
-                            sudo yum clean all
-                            sudo yum makecache
-                            sudo yum -y install pmm2-client
-                            sudo yum -y update
-                        elif [[ \$CLIENT_VERSION = pmm2-latest ]]; then
-                            sudo yum clean all
-                            sudo yum -y install pmm2-client
-                            sudo yum -y update
-                            sudo percona-release enable-only original testing
-                        elif [[ \$CLIENT_VERSION = 2* ]]; then
-                            sudo yum clean all
-                            sudo yum -y install pmm2-client-\$CLIENT_VERSION-6.el7.x86_64
-                            sudo percona-release enable-only original testing
-                            sleep 15
-                        elif [[ \$CLIENT_VERSION = pmm1-dev-latest ]]; then
-                            sudo percona-release enable-only original testing
-                            sudo yum clean all
-                            sudo yum -y install pmm-client
-                            sudo yum -y update
-                        else
-                            if [[ \$PMM_VERSION == pmm1 ]]; then
-                                    if [[ \$CLIENT_VERSION == http* ]]; then
-                                    wget -O pmm-client.tar.gz --progress=dot:giga "\${CLIENT_VERSION}"
-                                else
-                                    wget -O pmm-client.tar.gz --progress=dot:giga "https://www.percona.com/downloads/pmm-client/pmm-client-\${CLIENT_VERSION}/binary/tarball/pmm-client-\${CLIENT_VERSION}.tar.gz"
-                                fi
-                                tar -zxpf pmm-client.tar.gz
-                                pushd pmm-client-*
-                                    sudo ./install
-                                popd
-                            else
-                                if [[ \$CLIENT_VERSION == http* ]]; then
-                                    wget -O pmm2-client.tar.gz --progress=dot:giga "\${CLIENT_VERSION}"
-                                else
-                                    wget -O pmm2-client.tar.gz --progress=dot:giga "https://www.percona.com/downloads/pmm2/\${CLIENT_VERSION}/binary/tarball/pmm2-client-\${CLIENT_VERSION}.tar.gz"
-                                fi
-                                export BUILD_ID=dear-jenkins-please-dont-kill-virtualbox
-                                export JENKINS_NODE_COOKIE=dear-jenkins-please-dont-kill-virtualbox
-                                export JENKINS_SERVER_COOKIE=dear-jenkins-please-dont-kill-virtualbox
-                                tar -zxpf pmm2-client.tar.gz
-                                rm -r pmm2-client.tar.gz
-                                mv pmm2-client-* pmm2-client
-                                cd pmm2-client
-                                sudo bash -x ./install_tarball
-                                pwd
-                                cd ../
-                                export PMM_CLIENT_BASEDIR=`ls -1td pmm2-client 2>/dev/null | grep -v ".tar" | head -n1`
-                                export PATH="`pwd`/pmm2-client/bin:$PATH"
-                                echo "export PATH=`pwd`/pmm2-client/bin:$PATH" >> ~/.bash_profile
-                                source ~/.bash_profile
-                                pmm-admin --version
-                                if [[ \$CLIENT_INSTANCE == yes ]]; then
-                                    if [[ \$ENABLE_PUSH_MODE == yes ]]; then
-                                        pmm-agent setup --config-file=`pwd`/pmm2-client/config/pmm-agent.yaml --server-address=\$SERVER_IP:443 --server-insecure-tls --server-username=admin --server-password=admin --metrics-mode=push \$IP
-                                    else
-                                        pmm-agent setup --config-file=`pwd`/pmm2-client/config/pmm-agent.yaml --server-address=\$SERVER_IP:443 --server-insecure-tls --server-username=admin --server-password=admin \$IP
-                                    fi
-                                else
-                                    pmm-agent setup --config-file=`pwd`/pmm2-client/config/pmm-agent.yaml --server-address=\$IP:443 --server-insecure-tls --server-username=admin --server-password=admin \$IP
-                                fi
-                                sleep 10
-                                JENKINS_NODE_COOKIE=dontKillMe nohup bash -c 'pmm-agent --config-file=`pwd`/pmm2-client/config/pmm-agent.yaml > pmm-agent.log 2>&1 &'
-                                sleep 10
-                                cat pmm-agent.log
-                                pmm-admin status
-                            fi
-                        fi
-                        export PATH=\$PATH:/usr/sbin:/sbin
-                        if [[ \$PMM_VERSION == pmm2 ]]; then
-                            if [[ \$CLIENT_VERSION == dev-latest ]] || [[ \$CLIENT_VERSION == pmm2-latest ]] || [[ \$CLIENT_VERSION == 2* ]]; then
-                                pmm-admin --version
-                                if [[ \$CLIENT_INSTANCE == yes ]]; then
-                                    if [[ \$ENABLE_PUSH_MODE == yes ]]; then
-                                        sudo pmm-agent setup --server-address=\$SERVER_IP:443 --server-insecure-tls --server-username=admin --server-password=admin --metrics-mode=push \$IP
-                                    else
-                                        sudo pmm-agent setup --server-address=\$SERVER_IP:443 --server-insecure-tls --server-username=admin --server-password=admin \$IP
-                                    fi
-                                else
-                                    sudo pmm-agent setup --server-address=\$IP:443 --server-insecure-tls --server-username=admin --server-password=admin \$IP
-                                fi
-                                sleep 10
-                                pmm-admin list
-                            fi
-                        else
-                            sudo pmm-admin config --client-name pmm-client-hostname --server `ip addr show eth0 | grep 'inet ' | awk '{print\\\$2}' | cut -d '/' -f 1`
-                        fi
                         [ -z "${CLIENTS}" ] && exit 0 || :
                         if [[ \$PMM_VERSION == pmm1 ]]; then
                             bash /srv/pmm-qa/pmm-tests/pmm-framework.sh \
@@ -479,7 +418,7 @@ pipeline {
             }
         }
         failure {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AMI/OVF', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'pmm-staging-slave', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                 sh '''
                     set -o xtrace
                     export REQUEST_ID=\$(cat REQUEST_ID)

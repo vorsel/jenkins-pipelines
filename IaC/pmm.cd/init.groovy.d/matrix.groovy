@@ -145,9 +145,10 @@ authz_strategy_config = [
     user_permissions: [
         'percona*Build Engineers': ['Overall Administer'],
         'percona*iit': ['Overall Administer'],
-        'percona*PMM': ['Overall Read','Agent Build','Agent Configure','Agent Connect','Agent Create','Agent Delete','Agent Disconnect','Job Build','Job Cancel','Job Configure','Job Create','Job Delete','Job Discover','Job Move','Job Read','Job Workspace','Run Delete','Run Update','Run Replay','View Configure','View Create','View Delete','View Read','SCM Tag'],
-        'percona*ext-victoriametrics': ['Overall Read','Job Build','Job Cancel','Job Read','Run Replay','Run Update'],
-        'percona*ext-sde': ['Overall Read','Job Build','Job Cancel','Job Read','Run Replay','Run Update'],
+        'percona*pmm-devs': ['Overall Read','Agent Build','Agent Configure','Agent Connect','Agent Create','Agent Delete','Agent Disconnect','Job Build','Job Cancel','Job Configure','Job Create','Job Delete','Job Discover','Job Move','Job Read','Job Workspace','Run Delete','Run Update','Run Replay','View Configure','View Create','View Delete','View Read','SCM Tag'],
+        'percona*ext-sde': ['Overall Read','Agent Build','Agent Configure','Agent Connect','Agent Create','Agent Delete','Agent Disconnect','Job Build','Job Cancel','Job Configure','Job Create','Job Delete','Job Discover','Job Move','Job Read','Job Workspace','Run Delete','Run Update','Run Replay','View Configure','View Create','View Delete','View Read','SCM Tag'],
+        'percona*PMM Contributors': ['Overall Read','Agent Build','Job Build','Job Cancel','Job Discover','Job Read','View Read'],
+        'atymchuk': ['Overall Administer'],
     ]
 ]
 

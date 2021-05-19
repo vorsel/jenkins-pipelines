@@ -34,7 +34,7 @@ Parameters:
 Mappings:
   AmazonLinux2:
     us-west-2:
-      x64: ami-a9d09ed1
+      x64: ami-0518bb0e75d3619ca
 
 Resources:
 
@@ -181,7 +181,27 @@ Resources:
       - IpProtocol: tcp
         FromPort: 22
         ToPort: 22
-        CidrIp: 159.65.115.164/32
+        CidrIp: 176.37.55.60/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 188.163.20.103/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 213.159.239.48/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 46.149.86.84/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 54.214.47.252/32
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 54.214.47.254/32
       Tags:
       - Key: iit-billing-tag
         Value: !Ref JShortName
@@ -475,13 +495,12 @@ Resources:
                   amazon-linux-extras install epel -y
                   yum -y update --security
                   amazon-linux-extras install -y nginx1.12
-                  yum -y install java-1.8.0-openjdk-1.8.0.272.b10 jenkins-2.263.2 certbot git yum-cron aws-cli xfsprogs
+                  yum -y install java-1.8.0-openjdk jenkins-2.277.2 certbot git yum-cron aws-cli xfsprogs
 
                   sed -i 's/update_cmd = default/update_cmd = security/' /etc/yum/yum-cron.conf
                   sed -i 's/apply_updates = no/apply_updates = yes/'     /etc/yum/yum-cron.conf
                   echo "exclude=java*" >> /etc/yum/yum-cron.conf
-                  chkconfig yum-cron on
-                  service yum-cron start
+                  systemctl enable --now yum-cron
               }
 
               volume_state() {
@@ -547,13 +566,13 @@ Resources:
                   sed -i 's^"-Djava.awt.headless=true"^"-Djava.awt.headless=true -Xms2048m -Xmx4096m -server -XX:+AlwaysPreTouch -verbose:gc -Xloggc:$JENKINS_HOME/gc-%t.log -XX:NumberOfGCLogFiles=5 -XX:+UseGCLogFileRotation -XX:GCLogFileSize=20m -XX:+PrintGC -XX:+PrintGCDateStamps -XX:+PrintGCDetails -XX:+PrintHeapAtGC -XX:+PrintGCCause -XX:+PrintTenuringDistribution -XX:+PrintReferenceGC -XX:+PrintAdaptiveSizePolicy -XX:+UseConcMarkSweepGC -XX:+ExplicitGCInvokesConcurrentAndUnloadsClasses -XX:+CMSParallelRemarkEnabled -XX:+ParallelRefProcEnabled -XX:+CMSClassUnloadingEnabled -XX:+ScavengeBeforeFullGC -XX:+CMSScavengeBeforeRemark -XX:NewSize=512m -XX:MaxNewSize=3g -XX:NewRatio=2 -Dorg.jenkinsci.plugins.durabletask.BourneShellScript.HEARTBEAT_CHECK_INTERVAL=600"^' /etc/sysconfig/jenkins
                   echo JENKINS_HOME=/mnt/$JENKINS_HOST \
                       | tee -a /etc/sysconfig/jenkins
-                  chkconfig jenkins on
-                  service jenkins start
+                  systemctl enable jenkins
+                  systemctl start jenkins
 
                   #echo "/usr/bin/aws s3 sync --sse-kms-key-id alias/jenkins-pmm-backup --sse aws:kms --exclude '*/caches/*' --exclude '*/config-history/nodes/*' --exclude '*/secretFiles/*' --delete /mnt/ s3://backup.cd.percona.com/" > /etc/cron.daily/jenkins-backup
                   #chmod 755 /etc/cron.daily/jenkins-backup
 
-                  printf "* * * * * root bash -c 'curl -s http://169.254.169.254/latest/meta-data/spot/instance-action | grep action && sh -c \"service jenkins stop; cp /var/log/jenkins/jenkins.log /mnt/jenkins-latest.log; umount /mnt\" || :'\n* * * * * root sleep 30; bash -c 'curl -s http://169.254.169.254/latest/meta-data/spot/instance-action | grep action && sh -c \"service jenkins stop; cp /var/log/jenkins/jenkins.log /mnt/jenkins-latest.log; umount /mnt\" || :'\n" > /etc/cron.d/terminate-check
+                  printf "* * * * * root bash -c 'curl -s http://169.254.169.254/latest/meta-data/spot/instance-action | grep action && sh -c \"systemctl stop jenkins; cp /var/log/jenkins/jenkins.log /mnt/jenkins-latest.log; umount /mnt\" || :'\n* * * * * root sleep 30; bash -c 'curl -s http://169.254.169.254/latest/meta-data/spot/instance-action | grep action && sh -c \"systemctl stop jenkins; cp /var/log/jenkins/jenkins.log /mnt/jenkins-latest.log; umount /mnt\" || :'\n" > /etc/cron.d/terminate-check
               }
 
               create_fake_ssl_cert() {
@@ -631,19 +650,23 @@ Resources:
               		  }
               		}
               	EOF
-                  chkconfig nginx on
-                  service nginx start
+                  systemctl enable --now nginx
               }
 
               setup_letsencrypt() {
-                  certbot --debug --non-interactive certonly --agree-tos --register-unsafely-without-email --webroot -w /usr/share/nginx/html --keep -d $JENKINS_HOST
+                  if [[ -d /mnt/ssl_backup ]]; then
+                    rsync -aHSv --delete /mnt/ssl_backup/ /etc/letsencrypt/
+                    certbot renew
+                  else
+                    certbot --debug --non-interactive certonly --agree-tos --register-unsafely-without-email --webroot -w /usr/share/nginx/html --keep -d $JENKINS_HOST
+                  fi
                   ln -f -s /etc/letsencrypt/live/$JENKINS_HOST/fullchain.pem /etc/nginx/ssl/certificate.crt
                   ln -f -s /etc/letsencrypt/live/$JENKINS_HOST/privkey.pem   /etc/nginx/ssl/certificate.key
-                  printf '#!/bin/sh\ncertbot renew\nservice nginx restart\n' > /etc/cron.daily/certbot
+                  printf '#!/bin/sh\ncertbot renew\nsystemctl restart nginx\nrsync -aHSv --delete /etc/letsencrypt/ /mnt/ssl_backup/\n' > /etc/cron.daily/certbot
                   chmod 755 /etc/cron.daily/certbot
-                  service nginx stop
+                  systemctl stop nginx
                   sleep 2
-                  service nginx start
+                  systemctl start nginx
               }
 
               setup_dhparam() {
@@ -651,7 +674,28 @@ Resources:
                       openssl dhparam -out /mnt/$JENKINS_HOST/ssl/dhparam-4096.pem 4096
                   fi
                   cp /mnt/$JENKINS_HOST/ssl/dhparam-4096.pem /etc/nginx/ssl/dhparam.pem
-                  service nginx restart
+                  systemctl restart nginx
+              }
+
+              setup_ssh_keys() {
+                KEYS_LIST="mykola.marzhan evgeniy.patlan slava.sarzhan illia.pshonkin alex.miroshnychenko eduardo.casarero santiago.ruiz andrew.siemen kamil.babayev"
+
+                for KEY in $KEYS_LIST; do
+                    RETRY="3"
+                    while [ $RETRY != "0" ]; do
+                        STATUS=$(curl -Is https://www.percona.com/get/engineer/KEY/$KEY.pub | head -n1 | awk '{print $2}')
+                        if [[ $STATUS -eq 200 ]]; then
+                            curl -s https://www.percona.com/get/engineer/KEY/$KEY.pub | tee -a /home/ec2-user/.ssh/authorized_keys
+                            RETRY="0"
+                        elif [[ $STATUS -eq 404 ]]; then
+                            echo "Skipping key $KEY"
+                            RETRY=0
+                        else
+                            echo "Got $STATUS, retrying"
+                            RETRY=$(($RETRY-1))
+                        fi
+                    done
+                done
               }
 
               main() {
@@ -663,6 +707,7 @@ Resources:
                   setup_nginx
                   setup_dhparam
                   setup_letsencrypt
+                  setup_ssh_keys
               }
 
               main
