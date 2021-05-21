@@ -1,7 +1,7 @@
 /* groovylint-disable DuplicateStringLiteral, GStringExpressionWithinString, LineLength */
-library changelog: false, identifier: 'lib@master', retriever: modernSCM([
+library changelog: false, identifier: 'lib@PXC-3515_fix_centos6_artifacts_upoload2', retriever: modernSCM([
     $class: 'GitSCMSource',
-    remote: 'https://github.com/Percona-Lab/jenkins-pipelines.git'
+    remote: 'https://github.com/vorsel/jenkins-pipelines.git'
 ]) _
 
 void installCli(String PLATFORM) {
@@ -89,7 +89,7 @@ parameters {
                label 'min-xenial-x64'
             }
             steps {
-                slackNotify("#releases", "#00FF00", "[${JOB_NAME}]: starting build for ${BRANCH}")
+                slackNotify("@alex.miroshnychenko", "#00FF00", "[${JOB_NAME}]: starting build for ${BRANCH}")
                 cleanUpWS()
                 installCli("deb")
                 buildStage("ubuntu:xenial", "--get_sources=1")
@@ -335,7 +335,7 @@ parameters {
             deleteDir()
         }
         failure {
-            slackNotify("#releases", "#FF0000", "[${JOB_NAME}]: build failed for ${BRANCH}")
+            slackNotify("@alex.miroshnychenko", "#FF0000", "[${JOB_NAME}]: build failed for ${BRANCH}")
             deleteDir()
         }
         always {
