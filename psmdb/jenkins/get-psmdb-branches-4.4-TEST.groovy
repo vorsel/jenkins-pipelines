@@ -1,6 +1,6 @@
-library changelog: false, identifier: 'lib@master', retriever: modernSCM([
+library changelog: false, identifier: 'lib@PSMDB-870_get_tools_tag_44', retriever: modernSCM([
     $class: 'GitSCMSource',
-    remote: 'https://github.com/Percona-Lab/jenkins-pipelines.git'
+    remote: 'https://github.com/vorsel/jenkins-pipelines.git'
 ]) _
 
 pipeline {
@@ -25,46 +25,51 @@ pipeline {
                 withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'AWS_STASH', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
                     sh """
                         EC=0
-                        aws s3 ls s3://percona-jenkins-artifactory/percona-server-mongodb/branch_commit_id_44.properties || EC=\$?
+                        aws s3 ls s3://percona-jenkins-artifactory/percona-server-mongodb/branch_commit_id_44-TEST.properties || EC=\$?
 
 			if [ \${EC} = 1 ]; then
 			  LATEST_RELEASE_BRANCH=\$(git -c 'versionsort.suffix=-' ls-remote --heads --sort='v:refname' ${GIT_REPO} release-4.4\\* | tail -1)
 			  BRANCH_NAME=\$(echo \${LATEST_RELEASE_BRANCH} | cut -d "/" -f 3)
 			  COMMIT_ID=\$(echo \${LATEST_RELEASE_BRANCH} | cut -d " " -f 1)
-                          MONGO_TOOLS_TAG_LINK=\$(echo ${GIT_REPO} | sed -re 's|github.com|raw.githubusercontent.com|; s|\\.git$||')
+                          MONGO_TOOLS_TAG_LINK=\$(echo ${GIT_REPO} | sed -re 's|github.com|raw.githubusercontent.com|; s|\\.git\$||')
                           MONGO_TOOLS_TAG=\$(curl \${MONGO_TOOLS_TAG_LINK}/\${BRANCH_NAME}/MONGO_TOOLS_TAG_VERSION)
 
-			  echo "BRANCH_NAME=\${BRANCH_NAME}" > branch_commit_id_44.properties
-			  echo "COMMIT_ID=\${COMMIT_ID}" >> branch_commit_id_44.properties
+			  echo "BRANCH_NAME=\${BRANCH_NAME}" > branch_commit_id_44-TEST.properties
+			  echo "COMMIT_ID=\${COMMIT_ID}" >> branch_commit_id_44-TEST.properties
+                          echo "MONGO_TOOLS_TAG=\${MONGO_TOOLS_TAG}" >> branch_commit_id_44-TEST.properties
 
-			  aws s3 cp branch_commit_id_44.properties s3://percona-jenkins-artifactory/percona-server-mongodb/
-                          echo "START_NEW_BUILD=NO" > startBuild
+			  aws s3 cp branch_commit_id_44-TEST.properties s3://percona-jenkins-artifactory/percona-server-mongodb/
+                          echo "START_NEW_BUILD=YES" > startBuild
 			else
-                          aws s3 cp s3://percona-jenkins-artifactory/percona-server-mongodb/branch_commit_id_44.properties .
-			  source branch_commit_id_44.properties
+                          aws s3 cp s3://percona-jenkins-artifactory/percona-server-mongodb/branch_commit_id_44-TEST.properties .
+			  source branch_commit_id_44-TEST.properties
 
 			  LATEST_RELEASE_BRANCH=\$(git -c 'versionsort.suffix=-' ls-remote --heads --sort='v:refname' ${GIT_REPO} release-4.4\\* | tail -1)
 			  LATEST_BRANCH_NAME=\$(echo \${LATEST_RELEASE_BRANCH} | cut -d "/" -f 3)
 			  LATEST_COMMIT_ID=\$(echo \${LATEST_RELEASE_BRANCH} | cut -d " " -f 1)
+                          MONGO_TOOLS_TAG_LINK=\$(echo ${GIT_REPO} | sed -re 's|github.com|raw.githubusercontent.com|; s|\\.git\$||')
+                          MONGO_TOOLS_TAG=\$(curl \${MONGO_TOOLS_TAG_LINK}/\${LATEST_BRANCH_NAME}/MONGO_TOOLS_TAG_VERSION)
 
 			  if [ "x\${COMMIT_ID}" != "x\${LATEST_COMMIT_ID}" ] || [ "x\${BRANCH_NAME}" != "x\${LATEST_BRANCH_NAME}" ]; then
 			    echo "START_NEW_BUILD=YES" > startBuild
 			  else
-			    echo "START_NEW_BUILD=NO" > startBuild
+			    echo "START_NEW_BUILD=YES" > startBuild
 			  fi
 
-			  echo "BRANCH_NAME=\${LATEST_BRANCH_NAME}" > branch_commit_id_44.properties
-			  echo "COMMIT_ID=\${LATEST_COMMIT_ID}" >> branch_commit_id_44.properties
-                          aws s3 cp branch_commit_id_44.properties s3://percona-jenkins-artifactory/percona-server-mongodb/
+			  echo "BRANCH_NAME=\${LATEST_BRANCH_NAME}" > branch_commit_id_44-TEST.properties
+			  echo "COMMIT_ID=\${LATEST_COMMIT_ID}" >> branch_commit_id_44-TEST.properties
+                          echo "MONGO_TOOLS_TAG=\${MONGO_TOOLS_TAG}" >> branch_commit_id_44-TEST.properties
+                          aws s3 cp branch_commit_id_44-TEST.properties s3://percona-jenkins-artifactory/percona-server-mongodb/
                         fi
                     """
                 }
                 script {
                     START_NEW_BUILD = sh(returnStdout: true, script: "source startBuild; echo \${START_NEW_BUILD}").trim()
-                    BRANCH_NAME = sh(returnStdout: true, script: "source branch_commit_id_44.properties; echo \${BRANCH_NAME}").trim()
-                    COMMIT_ID = sh(returnStdout: true, script: "source branch_commit_id_44.properties; echo \${COMMIT_ID}").trim()
-                    VERSION = sh(returnStdout: true, script: "source branch_commit_id_44.properties; echo \${BRANCH_NAME} | cut -d - -f 2 ").trim()
-                    RELEASE = sh(returnStdout: true, script: "source branch_commit_id_44.properties; echo \${BRANCH_NAME} | cut -d - -f 3 ").trim()
+                    BRANCH_NAME = sh(returnStdout: true, script: "source branch_commit_id_44-TEST.properties; echo \${BRANCH_NAME}").trim()
+                    COMMIT_ID = sh(returnStdout: true, script: "source branch_commit_id_44-TEST.properties; echo \${COMMIT_ID}").trim()
+                    VERSION = sh(returnStdout: true, script: "source branch_commit_id_44-TEST.properties; echo \${BRANCH_NAME} | cut -d - -f 2 ").trim()
+                    RELEASE = sh(returnStdout: true, script: "source branch_commit_id_44-TEST.properties; echo \${BRANCH_NAME} | cut -d - -f 3 ").trim()
+                    MONGO_TOOLS_TAG = sh(returnStdout: true, script: "source branch_commit_id_44-TEST.properties; echo \${MONGO_TOOLS_TAG}").trim()
                 }
 
             }
@@ -80,8 +85,8 @@ pipeline {
                         echo ${START_NEW_BUILD}: build required
                     """
                 }
-                slackNotify("#releases", "#00FF00", "[${JOB_NAME}]: new changes for branch ${BRANCH_NAME}[commit id: ${COMMIT_ID}] were detected, build will be started soon")
-                build job: 'psmdb44-autobuild-RELEASE', parameters: [string(name: 'GIT_BRANCH', value: BRANCH_NAME), string(name: 'PSMDB_VERSION', value: VERSION), string(name: 'PSMDB_RELEASE', value: RELEASE), string(name: 'COMPONENT', value: 'testing')]
+                slackNotify("@alex.miroshnychenko", "#00FF00", "[${JOB_NAME}]: new changes for branch ${BRANCH_NAME}[commit id: ${COMMIT_ID}] were detected, build will be started soon with tag: |${MONGO_TOOLS_TAG}|")
+                //build job: 'psmdb44-autobuild-RELEASE', parameters: [string(name: 'GIT_BRANCH', value: BRANCH_NAME), string(name: 'PSMDB_VERSION', value: VERSION), string(name: 'PSMDB_RELEASE', value: RELEASE), string(name: 'COMPONENT', value: 'testing')]
 
             }
         }

@@ -1,0 +1,15 @@
+- job:
+    name: psmdb44-get-tools-tag-TEST
+    project-type: pipeline
+    description: |
+        Do not edit this job through the web!
+        Check PSMDB repo for new release branches to build packages
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/vorsel/jenkins-pipelines.git
+            branches:
+            - 'PSMDB-870_get_tools_tag_44'
+            wipe-workspace: false
+      lightweight-checkout: true
+      script-path: psmdb/jenkins/get-psmdb-branches-4.4-TEST.groovy
