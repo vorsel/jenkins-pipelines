@@ -55,8 +55,7 @@ def call(String FOLDER_NAME, String AWS_STASH_PATH) {
                     fi
 
                     if [ `find . -name "*.noarch.rpm" | wc -l` -gt 0 ]; then
-                        Vers=("6" "7" "8" "9")
-                        for osVer in "\${Vers[@]}"; do
+                        for osVer in 6 7 8 9; do
                             ssh -o StrictHostKeyChecking=no -i ${KEY_PATH} ${USER}@repo.ci.percona.com \
                                 mkdir -p \${path_to_build}/binary/redhat/\${osVer}/\${arch}
                             scp -o StrictHostKeyChecking=no -i ${KEY_PATH} \
