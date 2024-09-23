@@ -52,7 +52,7 @@ pipeline {
             description: 'DEB release value',
             name: 'DEB_RELEASE')
         string(
-            defaultValue: '2.5.0',
+            defaultValue: '2.6.0',
             description: 'VERSION value',
             name: 'VERSION')
         string(
@@ -74,15 +74,15 @@ pipeline {
         stage('Create PBM source tarball') {
             agent {
                 kubernetes {
-                    inheritFrom 'centos-7-x64'
+                    inheritFrom 'ol-8-x64'
                 }
             }
             steps {
-                container('centos-7-x64') {
+                container('ol-8-x64') {
                     installAWScliv2()
                     slackNotify("#releases-ci", "#00FF00", "[${JOB_NAME}]: starting build for ${GIT_BRANCH} - [${BUILD_URL}]")
                     cleanUpWS()
-                        buildStage("centos:7", "--get_sources=1")
+                        buildStage("oraclelinux:8", "--get_sources=1")
                         sh '''
                         REPO_UPLOAD_PATH=$(grep "UPLOAD" test/percona-backup-mongodb.properties | cut -d = -f 2 | sed "s:$:${BUILD_NUMBER}:")
                         AWS_STASH_PATH=$(echo ${REPO_UPLOAD_PATH} | sed  "s:UPLOAD/experimental/::")
@@ -107,15 +107,15 @@ pipeline {
                 stage('Build PBM generic source rpm') {
                     agent {
                         kubernetes {
-                            inheritFrom 'centos-7-x64'
+                            inheritFrom 'ol-8-x64'
                         }
                     }
                     steps {
-                        container('centos-7-x64') {
+                        container('ol-8-x64') {
                             installAWScliv2()
                             cleanUpWS()
                             popArtifactFolder("source_tarball/", AWS_STASH_PATH)
-                            buildStage("centos:7", "--build_src_rpm=1")
+                            buildStage("oraclelinux:8", "--build_src_rpm=1")
 
                             pushArtifactFolder("srpm/", AWS_STASH_PATH)
                             uploadRPMfromAWSrke("srpm/", AWS_STASH_PATH)
@@ -125,11 +125,11 @@ pipeline {
                 stage('Build PBM generic source deb') {
                     agent {
                         kubernetes {
-                            inheritFrom 'buster-x64'
+                            inheritFrom 'focal-x64'
                         }
                     }
                     steps {
-                        container('buster-x64') {
+                        container('focal-x64') {
                             installAWScliv2()
                             cleanUpWS()
                             popArtifactFolder("source_tarball/", AWS_STASH_PATH)
@@ -144,24 +144,6 @@ pipeline {
         } // stage
         stage('Build PBM RPMs/DEBs/Binary tarballs') {
             parallel {
-                stage('Centos 7') {
-                    agent {
-                        kubernetes {
-                            inheritFrom 'centos-7-x64'
-                        }
-                    }
-                    steps {
-                        container('centos-7-x64') {
-                            installAWScliv2()
-                            cleanUpWS()
-                            popArtifactFolder("srpm/", AWS_STASH_PATH)
-                            buildStage("centos:7", "--build_rpm=1")
-
-                            pushArtifactFolder("rpm/", AWS_STASH_PATH)
-                            uploadRPMfromAWSrke("rpm/", AWS_STASH_PATH)
-                        }
-                    }
-                }
                 stage('Oracle Linux 8') {
                     agent {
                         kubernetes {
@@ -264,24 +246,6 @@ pipeline {
                             cleanUpWS()
                             popArtifactFolder("source_deb/", AWS_STASH_PATH)
                             buildStage("ubuntu:noble", "--build_deb=1")
-
-                            pushArtifactFolder("deb/", AWS_STASH_PATH)
-                            uploadDEBfromAWSrke("deb/", AWS_STASH_PATH)
-                        }
-                    }
-                }
-                stage('Debian Buster(10)') {
-                    agent {
-                        kubernetes {
-                            inheritFrom 'buster-x64'
-                        }
-                    }
-                    steps {
-                        container('buster-x64') {
-                            installAWScliv2()
-                            cleanUpWS()
-                            popArtifactFolder("source_deb/", AWS_STASH_PATH)
-                            buildStage("debian:buster", "--build_deb=1")
 
                             pushArtifactFolder("deb/", AWS_STASH_PATH)
                             uploadDEBfromAWSrke("deb/", AWS_STASH_PATH)
