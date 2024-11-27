@@ -173,14 +173,18 @@ ENDSSH
                                         if [ -d /srv/UPLOAD/${PATH_TO_BUILD}/source/debian ]; then
                                             cd /srv/UPLOAD/${PATH_TO_BUILD}/source/debian
                                             DSC=\$(find . -type f -name '*.dsc')
+                                            EC=0
                                             for DSC_FILE in \${DSC}; do
                                                 echo "<*> DSC file is "\${DSC_FILE}
                                                 for _codename in \${CODENAMES}; do
                                                     echo "<*> CODENAME: "\${_codename}
-                                                    repopush --gpg-pass=${SIGN_PASSWORD} --package=\${DSC_FILE} --repo-path=\${REPOPATH} --component=\${REPOCOMP}  --codename=\${_codename} --verbose \${REPOPUSH_ARGS} || true
+                                                    repopush --gpg-pass=${SIGN_PASSWORD} --package=\${DSC_FILE} --repo-path=\${REPOPATH} --component=\${REPOCOMP}  --codename=\${_codename} --verbose \${REPOPUSH_ARGS} || EC=\$?
                                                     sleep 5
                                                 done
                                             done
+                                            if [ \${EC} -eq 1 ]; then
+                                                rm -vf  \${REPOPATH}/db/lockfile
+                                            fi
                                         fi
                                     fi
                                     # -------------------------------------> binary pushing
