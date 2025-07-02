@@ -1,0 +1,15 @@
+- job:
+    name: hetzner-pbm-rhel10-test
+    project-type: pipeline
+    description: |
+        Do not edit this job through the web!
+        Test job for RHEL 10 builds.
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/vorsel/jenkins-pipelines.git
+            branches:
+            - '**'
+            wipe-workspace: false
+      lightweight-checkout: true
+      script-path: pbm/jenkins/rhel10-test.groovy
