@@ -6,9 +6,9 @@
     pipeline-scm:
       scm:
         - git:
-            url: https://github.com/Percona-Lab/jenkins-pipelines.git
+            url: https://github.com/vorsel/jenkins-pipelines.git
             branches:
-            - 'hetzner'
+            - 'PSMDB-1940_buildbuddy_8.3_pipeline_changes'
             wipe-workspace: false
       lightweight-checkout: true
       script-path: psmdb/jenkins/percona-server-for-mongodb-8.3.groovy

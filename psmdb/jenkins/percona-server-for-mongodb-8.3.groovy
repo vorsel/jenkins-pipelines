@@ -27,7 +27,7 @@ void buildStage(String DOCKER_OS, String STAGE_PARAM) {
             ls -laR ./
             bash -x ./psmdb_builder.sh --builddir=\${build_dir}/test --install_deps=1
             ls -la ./test/
-            bash -x ./psmdb_builder.sh --builddir=\${build_dir}/test --repo=${GIT_REPO} --branch=${GIT_BRANCH} --psm_ver=${PSMDB_VERSION} --psm_release=${PSMDB_RELEASE} --mongo_tools_tag=${MONGO_TOOLS_TAG} ${STAGE_PARAM}"
+            bash -x ./psmdb_builder.sh --builddir=\${build_dir}/test --repo=${GIT_REPO} --branch=${GIT_BRANCH} --psm_ver=${PSMDB_VERSION} --psm_release=${PSMDB_RELEASE} --mongo_tools_tag=${MONGO_TOOLS_TAG} --remote_cache_server=${REMOTE_CACHE_SERVER} ${STAGE_PARAM}"
     """
 }
 
@@ -76,6 +76,10 @@ pipeline {
             choices: 'laboratory\ntesting\nexperimental',
             description: 'Repo component to push packages to',
             name: 'COMPONENT')
+        string(
+            defaultValue: '89.167.33.143',
+            description: 'Bazel remote cache server IP (leave empty to disable remote cache)',
+            name: 'REMOTE_CACHE_SERVER')
         choice(
             name: 'BUILD_PACKAGES',
             choices: ['true', 'false'],
