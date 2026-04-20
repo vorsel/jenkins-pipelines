@@ -1,0 +1,26 @@
+services:
+  reapi-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["-listen", ":8990", "-backend", "frontend:8980"]
+    networks:
+      - docker-compose_default
+    restart: always
+
+  envoy-proxy:
+    image: envoyproxy/envoy:v1.31-latest
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "warn"]
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "8981:8981"
+    networks:
+      - docker-compose_default
+    depends_on:
+      - reapi-proxy
+    restart: always
+
+networks:
+  docker-compose_default:
+    external: true
