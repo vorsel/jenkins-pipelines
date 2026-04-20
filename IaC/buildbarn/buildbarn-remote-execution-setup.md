@@ -1578,6 +1578,32 @@ for name, (dur, cnt) in sorted(stats.items(), key=lambda x: -x[1][0])[:20]:
 
 Or open the `.json.gz` file in `chrome://tracing` / `ui.perfetto.dev`.
 
+### 9.9 Fallback Behavior When BuildBarn Is Unavailable
+
+Our current `.bazelrc.local` sets `--spawn_strategy=remote,local` and `--strategy=CppCompile=remote,local`. This controls *which strategy Bazel picks first*, but it **does NOT automatically fall back to local execution when the remote cluster is unreachable**. Behavior by scenario:
+
+| Scenario | Default behavior | With `--remote_local_fallback=true` |
+|----------|------------------|--------------------------------------|
+| BuildBarn unreachable at build start (capabilities RPC fails) | **Build fails immediately** with gRPC error | Build runs fully locally (≈3 h for `install-dist-test`) |
+| BuildBarn crashes mid-build | Actions retry `--remote_retries` times (default 5), then **fail** | Per-action fallback to local execution, build continues |
+| Only `--remote_cache` unreachable (executor up) | Build continues without cache (graceful) | Same |
+| `.bazelrc.local` removed / remote flags cleared | Pure local build (explicit, no fallback involved) | Same |
+
+**Recommendation:**
+
+- **Developer machines** where BuildBarn is a convenience, not a requirement — add to `.bazelrc.local`:
+
+  ```
+  common:local --remote_local_fallback=true
+  common:local --remote_retries=2
+  ```
+
+  Accepts ~3 h fallback time if BuildBarn is down rather than failing the build.
+
+- **CI / release builds** where a silent switch to slow local execution would hide infrastructure failures — leave default (or set `--remote_local_fallback=false` explicitly). Fail loud, fix BuildBarn, retry.
+
+`--remote_local_fallback` is marked deprecated in upstream Bazel 8+ but still works in MongoDB's REAPI v2.0 fork used for PSMDB.
+
 ## Part 10: Current Status
 
 ### What Works
