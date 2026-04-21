@@ -830,7 +830,7 @@ Bazel Client (PSMDB, REAPI v2.0)
 
 ### Problem
 
-Percona Server for MongoDB (PSMDB) uses a custom MongoDB Bazel fork that speaks **REAPI v2.0 only**. BuildBarn requires **REAPI v2.3+**. During the `GetCapabilities` handshake, Bazel sees the server's `LowApiVersion=2.3` and rejects it:
+Percona Server for MongoDB (PSMDB) uses MongoDB's pinned Bazel fork — currently **`bazel release 7.5.0-mongo_06d753863d`** (`bazel --version` output) — which speaks **REAPI v2.0 only** even though upstream Bazel 7.x speaks 2.3+. BuildBarn requires **REAPI v2.3+**. During the `GetCapabilities` handshake, Bazel sees the server's `LowApiVersion=2.3` and rejects it:
 
 ```
 ERROR: The client supported API versions, 2.0 to 2.0, is not supported by the server, 2.3 to 2.12.
@@ -1355,9 +1355,26 @@ cd percona-server-mongodb
 python3 buildscripts/install_bazel.py
 export PATH="$HOME/.local/bin:$PATH"
 bazel --version
+# Expected output: bazel release 7.5.0-mongo_06d753863d
 ```
 
 > **Important:** PSMDB requires MongoDB's custom Bazel fork. Standard Bazelisk or upstream Bazel will fail with `cc_binary` rule errors. The fork is installed via `buildscripts/install_bazel.py` which downloads the correct binary from MongoDB's S3 bucket.
+
+#### Bazel version pinning
+
+| Component | Version |
+|-----------|---------|
+| Bazel binary | **`7.5.0-mongo_06d753863d`** (MongoDB fork of upstream Bazel 7.5.0) |
+| Source of truth | `buildscripts/install_bazel.py` in PSMDB repo (which mirrors MongoDB's `mongo` repo Bazel pin) |
+| REAPI version spoken by client | **2.0** (despite Bazel 7.5.0 normally speaking 2.3+) |
+| Why 2.0 | The MongoDB fork forces the REAPI version down to 2.0; this is the reason we need the REAPI v2.0 capabilities proxy described in Part 7 |
+
+Practical implications when reading Bazel docs / debugging:
+
+- Most Bazel 7.x flags work as-documented (e.g. `--remote_retries`, `--noremote_accept_cached`, `--profile`, `--execution_log_compact_file`).
+- A handful of post-7.x flag renames are **not** present (e.g. `--remote_retry_max_attempts` does not exist; use `--remote_retries=N` instead).
+- `--config=psmdb_dev` is defined in PSMDB's checked-in `.bazelrc` and pulls in MongoDB-specific toolchain selection. It is **always required** for PSMDB builds.
+- The wrapper hook script (`.bazelrc.wrapper_hook`, see §9.2) injects `--config=local` automatically — that is what activates the BuildBarn flags from `.bazelrc.local`.
 
 ### 9.3 `.bazelrc.local`
 
@@ -1527,6 +1544,24 @@ Per-action averages:
 
 Before cache tuning the `fetch` average was ~84s per action because every action re-downloaded the MongoDB toolchain (several GB) from central CAS. After increasing worker cache to 100GB / 1M files, toolchain files stay hardlinked between actions, and `fetch` dropped to 4.6s (≈18× faster).
 
+#### PoC runner image validation (`psmdb-runner-ubuntu-noble-x86_64:poc`)
+
+After switching from the hand-curated `psmdb-runner:latest` image to a new image built by running `psmdb_builder.sh install_deps()` verbatim inside a Dockerfile (see `IaC/buildbarn/runners/`), the cluster was revalidated in three phases. The runner image is ~1.73 GB on disk / 441 MB content (vs 794 MB / 198 MB baseline) because it includes the full Jenkins build-env package list (Go SDK, valgrind, devscripts, etc.) rather than a trimmed subset.
+
+| Run | Nodes on PoC image | Mode | Wall time | Remote cache hit | Remote exec | Local | Internal | Exit |
+|-----|--------------------|------|-----------|------------------|-------------|-------|----------|------|
+| Baseline (pre-PoC) | 0/3 | warm | **2 min 47 s** | 10,330 | 0 | 1,773 | 5,888 | 0 |
+| 1 × worker on PoC | 1/3 (`barn-psmdb-worker-2`) | warm | **3 min 01 s** | 10,330 | 0 | 1,773 | 5,888 | 0 |
+| 1 × worker on PoC | 1/3 (`barn-psmdb-worker-2`) | `--noremote_accept_cached` | **22 min 59 s** | 0 | **10,330** | 1,773 | 5,888 | 0 |
+| Full rollout | **3/3 + mongot** | warm | **3 min 07 s** | 10,330 | 0 | 1,773 | 5,888 | 0 |
+
+Critical observations:
+
+- **Zero action failures across 10,330 remote executions during the `--noremote_accept_cached` run.** In a heterogeneous cluster (1 of 3 workers on the new image), scheduler distribution of ~1:1:1 means ~3,400 actions executed on the PoC image successfully. This is strong evidence the PoC image is functionally equivalent to the baseline for PSMDB Bazel builds.
+- **Hermetic toolchain verified**: the compile processes on PoC workers run `external/mongo_toolchain_v5/stow/gcc-v5/libexec/gcc/x86_64-mongodb-linux/14.2.0/cc1plus` — i.e. Bazel pulls the MongoDB toolchain from `mongo_toolchain_v5` at execution time regardless of what is installed on the host. Host-level `mongodbtoolchain v4` and `aws_sdk_build` in `install_deps()` can therefore be safely disabled in the runner image (tracked as size-reduction follow-up).
+- **Warm rebuild is insensitive to worker count at ~100% cache hit rate.** After full rollout (3 nodes + mongot = 4 nodes), the warm time was 3:07 vs the single-PoC-node 3:01 — the extra worker slots sit idle because no actions execute. Warm wall time is dominated by client-side action-graph processing, gRPC RTT to frontend, and local linking, not remote compute.
+- `--noremote_accept_cached` disables Action Cache lookup but **keeps CAS (blob) reads**, so it is not a true cold build — toolchain tarballs and source blobs are still served from cache. Hence 22:59 is a "semi-cold" measurement and is not directly comparable to the 30-min original cold baseline (which ran against a cold CAS).
+
 ### 9.8 Performance Bottlenecks
 
 | Bottleneck | Symptom | Solution |
@@ -1610,14 +1645,14 @@ Our current `.bazelrc.local` sets `--spawn_strategy=remote,local` and `--strateg
 
 - **PSMDB `install-mongod` and `install-dist-test` build successfully** via remote execution on the `master` branch
 - `install-dist-test` cold build (17,991 actions): **~30 min** vs ~3 hours locally — ≈6× speedup
-- `install-dist-test` warm remote cache (after `bazel clean`): **~2 min 47 s**, 10,330/10,330 compile actions served from Action Cache — ≈65× faster than local
+- `install-dist-test` warm remote cache (after `bazel clean`): **~2 min 47 s** (pre-PoC baseline) / **~3 min 07 s** (post-PoC rollout), 10,330/10,330 compile actions served from Action Cache — ≈65× faster than local
 - `install-mongod` cold build (3,217 actions): **~67 min** on the same setup before cache tuning
 - Unchanged-code rebuild (local cache warm): **1.6 s**
-- BuildBarn central server + 2 dedicated worker nodes deployed and operational
+- BuildBarn central server + 2 dedicated worker nodes (permanent) + 1 ephemeral node deployed and operational
 - REAPI v2.0 proxy patches capabilities — MongoDB's Bazel fork (REAPI v2.0) works with BuildBarn (REAPI v2.3+)
 - Worker local cache tuned to 100 GB / 1M files — toolchain stays hardlinked between actions, fetch dropped from 84 s to 4.6 s average
 - Central CAS/AC sizes increased to keep MongoDB toolchain blobs resident
-- Custom runner image (`psmdb-runner:latest`) with dev packages on all nodes
+- **Runner image `psmdb-runner-ubuntu-noble-x86_64:poc`** on every hardlinking-pool node — built from `psmdb_builder.sh install_deps()` (see `IaC/buildbarn/runners/`) rather than a hand-curated package list. Validated via 10,330 remote executions with zero failures; see §9.7 PoC runner image validation.
 - Python wheel downloads work (runner has network access)
 - Platform property matching configured (exact match, lexicographic sorting)
 
@@ -1625,18 +1660,34 @@ Our current `.bazelrc.local` sets `--spawn_strategy=remote,local` and `--strateg
 
 1. **Local linking** — final link step runs on the client and can dominate wall time after remote actions complete. A more powerful client or distributed linking would help.
 2. **Hardlinking vs FUSE** — currently using hardlinking workers due to shared-VPS kernel restrictions. Dedicated bare-metal with FUSE workers would enable lazy input loading and reduce fetch time further.
-3. **Runner image** — built locally on each node. Could be pushed to a private registry for easier deployment.
-4. **Execution log** — `--execution_log_json_file` crashes the client on large builds (OOM). Use `--execution_log_compact_file` or drop the flag.
+3. **Runner image size** — current PoC image is ~1.73 GB on disk because `psmdb_builder.sh install_deps()` pulls in Go SDK, valgrind, devscripts/debhelper, and other packages that are only needed for Jenkins non-Bazel phases. Bazel execution itself uses its own hermetic toolchain (`mongo_toolchain_v5`) at runtime. Commenting `install_mongodbtoolchain`, `aws_sdk_build`, and `install_golang` in the local `psmdb_builder.sh` copy should shrink the image by ≈800 MB; tracked as a size-reduction follow-up.
+4. **Runner image distribution** — currently bit-identical on all nodes via `docker save | scp | docker load`. For scaling to 17 variants × N nodes this needs to move to a registry (ghcr.io / Percona / Quay — decision pending, see §11.4).
+5. **Execution log** — `--execution_log_json_file` crashes the client on large builds (OOM). Use `--execution_log_compact_file` or drop the flag.
 
 ### Infrastructure
 
-| Server | Public IP | Private IP | Role | `nproc` | Concurrency |
-|--------|-----------|------------|------|---------|-------------|
-| barn-psmdb | 65.108.253.73 | 10.30.242.3 | Central (frontend, scheduler, storage, worker, proxy) | 16 | 12 (~75% of cores) |
-| barn-psmdb-worker-1 | 95.217.219.115 | 10.30.242.4 | Worker node (worker + runner) | 16 | 24 (×1.5 oversubscribed) |
-| barn-psmdb-worker-2 | 95.217.221.140 | 10.30.242.5 | Worker node (worker + runner) | 16 | 24 (×1.5 oversubscribed) |
+Permanent nodes (always present):
 
-Total worker concurrency: **60** slots across 48 physical cores. Client invokes with `--jobs=96` so the scheduler always has work queued.
+| Server | Public IP | Private IP | Role | `nproc` | Concurrency | Runner image |
+|--------|-----------|------------|------|---------|-------------|--------------|
+| barn-psmdb | 65.108.253.73 | 10.30.242.3 | Central (frontend, scheduler, storage, worker, proxy) | 16 | 12 (≈×0.75, undersubscribed — shares with storage/scheduler/frontend) | `psmdb-runner-ubuntu-noble-x86_64:poc` on the `hardlinking` pool; fuse pool retains `ghcr.io/catthehacker/ubuntu:act-22.04` (unused by PSMDB) |
+| barn-psmdb-worker-1 | 95.217.219.115 | 10.30.242.4 | Worker node (worker + runner) | 16 | 24 (×1.5 oversubscribed) | `psmdb-runner-ubuntu-noble-x86_64:poc` |
+| barn-psmdb-worker-2 | 95.217.221.140 | 10.30.242.5 | Worker node (worker + runner) | 16 | 24 (×1.5 oversubscribed) | `psmdb-runner-ubuntu-noble-x86_64:poc` |
+
+Ephemeral / experimental nodes (may come and go):
+
+| Server | Role | `nproc` | RAM | Concurrency | Runner image | Notes |
+|--------|------|---------|-----|-------------|--------------|-------|
+| psmdb-mongot | Worker node (worker + runner) | 12 | 22 GB | 18 (×1.5 oversubscribed) | `psmdb-runner-ubuntu-noble-x86_64:poc` | Temporary extra capacity (see §11.4 registry/rollout notes). Safe to remove at any time. |
+
+Hardlinking-pool worker concurrency (where PSMDB builds actually run):
+
+- **3 permanent nodes: `12 + 24 + 24 = 60` slots**
+- **+ `psmdb-mongot` (when present): `+18` → `78` slots total**
+
+Client invokes with `--jobs=96` so the scheduler always has work queued regardless of whether the ephemeral node is live. The bb-browser "N idle workers" counter reflects live pool size (60 without mongot, 78 with).
+
+**Central is intentionally undersubscribed** (concurrency 12 on 16 cores, ×0.75). The node also hosts `frontend`, both `storage` shards, `scheduler`, `browser`, `runner-installer`, and the REAPI proxy. Raising concurrency here has asymmetric risk: a worker-node overload slows only that one node, but central overload degrades the shared CAS and scheduler, which slows the entire cluster. Any future attempt to raise 12 → 18 should be measured with `--noremote_accept_cached` before and after to confirm the change is not a net regression.
 
 **Why ×1.5 oversubscription on dedicated workers works for PSMDB.** Remote compilation actions spend a meaningful share of their wall time on I/O (fetching toolchain/header inputs, uploading object files) rather than pure CPU. With `concurrency = nproc`, those I/O-waiting slots leave cores idle. Raising concurrency to `nproc × 1.5` keeps cores busy while one slot is blocked on fetch/upload. For pure-CPU workloads (or when the worker cache is cold and every slot is bottlenecked on `fetch`), oversubscription can hurt — benchmark before settling on a value.
 
@@ -1710,28 +1761,35 @@ Warm rebuild (action cache populated from previous run, no code changes): **~50 
 
 ### 11.4 Runner image production plan
 
-**Proposed structure** (spinoff repo or `barn/runners/` subdir):
+**Current implementation:** `IaC/buildbarn/runners/` (this repo). Structure in place, populated for the PoC variant:
 
 ```
-barn/runners/
-├── common/
-│   ├── install-bb-runner.sh      # same across all — installs bb_runner after startup
-│   └── base.jsonnet              # runner config template
-├── oracle-linux-8/
-│   ├── Dockerfile                # FROM oraclelinux:8, runs install_deps for RHEL=8
-│   └── build.sh
-├── oracle-linux-9/
-├── amazon-linux-2023/
-├── ubuntu-jammy/
-├── ubuntu-noble/
-├── debian-bookworm/
+IaC/buildbarn/runners/
+├── README.md                          # strategy, directory layout, build/deploy workflow
+├── psmdb_builder.sh                   # local copy of upstream psmdb_builder.sh, shared by all variants
+├── ubuntu-noble-x86_64/               # PoC variant — validated, in production on all hardlinking-pool nodes
+│   └── Dockerfile
+├── ubuntu-jammy-x86_64/               # pending
+├── ubuntu-jammy-aarch64/              # pending
+├── ubuntu-noble-aarch64/              # pending
+├── debian-bookworm-x86_64/            # pending
+├── oracle-linux-8-x86_64/             # pending
+├── oracle-linux-8-aarch64/            # pending
+├── oracle-linux-9-x86_64/             # pending
+├── oracle-linux-9-aarch64/            # pending
+├── amazon-linux-2023-x86_64/          # pending
+├── amazon-linux-2023-aarch64/         # pending
 └── .github/workflows/
-    └── weekly-rebuild.yml        # rebuild all images weekly, push to registry
+    └── weekly-rebuild.yml             # pending — rebuild all variants weekly, push to registry
 ```
 
-Each Dockerfile reuses the relevant branch of `install_deps()` (either by sourcing `psmdb_builder.sh` with `INSTALL=1` and target env vars, or by duplicating the package list). Each variant × arch produces one image:
+**Strategy.** Each Dockerfile fetches `IaC/buildbarn/runners/psmdb_builder.sh` from this repo over HTTP (via `wget`) and runs it with `--install_deps=1`. No package list is duplicated into the Dockerfiles — the script is the single source of truth. Bazel's internal guards in every `build_*` phase ensure only `install_deps()` runs when the other flags default to `0`. Upstream changes to `percona-server-mongodb/percona-packaging/scripts/psmdb_builder.sh` are pulled into the local copy by a conscious `cp` + review step.
+
+**Each variant × arch produces one image:**
 
 ```
+<registry>/psmdb-runner-ubuntu-noble-x86_64:YYYYMMDD
+<registry>/psmdb-runner-ubuntu-noble-aarch64:YYYYMMDD
 <registry>/psmdb-runner-ol8-x86_64:YYYYMMDD
 <registry>/psmdb-runner-ol8-aarch64:YYYYMMDD
 <registry>/psmdb-runner-ol9-x86_64:YYYYMMDD
@@ -1741,7 +1799,9 @@ Each Dockerfile reuses the relevant branch of `install_deps()` (either by sourci
 
 **Build frequency:** weekly rebuild covers security patches; daily is overkill unless upstream package repos are unstable. Pin to a date tag in `worker.jsonnet` to avoid silent drift mid-release.
 
-**Open decision:** private registry location. Options: Percona internal registry, ghcr.io, Quay. Needs alignment with security/access policy. Until chosen, images live locally on each worker node (as `psmdb-runner:latest` does today — doesn't scale to 17 variants × N workers).
+**PoC validation status (ubuntu-noble-x86_64):** validated against `install-dist-test` with 10,330 remote executions, zero failures, in both heterogeneous (1 of 3 workers) and full-rollout (4 of 4 workers) configurations. Wall-clock within noise of the pre-PoC baseline. See §9.7 PoC runner image validation for measurements.
+
+**Open decision:** private registry location. Options: Percona internal registry, `ghcr.io`, `quay.io`, `hub.docker.com/u/perconalab`. Needs alignment with security/access policy. Until chosen, the PoC image is replicated on each worker node via `docker save` / `scp` / `docker load` from `barn-psmdb-worker-2` (where it is first built). This is fine for 1 variant × 4 nodes but does not scale to 17 variants × N nodes — the registry decision is a hard prerequisite for step 3 of §11.7.
 
 ### 11.5 BuildBarn configuration changes
 
@@ -1824,9 +1884,9 @@ Jenkins agents become BuildBarn clients:
 
 In order of dependency — each step unblocks the next:
 
-1. **Pick registry** for runner images (Percona internal / ghcr.io / Quay). Needed before any automation.
-2. **Build 1 runner image** for `ubuntu-noble-x86_64` using `install_deps()`. Validate it runs an `install-dist-test` build through BuildBarn with the same or better numbers than current `psmdb-runner:latest` (this is the control).
-3. **Extend to all 17 variants** — Dockerfiles + CI job for weekly rebuild. Spinoff repo.
+1. **Pick registry** for runner images (Percona internal / `ghcr.io` / `quay.io` / `hub.docker.com/u/perconalab`). Needed before any automation. **Still open.**
+2. ~~**Build 1 runner image** for `ubuntu-noble-x86_64` using `install_deps()`. Validate it runs an `install-dist-test` build through BuildBarn with the same or better numbers than current `psmdb-runner:latest` (this is the control).~~ **Done.** `IaC/buildbarn/runners/ubuntu-noble-x86_64/` implemented, validated with 10,330 remote executions (§9.7), rolled out to all hardlinking-pool nodes.
+3. **Extend to all remaining variants** — Dockerfiles in `IaC/buildbarn/runners/<variant>/`, each differing only by `FROM <distro>:<version>`. The shared `psmdb_builder.sh` auto-detects the OS via `get_system()`. Add CI job (pending registry decision at step 1) for weekly rebuild.
 4. **Add aarch64 infrastructure**: 1 Hetzner CAX41 as PoC, BuildBarn worker config with `Arch=aarch64` property. Run one aarch64 variant end-to-end.
 5. **Update PSMDB Bazel rules** to emit correct `exec_properties` per target platform (`--config=release-ol8-x86_64` etc.). This is the biggest unknown — may need MongoDB Bazel fork investigation.
 6. **Run one full release matrix** on BuildBarn, measure actual wall time + CAS/AC footprint. Adjust sizing (11.5) based on real numbers.
@@ -1844,9 +1904,9 @@ In order of dependency — each step unblocks the next:
 
 ### 11.9 What NOT to do yet
 
-- Don't add aarch64 workers before a runner image exists — nothing to deploy.
-- Don't touch PSMDB `.bzl` files before a second variant works — current single-variant success is the baseline to preserve.
-- Don't push `psmdb-runner:latest` to a public registry — it's a disposable interim image, not the release runner.
+- Don't add aarch64 workers before an aarch64 runner image exists — nothing to deploy. (The x86_64 PoC image is ready; aarch64 still needs a separate Dockerfile variant + CAX instance.)
+- Don't touch PSMDB `.bzl` files before a second variant works — the validated `ubuntu-noble-x86_64` PoC is the baseline to preserve.
+- Don't push the PoC image (`psmdb-runner-ubuntu-noble-x86_64:poc`) to any public registry — it's tagged `:poc` to signal disposability. Before any registry push, rename to a dated production tag (`:YYYYMMDD`) and ideally after the size-reduction follow-up in §10 (Improvements #3).
 - Don't enable scheduler priorities before there's actual contention to schedule around.
 
 ## Troubleshooting

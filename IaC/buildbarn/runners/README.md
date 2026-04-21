@@ -2,6 +2,15 @@
 
 Each subdirectory holds a `Dockerfile` for one `(OS, glibc, arch)` combination from the PSMDB release matrix. Images are consumed by BuildBarn runners (`runner-*` service in `docker-compose.yml`) and referenced by the worker `platform.properties.container-image` field.
 
+## Status
+
+| Variant | Status | Validation evidence |
+|---------|--------|---------------------|
+| `ubuntu-noble-x86_64/` | **Production (PoC tag `:poc`)** on all hardlinking-pool nodes of the BuildBarn cluster | 10,330 remote executions with zero action failures on `install-dist-test`, measured with `--noremote_accept_cached` on a heterogeneous cluster (see §9.7 of `../buildbarn-remote-execution-setup.md`) |
+| all other variants | Not yet implemented | — |
+
+Image size for the PoC variant is ~1.73 GB on disk / 441 MB content. This is intentionally larger than strictly necessary because `psmdb_builder.sh install_deps()` also installs Go SDK, `valgrind`, `devscripts`/`debhelper`, and pip bootstrap — none of which Bazel uses at runtime (Bazel pulls the hermetic `mongo_toolchain_v5` from CAS). Commenting those blocks in the local `psmdb_builder.sh` copy is a pending size-reduction follow-up; until it lands, correctness ≫ size.
+
 ## Strategy: run `install_deps()` from a locally-committed copy of `psmdb_builder.sh`
 
 The single source of truth for build-time dependencies upstream is `install_deps()` in:
