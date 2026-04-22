@@ -4,12 +4,17 @@ Each subdirectory holds a `Dockerfile` for one `(OS, glibc, arch)` combination f
 
 ## Status
 
+The 11-variant matrix is the authoritative list from `../buildbarn-ondemand-scaler.md` §3.1, which in turn mirrors the parallel stages in `psmdb/jenkins/percona-server-for-mongodb-8.3.groovy`. GHA workflow `.github/workflows/build-psmdb-buildbarn-runners.yml` builds all 11 in one run and pushes to `ghcr.io/<owner>/psmdb-buildbarn-runners/<variant>:{<sha>,latest}`.
+
 | Variant | Status | Validation evidence |
 |---------|--------|---------------------|
 | `ubuntu-noble-x86_64/` | **Production (PoC tag `:poc`)** on all hardlinking-pool nodes of the BuildBarn cluster | 10,330 remote executions with zero action failures on `install-dist-test`, measured with `--noremote_accept_cached` on a heterogeneous cluster (see §9.7 of `../buildbarn-remote-execution-setup.md`) |
-| all other variants | Not yet implemented | — |
+| `debian-bookworm-x86_64/` | **Validated** as a second pool (`debian12`) on `barn-psmdb-worker-2`; full cold `install-dist-test` completed | Cold build: 10,330 remote executions, exit 0, 1 h 43 min 42 s wall time (includes OOM+swap recovery mid-build). Identical `gitVersion` and `perconaFeatures` vs noble; different `openSSLVersion` (Debian 3.0.19 vs Ubuntu 3.0.13) proves per-distro runtime libs resolve correctly — see §9.7 "Second variant" in `../buildbarn-remote-execution-setup.md` |
+| `ubuntu-jammy-x86_64/`, `ubuntu-jammy-aarch64/`, `ubuntu-noble-aarch64/`, `oraclelinux-8-x86_64/`, `oraclelinux-8-aarch64/`, `oraclelinux-9-x86_64/`, `oraclelinux-9-aarch64/`, `amazonlinux-2023-x86_64/`, `amazonlinux-2023-aarch64/` | **Dockerfile committed; first image build pending GHA run** | `install_deps()` for each of these docker bases (`oraclelinux:8`, `oraclelinux:9`, `amazonlinux:2023`, `ubuntu:jammy`) has been executing on every Jenkins PSMDB 8.3 matrix build for years (see `buildStage(...)` in `psmdb/jenkins/percona-server-for-mongodb-8.3.groovy`). Empirical per-variant validation happens on first GHA run of `.github/workflows/build-psmdb-buildbarn-runners.yml` |
 
-Image size for the PoC variant is ~1.73 GB on disk / 441 MB content. This is intentionally larger than strictly necessary because `psmdb_builder.sh install_deps()` also installs Go SDK, `valgrind`, `devscripts`/`debhelper`, and pip bootstrap — none of which Bazel uses at runtime (Bazel pulls the hermetic `mongo_toolchain_v5` from CAS). Commenting those blocks in the local `psmdb_builder.sh` copy is a pending size-reduction follow-up; until it lands, correctness ≫ size.
+Image sizes: `ubuntu-noble-x86_64:poc` ~1.73 GB on disk / 441 MB content. `debian-bookworm-x86_64:poc` ~2.17 GB / 615 MB. Both are intentionally larger than strictly necessary because `psmdb_builder.sh install_deps()` installs Go SDK, `valgrind`, `devscripts`/`debhelper`, and pip bootstrap — none of which Bazel uses at runtime (Bazel pulls the hermetic `mongo_toolchain_v5` from CAS). Commenting those blocks in the local `psmdb_builder.sh` copy is a pending size-reduction follow-up; until it lands, correctness ≫ size.
+
+**Known non-fatal warning on Debian:** `psmdb_builder.sh` tries to install Python 3.13 via `add-apt-repository ppa:deadsnakes/ppa`, which does not exist on Debian. The step fails but `psmdb_builder.sh` runs without `set -e` so the image still builds. Debian's stock Python 3.11 is sufficient for `buildscripts/install_bazel.py` (stdlib-only) and for a full `bazel build install-dist-test`. A proper fix (per-distro Python-3.13 strategy) is tracked in the roadmap and not required for the validation above.
 
 ## Strategy: run `install_deps()` from a locally-committed copy of `psmdb_builder.sh`
 
@@ -70,7 +75,7 @@ bash -x ./psmdb_builder.sh --builddir=${build_dir}/test --install_deps=1
 | Adding a new OS variant | Transcribe all packages + helper steps | Copy dir, change `FROM` + `PSMDB_BRANCH` |
 | Image size | Smaller (trimmed) | Larger (includes Go, toolchain v4, AWS SDK, curl-from-source) |
 
-For the PoC stage we accept larger images. If size becomes a problem once all 17 variants are running, we can add a second stage that copies only the needed paths from a builder image. For now, correctness ≫ size.
+For the PoC stage we accept larger images. If size becomes a problem once all 11 variants are running, we can add a second stage that copies only the needed paths from a builder image. For now, correctness ≫ size.
 
 ## Naming
 
@@ -86,31 +91,35 @@ Examples:
 
 Tags are date-stamped (`YYYYMMDD`) so each weekly rebuild is addressable. `:latest` and `:poc` are used only during development — production BuildBarn worker configs must pin to a dated tag to prevent silent drift between nodes.
 
-## Directory layout (target)
+## Directory layout
 
 ```
 IaC/buildbarn/runners/
-├── README.md                          # this file
-├── psmdb_builder.sh                   # shared, BuildBarn-tuned mirror of upstream
-├── ubuntu-noble-x86_64/               # PoC (step 2 of roadmap)
-│   └── Dockerfile
-├── ubuntu-jammy-x86_64/
-├── ubuntu-jammy-aarch64/
-├── ubuntu-noble-aarch64/
-├── debian-bookworm-x86_64/
-├── oracle-linux-8-x86_64/
-├── oracle-linux-8-aarch64/
-├── oracle-linux-9-x86_64/
-├── oracle-linux-9-aarch64/
-├── amazon-linux-2023-x86_64/
-├── amazon-linux-2023-aarch64/
-└── .github/workflows/
-    └── weekly-rebuild.yml             # pushes all variants to registry
+├── README.md                                  # this file
+├── psmdb_builder.sh                           # shared, BuildBarn-tuned mirror of upstream
+├── ubuntu-noble-x86_64/        Dockerfile     # validated, production PoC
+├── ubuntu-noble-aarch64/       Dockerfile     # matrix entry; first build pending GHA
+├── ubuntu-jammy-x86_64/        Dockerfile
+├── ubuntu-jammy-aarch64/       Dockerfile
+├── debian-bookworm-x86_64/     Dockerfile     # validated, second pool PoC
+├── oraclelinux-8-x86_64/       Dockerfile     # covers 4 Jenkins stages (rpm + tarball + source rpm + source tarball)
+├── oraclelinux-8-aarch64/      Dockerfile
+├── oraclelinux-9-x86_64/       Dockerfile
+├── oraclelinux-9-aarch64/      Dockerfile
+├── amazonlinux-2023-x86_64/    Dockerfile
+└── amazonlinux-2023-aarch64/   Dockerfile
+
+.github/workflows/
+└── build-psmdb-buildbarn-runners.yml          # matrix-builds all 11; triggers: push to runners/**, workflow_dispatch, weekly cron
 ```
 
-Only `ubuntu-noble-x86_64/` is implemented today (PoC). Every subsequent variant is produced by creating a one-file subdirectory with a `Dockerfile` that differs in only one line:
+Note: no Debian Bookworm aarch64 — the PSMDB 8.3 Jenkins pipeline does not have that stage, so we don't carry an unused runner image. See `../buildbarn-ondemand-scaler.md` §3.1 for the full mapping of runners to Jenkins stages and to MongoDB's `REMOTE_EXECUTION_CONTAINERS` keys.
+
+Every Dockerfile differs from `ubuntu-noble-x86_64/Dockerfile` in only:
 
 - `FROM <distro>:<version>` — Ubuntu / Debian / Oracle Linux / Amazon Linux base image
+- package-manager bootstrap line (`apt-get install wget` vs `dnf install wget`)
+- three `LABEL org.percona.psmdb.{os,glibc,arch}=...` lines
 
 `install_deps()` itself auto-detects the OS via `get_system()` (checks `/etc/redhat-release`, `/etc/amazon-linux-release`, else Debian) and picks the right branch — no per-Dockerfile logic required.
 
@@ -188,6 +197,17 @@ Once a tagged image is verified on one worker:
 
 For the PoC we keep platform properties identical to the existing `psmdb-runner:latest` setup — only the on-disk image changes, so the PSMDB build does not need any client-side flags.
 
-## Planned rebuild cadence
+## Rebuild cadence and triggers
 
-Weekly, triggered by GitHub Actions (`weekly-rebuild.yml`). Justification: covers security updates to base OS packages and to MongoDB toolchain downloads without daily churn. Ad-hoc rebuild when `psmdb_builder.sh install_deps()` changes upstream (detected via CI watching `percona-server-mongodb` `master` + `preview-*` branches).
+GitHub Actions workflow: [`.github/workflows/build-psmdb-buildbarn-runners.yml`](../../../.github/workflows/build-psmdb-buildbarn-runners.yml). Triggers:
+
+- `push` to `main` or `PSMDB-2034_buildbarn_setup` touching `IaC/buildbarn/runners/**` or the workflow file — rebuilds any variants whose Dockerfile or shared `psmdb_builder.sh` changed (matrix rebuilds everything; `CACHE_BUST=$(date +%s)` ensures `install_deps()` re-runs against the current `psmdb_builder.sh`).
+- `schedule: cron "0 3 * * 1"` — weekly Monday 03:00 UTC rebuild. Covers CVE updates in base OS packages and in MongoDB toolchain downloads without daily churn.
+- `workflow_dispatch` — manual run; supports `variants` input (space-separated subset of the 11) for targeted rebuilds and `push_latest` toggle for branch experiments.
+
+Each matrix job produces two tags on `ghcr.io/<owner>/psmdb-buildbarn-runners/<variant>`:
+
+- `:${{ github.sha }}` — immutable, what BuildBarn worker configs pin in production.
+- `:latest` and `:<branch-name>` — moving tags for local iteration and for the on-demand scaler's `container-image` pool property during dev.
+
+aarch64 variants build natively on GitHub-hosted ARM runners (`ubuntu-24.04-arm`, free tier for public repos) — avoids 10–20x QEMU emulation overhead.

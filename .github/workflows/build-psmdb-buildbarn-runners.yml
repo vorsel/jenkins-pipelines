@@ -1,0 +1,218 @@
+name: build-psmdb-buildbarn-runners
+
+# Builds the 11 PSMDB BuildBarn runner images from
+# IaC/buildbarn/runners/<runner-name>/Dockerfile and pushes them to
+# ghcr.io/<repo-owner>/psmdb-buildbarn-runners/<runner-name>:{<sha>,latest}.
+#
+# The matrix is the authoritative list of runner images defined in
+# IaC/buildbarn/buildbarn-ondemand-scaler.md §3.1. One entry per
+# (distro, architecture) pair, exactly matching the parallel stages in
+# psmdb/jenkins/percona-server-for-mongodb-8.3.groovy.
+#
+# aarch64 images build natively on GitHub-hosted ARM runners
+# (`ubuntu-24.04-arm`, free for public repos), avoiding 10-20x QEMU
+# emulation overhead. If ARM runners become unavailable, swap
+# runs_on: ubuntu-24.04-arm -> ubuntu-24.04 and add `docker/setup-qemu-action`
+# — the Dockerfiles themselves are identical for both archs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: "Subset of runners to build (space-separated; empty = all 11)"
+        required: false
+        default: ""
+      push_latest:
+        description: "Also push :latest tag (disable for branch experiments)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+  push:
+    branches:
+      - main
+      - PSMDB-2034_buildbarn_setup
+    paths:
+      - "IaC/buildbarn/runners/**"
+      - ".github/workflows/build-psmdb-buildbarn-runners.yml"
+  schedule:
+    # Weekly rebuild to pick up upstream CVE updates in base images and any
+    # drift in psmdb_builder.sh install_deps() — Mondays 03:00 UTC.
+    - cron: "0 3 * * 1"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: psmdb-buildbarn-runners
+
+jobs:
+  build:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runs_on }}
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - runner: oraclelinux-8-x86_64
+            platform: linux/amd64
+            runs_on: ubuntu-24.04
+          - runner: oraclelinux-8-aarch64
+            platform: linux/arm64
+            runs_on: ubuntu-24.04-arm
+          - runner: oraclelinux-9-x86_64
+            platform: linux/amd64
+            runs_on: ubuntu-24.04
+          - runner: oraclelinux-9-aarch64
+            platform: linux/arm64
+            runs_on: ubuntu-24.04-arm
+          - runner: amazonlinux-2023-x86_64
+            platform: linux/amd64
+            runs_on: ubuntu-24.04
+          - runner: amazonlinux-2023-aarch64
+            platform: linux/arm64
+            runs_on: ubuntu-24.04-arm
+          - runner: ubuntu-jammy-x86_64
+            platform: linux/amd64
+            runs_on: ubuntu-24.04
+          - runner: ubuntu-jammy-aarch64
+            platform: linux/arm64
+            runs_on: ubuntu-24.04-arm
+          - runner: ubuntu-noble-x86_64
+            platform: linux/amd64
+            runs_on: ubuntu-24.04
+          - runner: ubuntu-noble-aarch64
+            platform: linux/arm64
+            runs_on: ubuntu-24.04-arm
+          - runner: debian-bookworm-x86_64
+            platform: linux/amd64
+            runs_on: ubuntu-24.04
+
+    steps:
+      - name: Skip if variant filtered out
+        id: filter
+        shell: bash
+        env:
+          FILTER: ${{ github.event.inputs.variants }}
+          THIS: ${{ matrix.runner }}
+        run: |
+          if [[ -z "${FILTER}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            for v in ${FILTER}; do
+              if [[ "${v}" == "${THIS}" ]]; then
+                echo "run=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            done
+            echo "variant ${THIS} not in filter [${FILTER}], skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.filter.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        if: steps.filter.outputs.run == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.filter.outputs.run == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        if: steps.filter.outputs.run == 'true'
+        id: meta
+        shell: bash
+        run: |
+          # GHCR paths must be lowercase; repo owners like "Percona" would
+          # otherwise cause 400 at push time.
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${REGISTRY}/${OWNER}/${IMAGE_NAMESPACE}/${{ matrix.runner }}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "cache_bust=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+          # Tag set: always the commit SHA; :latest only on push_latest=true
+          # or on the default/main branch push/schedule events.
+          TAGS="${IMAGE}:${{ github.sha }}"
+          PUSH_LATEST="${{ github.event.inputs.push_latest }}"
+          if [[ -z "${PUSH_LATEST}" || "${PUSH_LATEST}" == "true" ]]; then
+            TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
+            # Also tag with the branch name so feature branches get a
+            # deterministic moving tag (e.g. :PSMDB-2034_buildbarn_setup).
+            BRANCH_TAG="$(echo '${{ github.ref_name }}' | tr '/ ' '__')"
+            TAGS="${TAGS}"$'\n'"${IMAGE}:${BRANCH_TAG}"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ${{ matrix.runner }}
+        if: steps.filter.outputs.run == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: IaC/buildbarn/runners/${{ matrix.runner }}
+          file: IaC/buildbarn/runners/${{ matrix.runner }}/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            JENKINS_PIPELINES_REPO=https://github.com/${{ github.repository }}.git
+            JENKINS_PIPELINES_BRANCH=${{ github.ref_name }}
+            PSMDB_BUILDER_SCRIPT_PATH=IaC/buildbarn/runners/psmdb_builder.sh
+            CACHE_BUST=${{ steps.meta.outputs.cache_bust }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+
+      - name: Summarize
+        if: steps.filter.outputs.run == 'true'
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.runner }} (${{ matrix.platform }})"
+            echo ""
+            echo "Pushed tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "Pull:"
+            echo '```bash'
+            echo "docker pull ${{ steps.meta.outputs.image }}:${{ github.sha }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Aggregate job surfaces a single "all green" status check suitable for
+  # branch protection; avoids requiring 11 separate checks to stay in sync.
+  report:
+    name: report
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check matrix result
+        shell: bash
+        env:
+          RESULT: ${{ needs.build.result }}
+        run: |
+          echo "build matrix result: ${RESULT}"
+          if [[ "${RESULT}" != "success" ]]; then
+            echo "one or more variants failed"
+            exit 1
+          fi

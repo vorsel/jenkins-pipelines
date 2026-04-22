@@ -1562,6 +1562,45 @@ Critical observations:
 - **Warm rebuild is insensitive to worker count at ~100% cache hit rate.** After full rollout (3 nodes + mongot = 4 nodes), the warm time was 3:07 vs the single-PoC-node 3:01 — the extra worker slots sit idle because no actions execute. Warm wall time is dominated by client-side action-graph processing, gRPC RTT to frontend, and local linking, not remote compute.
 - `--noremote_accept_cached` disables Action Cache lookup but **keeps CAS (blob) reads**, so it is not a true cold build — toolchain tarballs and source blobs are still served from cache. Hence 22:59 is a "semi-cold" measurement and is not directly comparable to the 30-min original cold baseline (which ran against a cold CAS).
 
+#### Second variant: `psmdb-runner-debian-bookworm-x86_64:poc`
+
+Proves the Dockerfile pattern clones across distros with a single-line change (`FROM debian:bookworm` instead of `FROM ubuntu:24.04`), and that the multi-pool BuildBarn setup routes a Debian client to a Debian runner. Run on `barn-psmdb-worker-2` with two runner services sharing the node (12 + 12 slots, then retested with 24 + 24 after splitting pools proved functional).
+
+| Run | Pool | Mode | Wall time | Processes (cache hit / remote / local / internal) | Exit |
+|-----|------|------|-----------|----------------------------------------------------|------|
+| First cold Debian | bookworm 24-slot (worker-2 only) | cold AC, warm CAS | **1 h 43 min 42 s** | 0 / 10,330 / 1,773 / 5,888 | 0 |
+
+Process counts match ubuntu-noble's `--noremote_accept_cached` run exactly (`10330 / 1773 / 5888`), confirming the action graph and strategy allocation are identical regardless of runner distro.
+
+**Three cross-cutting findings from this run:**
+
+1. **OpenSSL linkage is non-hermetic.** `mongod --version` reports different `openSSLVersion` depending on which runner built it:
+
+   | Runner image | Reported `openSSLVersion` |
+   |--------------|----------------------------|
+   | ubuntu-noble-x86_64 | `OpenSSL 3.0.13 30 Jan 2024` (from Ubuntu 24.04 `libssl3t64`) |
+   | debian-bookworm-x86_64 | `OpenSSL 3.0.19 27 Jan 2026` (from Debian 12 `libssl3`) |
+
+   All other fields (`gitVersion`, `perconaFeatures`, `allocator`, `target_arch`) are identical. This is evidence that `mongo_toolchain_v5` is hermetic only for the C/C++ toolchain (gcc, cc1plus, ld); third-party shared libraries (OpenSSL, krb5, ldap, etc.) resolve against the runner's `/usr/lib`. **This is the argument for real per-distro runners rather than a single "universal" image with multiple platform advertisements** — a Debian `.deb` must ship linked against Debian libs, or package dependencies/ABI will not match on the customer's host. Option Y (separate images per distro) therefore remains the correct architecture going into §11.5.
+
+2. **OOM at `concurrency=24` on PSMDB template-heavy files.** Mid-build, kernel OOM-killed one `cc1plus` while compiling `src/mongo/db/s/resharding/*_coordinator_part_*.cpp` on the 30.6 GB worker-2. Peak memory for the heaviest PSMDB compile actions is **~2–3 GB per cc1plus** (sharding/resharding coordinators, extension IDL-generated files, collection sharding runtime). With 24 parallel compilations that is ~60 GB working set on a 32 GB node → overcommit.
+
+   ```
+   dmesg:
+   oom-kill: task=cc1plus, total-vm:1970232kB, anon-rss:1822988kB
+   Out of memory: Killed process 254320 (cc1plus)
+   ```
+
+   **Remediation adopted: add 32 GB swap on each worker.** Not dropping concurrency, because:
+   - Dropping 24 → 14 would cost throughput equivalent to losing 1–2 permanent Hetzner nodes
+   - Swap thrashing adds wall-time cost only for the few memory-heavy files (the tail of the build) — the rest fit in RAM
+   - Swap is already the natural mitigation for PSMDB developers building locally on 16–32 GB laptops; matches field practice
+   - A proper CPU/memory upgrade (Hetzner `ccx43` = 16 cores + 64 GB dedicated) is blocked by the current tariff limit of 8 dedicated CPUs. Shared tier caps at 32 GB RAM regardless of core count.
+
+   `sudo fallocate -l 32G /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile` on each worker, plus an `/etc/fstab` entry to persist.
+
+3. **Multi-pool on one worker works as designed.** `worker-2` advertises two platform pools (ubuntu24 + debian12) on the same `bb_worker` process via two `runners[]` entries pointing at two runner Unix sockets (`/worker/runner-noble`, `/worker/runner-bookworm`). Two separate runner containers (`runner-noble`, `runner-bookworm`) run distinct images and execute actions for their respective pools. `docker stats` mid-build showed `runner-bookworm` at ~1300% CPU (real cc1plus compilation), `runner-noble` at 0% (no noble work queued), confirming the scheduler routes each client's distro-autodetected platform to the correct pool. Worker-2 went from one pool × 24 slots to two pools × 12 + 12 in initial test, then to 24 + 24 with swap for production behavior. **Concurrency across pools on the same worker is not dynamically shared** (see §9.8); each pool has its own hard cap. For single-distro builds this means idle slots in the other pool are wasted; acceptable while Hetzner capacity is not the binding constraint.
+
 ### 9.8 Performance Bottlenecks
 
 | Bottleneck | Symptom | Solution |
@@ -1573,6 +1612,7 @@ Critical observations:
 | Cold worker cache | `context canceled` or `Failed to obtain input file` on new workers | Transient — clears after first build warms the cache. Reduce concurrency on fresh nodes initially |
 | Local linking | Final link step takes minutes on client | Linking stays local by design (`--strategy=CppLink=local`). Use a powerful client machine |
 | `java.lang.OutOfMemoryError` writing execution log | Crash **after** build finishes when using `--execution_log_json_file` on large builds | Use `--execution_log_compact_file=...` (binary proto) or drop the flag. JSON log blows up Bazel heap for 18k-action builds |
+| OOM-kill of `cc1plus` on memory-heavy PSMDB compile actions | `dmesg` shows `oom-kill` on `cc1plus` (typically in `resharding/coordinator_*.cpp` or collection sharding runtime). Build enters recovery / appears hung for minutes | PSMDB's heaviest compile units peak at ~2–3 GB RSS each. `concurrency × 2.5 GB` must fit in RAM + swap. **Add 32 GB swap on each worker** rather than dropping concurrency (see §9.7 second-variant finding #2). Alternative: upgrade to 64 GB RAM instances if tariff allows |
 
 To profile in detail, add `--profile=/tmp/build-profile.json.gz` to the build command. Analyse directly on the server without downloading:
 
@@ -1653,6 +1693,9 @@ Our current `.bazelrc.local` sets `--spawn_strategy=remote,local` and `--strateg
 - Worker local cache tuned to 100 GB / 1M files — toolchain stays hardlinked between actions, fetch dropped from 84 s to 4.6 s average
 - Central CAS/AC sizes increased to keep MongoDB toolchain blobs resident
 - **Runner image `psmdb-runner-ubuntu-noble-x86_64:poc`** on every hardlinking-pool node — built from `psmdb_builder.sh install_deps()` (see `IaC/buildbarn/runners/`) rather than a hand-curated package list. Validated via 10,330 remote executions with zero failures; see §9.7 PoC runner image validation.
+- **Second variant `psmdb-runner-debian-bookworm-x86_64:poc`** validated on `barn-psmdb-worker-2` through full `install-dist-test` cold build (10,330 remote executions, exit 0). Proves the single-line-`FROM` Dockerfile pattern clones across distros and that multi-pool BuildBarn routes correctly. See §9.7 second-variant subsection.
+- **Multi-pool worker architecture** on `worker-2` — one `bb_worker` process advertises two platform pools (ubuntu24 + debian12) by spawning two runner containers with distinct Unix sockets. Scheduler routes clients to the matching pool based on the `container-image` property the client auto-detects from its host OS. Blueprint for §11.5 per-variant worker configuration.
+- **Dev-environment symmetry confirmed** — the same `psmdb-runner-*-x86_64:poc` image is usable both as a BuildBarn worker runtime **and** as an interactive developer shell (`docker run -it -v $SRC:/src image bash` → `install_bazel.py && bazel build ...` works end-to-end). `install_bazel.py` is Python stdlib-only and runs fine on Debian 12's stock Python 3.11; the deadsnakes Python-3.13 block in `psmdb_builder.sh` is non-fatal on Debian and not required for the Bazel build path.
 - Python wheel downloads work (runner has network access)
 - Platform property matching configured (exact match, lexicographic sorting)
 
@@ -1660,9 +1703,11 @@ Our current `.bazelrc.local` sets `--spawn_strategy=remote,local` and `--strateg
 
 1. **Local linking** — final link step runs on the client and can dominate wall time after remote actions complete. A more powerful client or distributed linking would help.
 2. **Hardlinking vs FUSE** — currently using hardlinking workers due to shared-VPS kernel restrictions. Dedicated bare-metal with FUSE workers would enable lazy input loading and reduce fetch time further.
-3. **Runner image size** — current PoC image is ~1.73 GB on disk because `psmdb_builder.sh install_deps()` pulls in Go SDK, valgrind, devscripts/debhelper, and other packages that are only needed for Jenkins non-Bazel phases. Bazel execution itself uses its own hermetic toolchain (`mongo_toolchain_v5`) at runtime. Commenting `install_mongodbtoolchain`, `aws_sdk_build`, and `install_golang` in the local `psmdb_builder.sh` copy should shrink the image by ≈800 MB; tracked as a size-reduction follow-up.
+3. **Runner image size** — current PoC image is ~1.73 GB on disk (Ubuntu Noble) / ~2.17 GB (Debian Bookworm) because `psmdb_builder.sh install_deps()` pulls in Go SDK, valgrind, devscripts/debhelper, and other packages that are only needed for Jenkins non-Bazel phases. Bazel execution itself uses its own hermetic toolchain (`mongo_toolchain_v5`) at runtime. Commenting `install_mongodbtoolchain`, `aws_sdk_build`, and `install_golang` in the local `psmdb_builder.sh` copy should shrink the image by ≈800 MB; tracked as a size-reduction follow-up.
 4. **Runner image distribution** — currently bit-identical on all nodes via `docker save | scp | docker load`. For scaling to 17 variants × N nodes this needs to move to a registry (ghcr.io / Percona / Quay — decision pending, see §11.4).
 5. **Execution log** — `--execution_log_json_file` crashes the client on large builds (OOM). Use `--execution_log_compact_file` or drop the flag.
+6. **Worker RAM pressure at `concurrency=24`** — PSMDB's heaviest compile units (sharding/resharding coordinators, collection sharding runtime, IDL-generated extension files) peak at ~2–3 GB RSS per `cc1plus`. On a 32 GB Hetzner `cpx51` that exceeds physical RAM when 20+ of them schedule concurrently, triggering OOM-kill (observed during the debian-bookworm cold run, §9.7). **Decision: add 32 GB swap on each worker rather than drop concurrency** — lowering slots 24 → 14 costs throughput equivalent to losing 1–2 permanent nodes, and swap only affects the tail of the build where memory-heavy files compile. A proper upgrade to 64 GB RAM workers (Hetzner `ccx43`) is blocked by the current 8-dedicated-CPU tariff cap; the shared tier tops out at 32 GB RAM regardless of core count. Same swap-based mitigation is recommended for developers building PSMDB locally on 16–32 GB machines — it is already the de-facto practice in the field.
+7. **No dynamic concurrency sharing between pools on one worker** — if `worker-2` advertises 24 slots noble + 24 slots debian12 and only one distro has work, the other pool's slots sit idle (no cross-pool stealing). For true elastic sharing, `cpu_shares` / `cpus` caps on the Docker containers combined with high per-pool `concurrency` would let Linux CFS rebalance; revisit once multi-distro concurrent load is real.
 
 ### Infrastructure
 
@@ -1672,7 +1717,9 @@ Permanent nodes (always present):
 |--------|-----------|------------|------|---------|-------------|--------------|
 | barn-psmdb | 65.108.253.73 | 10.30.242.3 | Central (frontend, scheduler, storage, worker, proxy) | 16 | 12 (≈×0.75, undersubscribed — shares with storage/scheduler/frontend) | `psmdb-runner-ubuntu-noble-x86_64:poc` on the `hardlinking` pool; fuse pool retains `ghcr.io/catthehacker/ubuntu:act-22.04` (unused by PSMDB) |
 | barn-psmdb-worker-1 | 95.217.219.115 | 10.30.242.4 | Worker node (worker + runner) | 16 | 24 (×1.5 oversubscribed) | `psmdb-runner-ubuntu-noble-x86_64:poc` |
-| barn-psmdb-worker-2 | 95.217.221.140 | 10.30.242.5 | Worker node (worker + runner) | 16 | 24 (×1.5 oversubscribed) | `psmdb-runner-ubuntu-noble-x86_64:poc` |
+| barn-psmdb-worker-2 | 95.217.221.140 | 10.30.242.5 | Worker node (worker + runner, **multi-pool**) | 16 | 24 on ubuntu24 pool **+** 24 on debian12 pool (independent caps; see §9.7 second variant) | `psmdb-runner-ubuntu-noble-x86_64:poc` (ubuntu24 pool) **+** `psmdb-runner-debian-bookworm-x86_64:poc` (debian12 pool) |
+
+All workers have **32 GB swap** enabled to absorb peak memory on PSMDB's ~2–3 GB RSS `cc1plus` compilations (see §10 Improvements #6).
 
 Ephemeral / experimental nodes (may come and go):
 
@@ -1682,10 +1729,12 @@ Ephemeral / experimental nodes (may come and go):
 
 Hardlinking-pool worker concurrency (where PSMDB builds actually run):
 
-- **3 permanent nodes: `12 + 24 + 24 = 60` slots**
-- **+ `psmdb-mongot` (when present): `+18` → `78` slots total**
+| Pool (by `container-image` SHA) | Pool name | Slots | Notes |
+|----------------------------------|-----------|-------|-------|
+| `...@sha256:f1bd96...` | ubuntu24 | `12 + 24 + 24 (+ 18 mongot) = 78` | All 4 hardlinking nodes advertise this |
+| `...@sha256:d1df0f...` | debian12 | `24` | worker-2 only (second pool on same physical host) |
 
-Client invokes with `--jobs=96` so the scheduler always has work queued regardless of whether the ephemeral node is live. The bb-browser "N idle workers" counter reflects live pool size (60 without mongot, 78 with).
+Client invokes with `--jobs=96` so the scheduler always has work queued regardless of whether the ephemeral node is live. The bb-browser "N idle workers" counter reflects live pool size (78 ubuntu24 + 24 debian12 = 102 total slots when mongot is present).
 
 **Central is intentionally undersubscribed** (concurrency 12 on 16 cores, ×0.75). The node also hosts `frontend`, both `storage` shards, `scheduler`, `browser`, `runner-installer`, and the REAPI proxy. Raising concurrency here has asymmetric risk: a worker-node overload slows only that one node, but central overload degrades the shared CAS and scheduler, which slows the entire cluster. Any future attempt to raise 12 → 18 should be measured with `--noremote_accept_cached` before and after to confirm the change is not a net regression.
 
@@ -1767,12 +1816,13 @@ Warm rebuild (action cache populated from previous run, no code changes): **~50 
 IaC/buildbarn/runners/
 ├── README.md                          # strategy, directory layout, build/deploy workflow
 ├── psmdb_builder.sh                   # local copy of upstream psmdb_builder.sh, shared by all variants
-├── ubuntu-noble-x86_64/               # PoC variant — validated, in production on all hardlinking-pool nodes
+├── ubuntu-noble-x86_64/               # validated, in production on all hardlinking-pool nodes (§9.7)
+│   └── Dockerfile
+├── debian-bookworm-x86_64/            # validated on worker-2 via multi-pool setup (§9.7 second variant)
 │   └── Dockerfile
 ├── ubuntu-jammy-x86_64/               # pending
 ├── ubuntu-jammy-aarch64/              # pending
 ├── ubuntu-noble-aarch64/              # pending
-├── debian-bookworm-x86_64/            # pending
 ├── oracle-linux-8-x86_64/             # pending
 ├── oracle-linux-8-aarch64/            # pending
 ├── oracle-linux-9-x86_64/             # pending
@@ -1799,7 +1849,9 @@ IaC/buildbarn/runners/
 
 **Build frequency:** weekly rebuild covers security patches; daily is overkill unless upstream package repos are unstable. Pin to a date tag in `worker.jsonnet` to avoid silent drift mid-release.
 
-**PoC validation status (ubuntu-noble-x86_64):** validated against `install-dist-test` with 10,330 remote executions, zero failures, in both heterogeneous (1 of 3 workers) and full-rollout (4 of 4 workers) configurations. Wall-clock within noise of the pre-PoC baseline. See §9.7 PoC runner image validation for measurements.
+**PoC validation status:**
+- `ubuntu-noble-x86_64` — validated against `install-dist-test` with 10,330 remote executions, zero failures, in both heterogeneous (1 of 3 workers) and full-rollout (4 of 4 workers) configurations. Wall-clock within noise of the pre-PoC baseline. See §9.7 PoC runner image validation.
+- `debian-bookworm-x86_64` — validated via multi-pool deployment on worker-2: a separate `debian12` pool with its own `runner-bookworm` container handles Debian-client builds while the existing ubuntu24 pool continues serving noble traffic unchanged. Full `install-dist-test` cold build completed with 10,330 remote executions, zero failures (1 h 43 min 42 s wall time, with OOM+swap recovery mid-build). See §9.7 second variant subsection. Also surfaced the non-hermetic OpenSSL observation that justifies real per-distro runners rather than a single universal image.
 
 **Open decision:** private registry location. Options: Percona internal registry, `ghcr.io`, `quay.io`, `hub.docker.com/u/perconalab`. Needs alignment with security/access policy. Until chosen, the PoC image is replicated on each worker node via `docker save` / `scp` / `docker load` from `barn-psmdb-worker-2` (where it is first built). This is fine for 1 variant × 4 nodes but does not scale to 17 variants × N nodes — the registry decision is a hard prerequisite for step 3 of §11.7.
 
@@ -1886,7 +1938,7 @@ In order of dependency — each step unblocks the next:
 
 1. **Pick registry** for runner images (Percona internal / `ghcr.io` / `quay.io` / `hub.docker.com/u/perconalab`). Needed before any automation. **Still open.**
 2. ~~**Build 1 runner image** for `ubuntu-noble-x86_64` using `install_deps()`. Validate it runs an `install-dist-test` build through BuildBarn with the same or better numbers than current `psmdb-runner:latest` (this is the control).~~ **Done.** `IaC/buildbarn/runners/ubuntu-noble-x86_64/` implemented, validated with 10,330 remote executions (§9.7), rolled out to all hardlinking-pool nodes.
-3. **Extend to all remaining variants** — Dockerfiles in `IaC/buildbarn/runners/<variant>/`, each differing only by `FROM <distro>:<version>`. The shared `psmdb_builder.sh` auto-detects the OS via `get_system()`. Add CI job (pending registry decision at step 1) for weekly rebuild.
+3. **Extend to all remaining variants** — Dockerfiles in `IaC/buildbarn/runners/<variant>/`, each differing only by `FROM <distro>:<version>`. The shared `psmdb_builder.sh` auto-detects the OS via `get_system()`. Add CI job (pending registry decision at step 1) for weekly rebuild. **In progress**: `ubuntu-noble-x86_64` and `debian-bookworm-x86_64` done and validated end-to-end (§9.7); 9 x86_64 variants + 5 aarch64 variants pending.
 4. **Add aarch64 infrastructure**: 1 Hetzner CAX41 as PoC, BuildBarn worker config with `Arch=aarch64` property. Run one aarch64 variant end-to-end.
 5. **Update PSMDB Bazel rules** to emit correct `exec_properties` per target platform (`--config=release-ol8-x86_64` etc.). This is the biggest unknown — may need MongoDB Bazel fork investigation.
 6. **Run one full release matrix** on BuildBarn, measure actual wall time + CAS/AC footprint. Adjust sizing (11.5) based on real numbers.
@@ -1929,6 +1981,8 @@ In order of dependency — each step unblocks the next:
 | Build shows `0 remote` processes | Check: (1) `.bazelrc.local` uses `common:local` not bare `common`, (2) worker platform properties match exactly, (3) worker logs have no errors |
 | Worker log: `Worker failed readiness check: connection refused` | Runner container is starting. Wait 10–15 seconds — runner needs time to install `bb_runner` binary and start listening on the Unix socket |
 | Worker log: `Failed to obtain input file ... context canceled` | Worker is downloading large inputs (toolchain) and client timed out. Transient on cold start — clears after worker cache warms up. Reduce concurrency on new workers initially |
+| `FAILED_PRECONDITION: No workers exist for instance name prefix "hardlinking" platform {... "container-image":"...@sha256:<X>"...}` where `<X>` does NOT match what workers advertise | Client's distro auto-detection in `bazel/platforms/remote_execution_containers.bzl` picks a `container-image` SHA no worker pool advertises. Confirm client's distro (e.g. `lsb_release -sc`), find the corresponding entry in `remote_execution_containers.bzl`, then add a matching pool on at least one worker by appending a `runners[]` entry in `worker.jsonnet` with that SHA. Pattern illustrated in §9.7 "Second variant" (ubuntu24 + debian12 on the same `worker-2`) |
+| Build hangs for minutes at high `[X / 18,003]` count with processes stuck at thousand-seconds timestamps | Likely OOM-kill recovery (check `dmesg \| grep oom-kill` on workers). If confirmed, add swap on the affected worker (`fallocate -l 32G /swapfile && mkswap /swapfile && swapon /swapfile`) and restart the build. See §10 Improvements #6 |
 
 ## References
 
