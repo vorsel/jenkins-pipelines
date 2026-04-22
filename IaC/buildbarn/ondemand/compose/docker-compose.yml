@@ -1,0 +1,175 @@
+# BuildBarn control-plane for the PSMDB ondemand fleet.
+#
+# This compose file lives on the central host at /var/lib/buildbarn/compose/
+# (rsync'd by scripts/create-central.sh). The CAS/AC/FSAC ring buffers and
+# persistent_state dirs live on the xfs volume
+# psmdb-buildbarn-cas-ondemand (Hetzner volume 105484418, 750 GB, mounted
+# at /var/lib/buildbarn) — so this entire stack is stateless on the host
+# boot disk and can be recreated from scratch at any time by reattaching
+# the volume and re-running create-central.sh with mode=attach.
+#
+# Port strategy (user decision, see buildbarn-ondemand-scaler.md §6):
+#
+#   PUBLIC  (0.0.0.0)           PRIVATE (${PRIVATE_IP})     LOCAL (127.0.0.1)
+#   ──────────────────────────  ──────────────────────────  ──────────────────
+#   7982  scheduler admin HTML  8983  scheduler ↔ workers   8984  buildQueueState
+#   7984  bb-browser                                              (scaler only)
+#   8981  Envoy / Bazel clients
+#
+#   Rationale: 8981 (Bazel clients) is exposed publicly to match the existing
+#   barn-psmdb topology — developers and CI outside the Hetzner private
+#   network need to hit it. This is bare gRPC without TLS/auth, same as prod;
+#   a firewall allowlist can be bolted on later without re-architecting.
+#   Worker gRPC (8983) stays private because every worker is an ondemand VM
+#   created inside the psmdb.cd private network. BuildQueueState (8984) stays
+#   localhost because the scaler daemon runs on THIS host.
+#
+# Workers and their runner sidecars are NOT defined here — they live on
+# ephemeral ondemand VMs bootstrapped by the scaler (see §5.2).
+
+name: bb-psmdb-ondemand
+
+x-bb-image-common: &bb-image-common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+services:
+  # ---------------------------------------------------------------------
+  # Storage shard 0. Owns half of the sharded CAS/AC/FSAC key space.
+  # On-disk layout lives on the xfs volume via bind mounts from
+  # /var/lib/buildbarn/storage-{cas,ac,fsac}-0 — that's the ring-buffer
+  # block file, the key_location_map, and the persistent_state dir that
+  # lets the shard survive restarts without losing the in-memory index.
+  # Sized at 369 GB total (see config/storage.jsonnet for the breakdown).
+  # ---------------------------------------------------------------------
+  storage-0:
+    <<: *bb-image-common
+    image: ghcr.io/buildbarn/bb-storage:${BB_STORAGE_TAG}
+    command: [/config/storage.jsonnet]
+    expose:
+      - "8981"   # gRPC — only other compose services call this
+    volumes:
+      - ./config:/config:ro
+      - /var/lib/buildbarn/storage-cas-0:/storage-cas
+      - /var/lib/buildbarn/storage-ac-0:/storage-ac
+      - /var/lib/buildbarn/storage-fsac-0:/storage-fsac
+
+  # ---------------------------------------------------------------------
+  # Storage shard 1 — identical config to shard 0 but on different
+  # backing directories (so losing one shard doesn't nuke the other).
+  # ---------------------------------------------------------------------
+  storage-1:
+    <<: *bb-image-common
+    image: ghcr.io/buildbarn/bb-storage:${BB_STORAGE_TAG}
+    command: [/config/storage.jsonnet]
+    expose:
+      - "8981"
+    volumes:
+      - ./config:/config:ro
+      - /var/lib/buildbarn/storage-cas-1:/storage-cas
+      - /var/lib/buildbarn/storage-ac-1:/storage-ac
+      - /var/lib/buildbarn/storage-fsac-1:/storage-fsac
+
+  # ---------------------------------------------------------------------
+  # Frontend — Bazel clients hit this via Envoy (below). Splits each call
+  # across both storage shards and delegates Execute calls to the
+  # scheduler. Stateless: no volumes beyond /config.
+  # ---------------------------------------------------------------------
+  frontend:
+    <<: *bb-image-common
+    # Frontend is bb-storage running a different config file; same image tag.
+    image: ghcr.io/buildbarn/bb-storage:${BB_STORAGE_TAG}
+    command: [/config/frontend.jsonnet]
+    expose:
+      - "8980"   # gRPC — Envoy's upstream
+    volumes:
+      - ./config:/config:ro
+    depends_on:
+      - storage-0
+      - storage-1
+      - scheduler
+
+  # ---------------------------------------------------------------------
+  # Scheduler — the work queue. Takes requests from the frontend on 8982,
+  # dispatches them to workers on 8983 (workers connect via the private
+  # network from ondemand VMs), serves the HTML admin UI on 7982 (public),
+  # and exposes a programmatic BuildQueueState gRPC on 8984 that the
+  # ondemand scaler daemon polls to decide when to spin VMs up/down.
+  # ---------------------------------------------------------------------
+  scheduler:
+    <<: *bb-image-common
+    image: ghcr.io/buildbarn/bb-scheduler:${BB_SCHEDULER_TAG}
+    command: [/config/scheduler.jsonnet]
+    expose:
+      - "8982"   # Frontend → scheduler
+    ports:
+      - "7982:7982"
+      - "${PRIVATE_IP}:8983:8983"
+      - "127.0.0.1:8984:8984"
+    volumes:
+      - ./config:/config:ro
+
+  # ---------------------------------------------------------------------
+  # Browser — human-facing web UI for inspecting actions, CAS blobs, and
+  # queued/running operations. Read-only from the storage tier.
+  # ---------------------------------------------------------------------
+  browser:
+    <<: *bb-image-common
+    image: ghcr.io/buildbarn/bb-browser:${BB_BROWSER_TAG}
+    command: [/config/browser.jsonnet]
+    ports:
+      - "7984:7984"
+    volumes:
+      - ./config:/config:ro
+    depends_on:
+      - storage-0
+      - storage-1
+      - scheduler
+
+  # ---------------------------------------------------------------------
+  # REAPI v2 capabilities shim — Bazel 7.x refuses to talk to BuildBarn
+  # because BuildBarn advertises a newer REAPI minor version than Bazel
+  # supports. This tiny Go proxy rewrites the ServerCapabilities response
+  # to match what the client expects. Only Capabilities RPCs hit it —
+  # everything else goes straight to the frontend (see envoy.yaml).
+  # Source lives in IaC/buildbarn/reapi-proxy/ (shared with non-ondemand
+  # deployments). The bootstrap script rsyncs those source files to
+  # /var/lib/buildbarn/reapi-proxy/ and this `build:` context picks them
+  # up relative to the compose file.
+  # ---------------------------------------------------------------------
+  reapi-proxy:
+    <<: *bb-image-common
+    build:
+      context: /var/lib/buildbarn/reapi-proxy
+      dockerfile: Dockerfile
+    image: psmdb-reapi-proxy:local
+    command: ["-listen", ":8990", "-backend", "frontend:8980"]
+    expose:
+      - "8990"
+    depends_on:
+      - frontend
+
+  # ---------------------------------------------------------------------
+  # Envoy — the gateway Bazel clients actually connect to. Routes
+  # Capabilities RPCs to reapi-proxy (version patching) and every other
+  # RPC straight to frontend. Listens on 8981 inside the container; we
+  # publish it only on the private network interface.
+  # ---------------------------------------------------------------------
+  envoy-proxy:
+    <<: *bb-image-common
+    image: envoyproxy/envoy:${ENVOY_IMAGE_TAG}
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "warn"]
+    ports:
+      # Public — Bazel clients outside the private network need this (matches
+      # existing barn-psmdb, bare gRPC, no TLS). Add a Hetzner firewall with
+      # an IP allowlist later if the exposure becomes a concern.
+      - "8981:8981"
+    volumes:
+      - /var/lib/buildbarn/reapi-proxy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      - reapi-proxy
+      - frontend

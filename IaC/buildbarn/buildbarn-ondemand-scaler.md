@@ -36,7 +36,7 @@ Out of scope:
 
 **The existing BuildBarn deployment (central `bb-psmdb` + three workers described in `buildbarn-remote-execution-setup.md`) is not touched during any phase of this project.** It keeps serving current Bazel traffic exactly as documented in the setup doc.
 
-Everything in this plan — the new central host, the new `psmdb-buildbarn-cas` volume, the ondemand worker fleet, the scaler daemon, the GHA-published runner images — is created on **new, independent Hetzner resources**. Side-by-side, not replace-in-place.
+Everything in this plan — the new central host, the new `psmdb-buildbarn-cas-ondemand` volume, the ondemand worker fleet, the scaler daemon, the GHA-published runner images — is created on **new, independent Hetzner resources**. Side-by-side, not replace-in-place.
 
 Why this matters:
 
@@ -50,7 +50,7 @@ Concrete resource naming convention (everything new gets `-ondemand` suffix or `
 | Old (untouched) | New (ondemand, this project) |
 |-----------------|-------------------------------|
 | server `bb-psmdb` (cpx62, hel1) | server `bb-psmdb-ondemand` (`cpx42`, hel1) |
-| volume `build_buddy_psmdb_cache` (100 GB, BuildBuddy's) | volume `psmdb-buildbarn-cas-ondemand` (500 GB xfs, hel1) |
+| volume `build_buddy_psmdb_cache` (100 GB, BuildBuddy's) | volume `psmdb-buildbarn-cas-ondemand` (750 GB xfs, hel1) |
 | servers `barn-psmdb-worker-1/2`, `psmdb-mongot` (permanent) | ephemeral `psmdb-bb-worker-<pool>-<timestamp>` (scaler-owned) |
 | network `11374636 psmdb.cd.percona.com` (shared with old fleet) | same network is fine — or a dedicated new one if we want stricter isolation (see §5.4) |
 | SSH key `htz.cd.key` (Jenkins fleet) | new SSH key `htz.cd.bb-worker.key` (§5.10) |
@@ -117,10 +117,10 @@ Notes:
          |                                          |
          | frontend : 8980                          |
          | storage-0, storage-1 (CAS+AC+FSAC)       |
-         |   → NEW volume `psmdb-buildbarn-cas`     |
-         |     500 GB xfs, hel1 (all state incl.    |
-         |     configs & secrets lives here →       |
-         |     VM is fully replaceable)             |
+         |   → NEW volume `psmdb-buildbarn-cas-     |
+         |     ondemand` 750 GB xfs, hel1           |
+         |     (all state incl. configs & secrets   |
+         |      lives here → VM is replaceable)     |
          | scheduler : 8982 (client gRPC)           |
          |           : 8983 (worker gRPC)           |
          |           : 8984 (buildQueueState gRPC)  |
@@ -169,7 +169,7 @@ Notes:
 
 Key invariants:
 
-- **Central node is the only always-on VM** — and is **replaceable**: all state (CAS blobs, BuildBarn configs, scaler secrets) lives on the attached `psmdb-buildbarn-cas` volume. Day-1 sizing is **`cpx42`** (8c shared / 16 GB) — see §5.1 for rationale; upgrade to `ccx*` later is 10 minutes of downtime and no data migration.
+- **Central node is the only always-on VM** — and is **replaceable**: all state (CAS blobs, BuildBarn configs, scaler secrets) lives on the attached `psmdb-buildbarn-cas-ondemand` volume. Day-1 sizing is **`cpx42`** (8c shared / 16 GB) — see §5.1 for rationale; upgrade to `ccx*` later is 10 minutes of downtime and no data migration.
 - **Scaler daemon runs as a Docker service on central** (co-located with scheduler — talks to scheduler on `localhost:8984` gRPC, no extra networking).
 - **Each worker VM serves exactly one pool.** No multi-pool-per-VM in ondemand mode — simpler lifecycle, easier to reason about cost attribution, and cloud-init template needs only one `(distro, arch)` parameterisation.
   - Consequence: `worker-2`'s current setup (two pools on one VM, validated in §9.7 of setup doc) is a static-deployment pattern, not the ondemand one.
@@ -220,23 +220,48 @@ Why `cpx42` rather than larger/dedicated:
 - **Shared CPU** — the jitter argument for `ccx*` is theoretical; current production (`cpx62` worker with all services) validated in §9 has no jitter-induced failures. Accepting shared saves the dedicated-budget gate.
 - **`cpx52`/`cpx62` (12c/16c, 24/32 GB, €27/€50)** — fine alternatives if we want extra RAM headroom. Upgrade path is simple (§portability note below); no reason to over-size on day one.
 
-**VM is replaceable, state is portable.** If shared-CPU jitter *does* show up in scheduler p99 metrics (monitored via `/metrics` on the scaler + scheduler itself), the upgrade path is: `hcloud volume detach psmdb-buildbarn-cas → hcloud server delete bb-psmdb → hcloud server create --type ccx23 ... → hcloud volume attach psmdb-buildbarn-cas → docker compose up`. Total downtime ~10 minutes. No data migration, no config rebuild — because **all state lives on the volume**.
+**VM is replaceable, state is portable.** If shared-CPU jitter *does* show up in scheduler p99 metrics (monitored via `/metrics` on the scaler + scheduler itself), the upgrade path is: `hcloud volume detach psmdb-buildbarn-cas-ondemand → hcloud server delete bb-psmdb-ondemand → hcloud server create --type ccx23 ... → hcloud volume attach psmdb-buildbarn-cas-ondemand → docker compose up`. Total downtime ~10 minutes. No data migration, no config rebuild — because **all state lives on the volume**.
 
-**CAS volume — create a new, dedicated BuildBarn volume.** The existing `build_buddy_psmdb_cache` 100 GB volume belongs to a different system (BuildBuddy, not BuildBarn) and should stay there. BuildBarn gets its own volume, sized for our actual workload from day one:
+**CAS volume — create a new, dedicated BuildBarn volume.** The existing `build_buddy_psmdb_cache` 100 GB volume belongs to a different system (BuildBuddy, not BuildBarn) and should stay there. BuildBarn gets its own volume, sized for our actual workload from day one.
 
-| Inputs | Value |
-|--------|-------|
-| Cold PSMDB build per variant | ~10,330 actions, ~X GB of CAS content |
-| 11 runner images (see §3.1) | 11 variant-builds' worth of actions per matrix run |
-| Actions are content-addressed and deduplicated | Only unique blobs consume space |
-| Per-variant unique-blob ratio (estimate) | ~60–70% (large overlap via hermetic toolchain & shared sources) |
+**Sizing — 750 GB initial (Hetzner project limit is 1024 GB, ~100 GB already spent on `build_buddy_psmdb_cache`), with a documented path to 1–2 TB after limit increase.**
 
-Rough estimate: a single full matrix cold-run produces ~50–80 GB of unique CAS content. Multiple matrix runs (with changing code) grow this over weeks. **Start with 500 GB volume.** That's:
+The matrix we support is **4 × 11 = 44** (runner, version) combinations (§3.1): `{8.0, 8.3, 9.0, master} × 11 runners`. Bucket the CAS content by category and estimate per-combo contribution:
 
-- 5× headroom over one full matrix worth of cold content.
-- ~€20/month (Hetzner volume price ~€0.04/GB-month).
-- Room to run several weeks without GC.
-- Can be `hcloud volume resize`-d online later (up to 10 TB).
+| Content category | Raw size | Dedup factor across the 44 combos |
+|---|---|---|
+| Source tree (Bazel `SourceArtifact` digests) | ~0.5–1 GB | ~100 % within a version; ~60–70 % across versions (most sources unchanged between releases) |
+| Bazel external deps (rules_cc, BCR, grpc, boost, …) | ~1–2 GB | ~100 % if `MODULE.bazel.lock` identical; ~70 % across minor version bumps |
+| MongoDB `mongo_toolchain_v5` (hermetic) | ~2 GB | 0 % across `(arch, OS family)`; 100 % within the same `(arch, OS family)` |
+| Compile outputs (`.o`, `.a`, `.so`) | ~3–5 GB per cold build | 0 % across any `(distro, arch, version)` — different glibc, headers, flags |
+| Linked binaries + test binaries (`install-dist-test`) | ~1–2 GB per cold build | Same — unique per combo |
+
+**Per-combo unique contribution after dedup:** ~5–8 GB.
+
+**Worst-case totals** (all 44 cold-built back-to-back and kept):
+- Shared baseline (sources + external deps): ~3 GB (one-time)
+- Per-arch toolchain × 11 distinct `(arch, OS)`: ~22 GB
+- Per-combo compile outputs: 5 GB × 44 = ~220 GB
+- **≈ 245 GB** for a full cold matrix run of all 4 versions.
+
+**Sustained working set** (realistic steady state — primary version hot, others occasional):
+- 8.3 primary, 11 hot runners: ~70 GB
+- 8.0 maintenance, 3–4 hot: ~20 GB
+- 9.0 pre-release, 2–3 hot: ~15 GB
+- master infrequent, 1–2 hot: ~10 GB
+- Baseline + toolchains: ~25 GB
+- **≈ 140 GB active**; +50–100 GB for 2–4 weeks of source-churn deltas; +20–30 GB for feature-branch outputs.
+
+**Sustained total: ~250–300 GB.**
+
+**Pick 750 GB initial.** That gives:
+- ~2.5× headroom over sustained working set → ring buffer wraps every ~5–6 weeks rather than every few days, so CAS hits stay high for the primary version across its full release cycle.
+- ~€30/month (Hetzner volume price ~€0.04/GB-month).
+- Fits the current Hetzner project volume limit (1024 GB), leaving ~174 GB headroom for the existing 100 GB BuildBuddy volume plus small future volumes.
+- Online `hcloud volume resize` path to 1–2 TB after a one-line Hetzner support ticket to raise the project limit; takes 1–2 days and is free. We can run the ticket in parallel with Phase 0–1 rollout, and resize the moment it's approved (`hcloud volume resize <id> --size 1000 && ssh root@bb-psmdb-ondemand 'xfs_growfs /var/lib/buildbarn'` — no downtime).
+- Shrink requires migration, so err high within the allowed budget.
+
+Had the project limit been 2 TB, we'd have picked 1 TB (~3.3× headroom, ring wrap ~2 months); 750 GB is a pragmatic compromise that doesn't compromise the primary-version hit rate but does leave the less-hot versions (master, occasional 9.0 pre-release builds) rotating through the ring faster than ideal. We monitor `blobstore_blob_operations_total{operation="FindMissing"}` and oldest-block age (see §5.1.1) — if miss rate on master/9.0 creeps up measurably, that's the signal to request the project limit bump and resize.
 
 **Filesystem: `xfs`, not ext4.** Hetzner lets you pick one at volume-create time. Rationale:
 
@@ -244,11 +269,92 @@ Rough estimate: a single full matrix cold-run produces ~50–80 GB of unique CAS
 - xfs wins on **every attribute that matters for BuildBarn CAS**: millions of small files (better B+tree directory indexing), high concurrent writers (per-AG allocation groups reduce lock contention vs ext4's single journal), large-file extents for occasional big blobs. This is the canonical xfs workload — it's the default filesystem on RHEL/CentOS specifically because of caches and object stores.
 - The only ext4 advantage (offline shrink) is irrelevant here.
 
-Setup: `hcloud volume create --name psmdb-buildbarn-cas --size 500 --location hel1 --format xfs`, then `hcloud volume attach <id> <central-server>`, mount at `/var/lib/buildbarn`, point `storage-0` and `storage-1` at `/var/lib/buildbarn/storage-{cas,ac,fsac}-{0,1}` subdirectories, keep the compose files + scaler secrets on the same volume (under `/var/lib/buildbarn/config` and `/var/lib/buildbarn/secrets`) so re-attaching the volume to a fresh VM instantly restores the full setup.
+Setup: `hcloud volume create --name psmdb-buildbarn-cas-ondemand --size 750 --location hel1 --format xfs`, then `hcloud volume attach <id> <central-server>`, mount at `/var/lib/buildbarn`, point `storage-0` and `storage-1` at `/var/lib/buildbarn/storage-{cas,ac,fsac}-{0,1}` subdirectories, keep the compose files + scaler secrets on the same volume (under `/var/lib/buildbarn/config` and `/var/lib/buildbarn/secrets`) so re-attaching the volume to a fresh VM instantly restores the full setup.
 
-Grow path: `hcloud volume resize <id> --size 1000 && ssh root@bb-psmdb 'xfs_growfs /var/lib/buildbarn'` — online, no downtime.
+Grow path (after Hetzner project volume-limit increase): `hcloud volume resize <id> --size 1000 && ssh root@bb-psmdb-ondemand 'xfs_growfs /var/lib/buildbarn'` — online, no downtime. (Remember to update the jsonnet `sizeBytes` below and restart `storage-{0,1}` so the ring buffer can use the new space.)
 
-Monitoring: Prometheus alert on `node_filesystem_avail_bytes{mountpoint="/var/lib/buildbarn"} < 100GB`. When that fires: either resize volume online or trigger CAS GC (see §9 open questions — we still need to pick a GC policy).
+### 5.1.1 Cache invalidation strategy
+
+Four layers, from "always on" to "nuclear":
+
+**Layer 1 — built-in circular ring buffer (`LocalBlobAccess`).** This is the primary mechanism; no cron job, no manual cleanup. `bb-storage` splits the volume into fixed-size blocks and writes in FIFO order. When `currentBlocks` fill up, the oldest `oldBlocks` get recycled. Hot blobs accessed from `oldBlocks` are auto-promoted back to `currentBlocks` on read, so high-hit-rate content survives forever; cold content naturally falls off.
+
+Example jsonnet snippet for 750 GB volume (680 GB CAS + 60 GB AC + ~10 GB for index/state/xfs metadata):
+
+```jsonnet
+// /var/lib/buildbarn/config/storage-0.jsonnet (and -1 symmetric)
+local CAS_PATH = '/var/lib/buildbarn/cas-0';
+local AC_PATH  = '/var/lib/buildbarn/ac-0';
+{
+  contentAddressableStorage: {
+    backend: {
+      'local': {
+        keyLocationMapOnBlockDevice: {
+          source: { file: { path: CAS_PATH + '/key_location_map', sizeBytes: 6 * 1024 * 1024 * 1024 } },  // 6 GB index
+          entries: 48 * 1024 * 1024,
+        },
+        keyLocationMapMaximumGetAttempts: 16,
+        keyLocationMapMaximumPutAttempts: 64,
+        oldBlocks: 8,
+        currentBlocks: 24,
+        newBlocks: 3,
+        blocksOnBlockDevice: {
+          source: { file: { path: CAS_PATH + '/blocks', sizeBytes: 340 * 1024 * 1024 * 1024 } },  // 340 GB per shard × 2 shards = 680 GB CAS
+          spareBlocks: 3,
+        },
+        persistent: { stateDirectoryPath: CAS_PATH + '/persistent_state', minimumEpochInterval: '5m' },
+      },
+    },
+  },
+  actionCache: {
+    backend: {
+      'local': {
+        // AC is ~10× smaller than CAS; entries are tiny protobuf digests.
+        keyLocationMapOnBlockDevice: {
+          source: { file: { path: AC_PATH + '/key_location_map', sizeBytes: 2 * 1024 * 1024 * 1024 } },
+          entries: 16 * 1024 * 1024,
+        },
+        oldBlocks: 4, currentBlocks: 12, newBlocks: 2,
+        blocksOnBlockDevice: {
+          source: { file: { path: AC_PATH + '/blocks', sizeBytes: 30 * 1024 * 1024 * 1024 } },  // 30 GB per shard × 2 = 60 GB AC
+          spareBlocks: 2,
+        },
+        persistent: { stateDirectoryPath: AC_PATH + '/persistent_state', minimumEpochInterval: '5m' },
+      },
+    },
+  },
+}
+```
+
+When we bump to 1 TB after the Hetzner project-limit increase, the rescaling is mechanical: CAS blocks `340 GB → 450 GB`, AC blocks `30 GB → 40 GB`, and optionally grow the key_location_map (`6 GB → 8 GB` and `entries` `48 Mi → 64 Mi`). Bump `sizeBytes`, `docker compose restart storage-0 storage-1`, done.
+
+Monitoring (Prometheus on scheduler + storage):
+
+- `blobstore_blob_operations_total{operation="FindMissing"}` — rising miss-rate indicates ring wrap too fast.
+- `local_blob_access_blocks_*` — age distribution of blocks; if the oldest block's age drops below ~14 days, resize the volume.
+- `node_filesystem_avail_bytes{mountpoint="/var/lib/buildbarn"}` — expect ~5 % free (ring buffer is always almost-full; that's by design), alert only if < 20 GB free (that would mean index/state corrupted or config regression).
+
+**Layer 2 — logical invalidation via runner image SHA.** This is exactly the feature we just built. Each Bazel action is cached under the key `(action_digest, platform_properties)`, and `platform_properties.container-image = ghcr.io/.../runner:<version>-<sha>`. Rebuilding a runner image produces a new SHA → all previously-cached AC entries for that `(runner, version)` no longer match → next client build triggers fresh actions → old CAS outputs become orphans and are evicted naturally by Layer 1.
+
+Consequences:
+- **Per-`(runner, version)` cache isolation for free.** Changing `psmdb_builder_8_0.sh` never affects `:8.3-*` AC entries.
+- **Weekly runner rebuild (cron in the GHA workflow) gives us an implicit weekly bulk AC invalidation** — tag SHAs change every Monday 03:00 UTC, Monday morning builds pay cold cost, everything after that benefits.
+- **Pinning**: production BuildBarn worker pools should pin `:<version>-<sha>` in `ondemand-pools.yaml`, not `:<version>`. A new SHA goes live only when we update the pool config and rotate workers — predictable, not accidental drift.
+
+**Layer 3 — nuclear flush.** If something ever goes very wrong (confirmed AC poisoning, unrecoverable storage corruption, schema change in bb-storage protobuf between versions), wipe everything:
+
+```bash
+ssh root@bb-psmdb-ondemand
+cd /opt/buildbarn
+docker compose stop storage-0 storage-1
+rm -rf /var/lib/buildbarn/cas-0/* /var/lib/buildbarn/cas-1/* \
+       /var/lib/buildbarn/ac-0/*  /var/lib/buildbarn/ac-1/*
+docker compose up -d storage-0 storage-1
+```
+
+~5 minutes of central-stack downtime, all subsequent builds go cold-path. Use only when Layers 1+2 aren't enough (should be never under normal operation).
+
+**Layer 4 (not used) — per-pool `instance_name` namespacing.** BuildBarn supports routing different clients to isolated logical CAS/AC namespaces via `instance_name` prefixes on REAPI requests (e.g. `hardlinking/psmdb-8.3/` vs `hardlinking/psmdb-master/`). We **deliberately do not use this** because it would duplicate the source-tree and external-dep blobs (which are genuinely shared across release lines) and inflate CAS footprint by ~30 %. Layer 2 (runner image SHA) already gives us the only isolation we actually need — per-version-per-runner AC separation — without sacrificing dedup on the content that really is shared.
 
 The central node runs:
 
@@ -683,8 +789,12 @@ In strict dependency order — each step unblocks the next.
 2. **Build and push `ubuntu-noble-x86_64` and `debian-bookworm-x86_64` runner images** via the GHA workflow. Validate end-to-end: pick any fresh Hetzner VM (throwaway), `docker pull ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.3`, `docker run` it, confirm `psmdb_builder.sh install_deps` artefacts are in place. **Do not** re-deploy the existing `bb-psmdb` / worker-1 / worker-2 / mongot containers to use this registry; they keep running their current `docker save/load` tarball images untouched.
 3. **Create the NEW central VM and CAS volume.** Parallel to the existing `bb-psmdb`, we spin up a sibling host dedicated to the ondemand experiment:
    ```bash
-   # new volume for ondemand CAS (500 GB xfs)
-   hcloud volume create --name psmdb-buildbarn-cas-ondemand --size 500 --location hel1 --format xfs
+   # STATE: volume already created — ID 105484418, 750 GB xfs in hel1, NOT yet attached.
+   # (Created with: hcloud volume create --name psmdb-buildbarn-cas-ondemand --size 750 --location hel1 --format xfs)
+   #
+   # To verify at any point: hcloud volume describe 105484418
+   # To resize later (after Hetzner project limit-bump to ≥ 2 TB is approved):
+   #   hcloud volume resize 105484418 --size 1000 && ssh root@bb-psmdb-ondemand 'xfs_growfs /var/lib/buildbarn'
 
    # new central VM — does NOT replace bb-psmdb, lives alongside it
    hcloud server create \
@@ -695,11 +805,11 @@ In strict dependency order — each step unblocks the next.
        --ssh-key htz.cd.bb-worker.key \
        --network 11374636
 
-   hcloud volume attach <volume-id> bb-psmdb-ondemand
+   hcloud volume attach 105484418 bb-psmdb-ondemand
 
    # on bb-psmdb-ondemand:
    mkdir -p /var/lib/buildbarn
-   echo "/dev/disk/by-id/scsi-0HC_Volume_<id>  /var/lib/buildbarn  xfs  defaults,nofail,discard,noatime  0 0" >> /etc/fstab
+   echo "/dev/disk/by-id/scsi-0HC_Volume_105484418  /var/lib/buildbarn  xfs  defaults,nofail,discard,noatime  0 0" >> /etc/fstab
    mount -a
    ```
    Lay out on the volume:
@@ -789,7 +899,7 @@ Prerequisites to verify before committing:
 ## 9. Open questions / risks
 
 - **`BuildQueueState` proto stability.** The proto is part of `bb-remote-execution`'s public API but not version-SLA'd — upgrades could rename fields. Mitigation: pin the BuildBarn scheduler image digest in `docker-compose.yml`; add integration test that calls `ListPlatformQueues()` on scheduler startup and fails CI if the response doesn't match expected shape.
-- **CAS garbage collection.** bb-storage does not auto-GC. At ~30 workers doing cold builds, the 100 GB volume fills in weeks. Mitigation options: (a) periodic full wipe of CAS on schedule (loses warm-cache advantage after each wipe — bad for release cadence), (b) size-based LRU eviction via Redis backend (bb-storage supports it but adds a Redis service), (c) simply resize volume (Hetzner allows to 10 TB online) and accept forever-growing footprint until cost becomes uncomfortable. Recommend (c) until cost hits a pain threshold, then (b).
+- **CAS garbage collection.** ~~Open.~~ **Resolved — see §5.1.1 for the full strategy.** Short version: `LocalBlobAccess` is a circular ring buffer, not append-forever; it auto-evicts oldest blocks (with read-side promotion for hot blobs) and doesn't need cron-based GC. Logical invalidation per `(runner, version)` comes for free from rebuilding runner images (new image SHA → fresh AC entries → old outputs naturally age out of the ring). Only residual risk: sizing the volume too small so the ring wraps faster than the useful working set — mitigated by the 750 GB starting size (§5.1), a pending Hetzner project limit-bump that unlocks online resize to 1–2 TB, and Prometheus alerts on block-age distribution.
 - **Action cache invalidation on runner image rebuild.** If weekly rebuild produces a new SHA for `psmdb-runner-ubuntu-noble-x86_64`, all its AC entries become stale (different `container-image` property → different action digest). First build after rebuild pays full cold-run cost. **This is intentional** (catches drift) but means release runs the day after a rebuild are slow — schedule rebuilds on weekends, not mid-week.
 - **Hetzner API rate limits.** Default limit ~100 req/s; scaler polls every 30s → safe. But during a massive matrix spawn (11 pools × 3 VMs each = 33 `server create` calls in quick succession), might hit short-term caps. Mitigation: serialise spawn calls with a 2–3s jitter.
 - **Per-pool cost attribution** not built-in. Hetzner doesn't tag invoice lines by our labels. For internal accounting, the scaler should emit `bb_ondemand_scaler_estimated_hourly_cost_eur` broken down by pool, and a nightly job logs cumulative costs.
@@ -816,10 +926,11 @@ Back-of-envelope for current Percona usage pattern, Hetzner list prices (EUR, ro
 | Scenario | Fleet | Cost |
 |----------|-------|------|
 | **Current (unchanged during dev)** — old fleet | `bb-psmdb` (cpx62) + 3 workers + mongot | ~€200/month |
-| **Dev overhead — parallel ondemand setup** (Phase 0–3) | `bb-psmdb-ondemand` cpx42 + 500 GB xfs volume | +€17 + €20 = **+~€37/month** added on top of old fleet during dev |
+| **Dev overhead — parallel ondemand setup** (Phase 0–3) | `bb-psmdb-ondemand` cpx42 + 750 GB xfs volume | +€17 + €30 = **+~€47/month** added on top of old fleet during dev |
 | **Total during dev phase** (parallel running) | old fleet + new central (no workers idle) | **~€237/month** — temporary premium to de-risk migration |
-| **Post-cut-over** (old fleet retired, step 19) | 1 × `cpx42` ondemand central + 500 GB volume + ephemeral workers | ~€37/month + per-build costs |
-| Post-cut-over, if later upgraded to dedicated central | 1 × `ccx23` + 500 GB volume | ~€45/month |
+| **Post-cut-over** (old fleet retired, step 19) | 1 × `cpx42` ondemand central + 750 GB volume + ephemeral workers | ~€47/month + per-build costs |
+| Post-cut-over, if later upgraded to dedicated central | 1 × `ccx23` + 750 GB volume | ~€55/month |
+| Post-cut-over after Hetzner limit-bump → 1 TB volume | 1 × `cpx42` + 1 TB volume | ~€57/month |
 | One dev build (1 h wall time, noble, cold-ish) | central + 3 × `cpx51` for 1h | ~€0.33 per build |
 | One dev build (1 h wall time, warm via AC) | central + 1 × `cpx51` for 1h | ~€0.11 per build |
 | Full matrix run (2.5 h, 11 pools × ~2 VMs peak avg = ~22 worker-hours across `cpx51`/`cax41`) | central + avg ~9 VMs concurrently | ~€3–4 per matrix run |
@@ -833,8 +944,9 @@ Caveats:
 
 - Hetzner **bills per hour, minimum** — a 5-minute worker still costs one hour. Scale-down timing (§5.2) should batch reaps to minimise this.
 - **Bandwidth cost**: private-network traffic between central and workers is free; the concern is `docker pull` from ghcr.io on spawn, but ghcr.io has no egress cost on Hetzner's side.
-- **Volume cost scales with size, not usage** — 500 GB = €20/month regardless of how full; resizing up is cheap, resizing down is not supported (would require create-new/migrate/delete).
-- **CAS GC is still an open question** (§9). If the volume fills faster than expected, either grow it (`hcloud volume resize`) or add a GC strategy. €20/month covers 500 GB; going to 1 TB is €40.
+- **Volume cost scales with size, not usage** — 750 GB = €30/month regardless of how full; resizing up is cheap (€0.04/GB-month pro-rata), resizing down is not supported (would require create-new/migrate/delete).
+- **Volume budget is currently capped at Hetzner project limit 1024 GB.** With existing 100 GB `build_buddy_psmdb_cache` sitting in the same project, the practical ceiling for our CAS volume without a support ticket is ~924 GB. We deliberately take 750 GB now (leaving ~174 GB of project headroom) and request a limit bump to ≥2 TB concurrently with Phase 0 rollout so a later resize to 1 TB is one `hcloud volume resize` away.
+- **CAS GC strategy** — handled via `LocalBlobAccess` circular ring buffer (Layer 1 in §5.1.1). No cron-based GC; blocks auto-evict oldest blobs when full. Secondary logical invalidation via runner image SHA (Layer 2 in §5.1.1) gives per-`(runner, version)` cache isolation without manual intervention. If the ring wraps faster than every ~14 days in practice, grow the volume online (`hcloud volume resize`) and bump `sizeBytes` in the jsonnet.
 
 ## 12. Next concrete actions
 
@@ -844,7 +956,7 @@ The existing prod fleet (`bb-psmdb` + 3 workers + mongot) stays running and unto
 
 1. Create `.github/workflows/build-psmdb-buildbarn-runners.yml` in `vorsel/jenkins-pipelines`, push first runner images to `ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:<version>-<sha>` (immutable) and `:<version>` (moving). Mark packages public.
 2. Validate pull path on a throwaway Hetzner VM: `docker pull ghcr.io/vorsel/...` → `docker run` → confirm `psmdb_builder.sh` artefacts present.
-3. Create `psmdb-buildbarn-cas-ondemand` 500 GB xfs volume + new `bb-psmdb-ondemand` cpx42 host in hel1. Install BuildBarn control-plane (scheduler, 2 storage shards, frontend, browser, Envoy REAPI proxy) on the new host, all state on volume at `/var/lib/buildbarn`.
+3. Create `psmdb-buildbarn-cas-ondemand` 750 GB xfs volume + new `bb-psmdb-ondemand` cpx42 host in hel1 (and open a Hetzner support ticket to raise the project volume-size limit from 1024 GB so we can resize to 1 TB later without friction). Install BuildBarn control-plane (scheduler, 2 storage shards, frontend, browser, Envoy REAPI proxy) on the new host, all state on volume at `/var/lib/buildbarn`.
 
 **Then (Phase 1):**
 
