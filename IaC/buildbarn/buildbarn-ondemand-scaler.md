@@ -75,9 +75,11 @@ From empirical validation in `buildbarn-remote-execution-setup.md`:
 
 **Architectural primitive we rely on:** BuildBarn workers are *pull-based*. A worker dials the scheduler's gRPC `:8983` and announces itself with its `platform.properties`. The scheduler has no notion of "expected workers" — if a matching worker is online, operations are dispatched; if not, `FAILED_PRECONDITION: No workers exist for instance name prefix "hardlinking" platform {...}` surfaces on the client. Workers may come and go any time. This makes the autoscaler straightforward — it doesn't need to coordinate with the scheduler about workforce.
 
-### 3.1 Variant matrix — 11 runner images
+### 3.1 Variant matrix — 11 runner images × 3 PSMDB versions = 33 tag streams
 
-The authoritative source of truth is the parallel-stages block in [`jenkins-pipelines/psmdb/jenkins/percona-server-for-mongodb-8.3.groovy`](../../psmdb/jenkins/percona-server-for-mongodb-8.3.groovy) — specifically the `buildStage("<docker-image>", "--build_*=1")` invocations inside `stage('Build PSMDB RPMs/DEBs/Binary tarballs')`. Each unique `(docker-base, arch)` pair is one runner image; multiple Jenkins stages can (and do) share the same image.
+The authoritative source of truth for the `(distro, arch)` dimension is the parallel-stages block in [`jenkins-pipelines/psmdb/jenkins/percona-server-for-mongodb-8.3.groovy`](../../psmdb/jenkins/percona-server-for-mongodb-8.3.groovy) — specifically the `buildStage("<docker-image>", "--build_*=1")` invocations inside `stage('Build PSMDB RPMs/DEBs/Binary tarballs')`. Each unique `(docker-base, arch)` pair is one runner image repo; multiple Jenkins stages can (and do) share the same image.
+
+The **PSMDB release line** dimension is orthogonal: the same 11 `(distro, arch)` repos each carry three parallel tag streams, one per PSMDB release line — `8.0`, `8.3`, `master`. Each release line corresponds to one `psmdb_builder_<version>.sh` copy in `IaC/buildbarn/runners/` (see [`runners/README.md`](runners/README.md)). The GHA workflow in §7 materialises the full 11 × 3 = 33 job matrix on every run.
 
 | # | Runner image (registry path under `ghcr.io/vorsel/psmdb-buildbarn-runners/`) | Base image | Arch | Jenkins stages covered | MongoDB `REMOTE_EXECUTION_CONTAINERS` key + SHA |
 |---|---|---|---|---|---|
@@ -99,8 +101,9 @@ Notes:
 - **Validated today: images 9 and 11** (§9.7 of setup doc, empirical cold build through BuildBarn). Images 1–8 and 10 have never been built yet, but `install_deps()` for their docker bases runs in every Jenkins pipeline execution on a fresh container and has for years — so confidence is high that baking them into Dockerfiles is mechanical.
 - **OL8 x86_64 is the hottest image** — 4 stages share it (rpm + tarball + source rpm + source tarball). The scaler's pool config should probably give it a higher `min_nodes` once usage data rolls in (§Phase 4 step 18).
 - **MongoDB `REMOTE_EXECUTION_CONTAINERS` SHAs** are the routing keys the Bazel client sends to the scheduler (see §9.7 of setup doc for the discovery story). One SHA per distro covers both architectures — the scheduler matches on the SHA plus whatever `Pool` property carries the arch.
-- **Weekly rebuild cadence** picks up upstream CVE updates. Build all 11 in one matrix job, push with both `:<sha>` and `:latest` tags (§7 workflow).
-- **Registry path** during dev phase: `ghcr.io/vorsel/psmdb-buildbarn-runners/<runner-image>:latest`. Production flips to `ghcr.io/percona/...` per §7.
+- **Weekly rebuild cadence** picks up upstream CVE updates. Build all 11 × 3 = 33 combinations in one matrix job, push with both `:<version>-<sha>` (immutable) and `:<version>` (moving) tags (§7 workflow).
+- **Registry path** during dev phase: `ghcr.io/vorsel/psmdb-buildbarn-runners/<runner-image>:<psmdb-version>` where `<psmdb-version>` ∈ `{8.0, 8.3, master}` — e.g. `debian-bookworm-x86_64:8.3`. Production flips to `ghcr.io/percona/...` per §7.
+- **Tag streams are independent.** The three `psmdb_builder_*.sh` files evolve independently (8.0 freezes, 8.3 is current production, master drifts forward). Workers for PSMDB 8.0 builds pin `:8.0-<sha>`; workers for 8.3 or master pin their respective streams. Scaler `ondemand-pools.yaml` can therefore carry up to 33 pool entries (11 runner × 3 version) if we choose to route strictly by version — in practice, most pools will be `:8.3-<sha>` until 9.0 forks off.
 
 **Second primitive — queue state read API:** the scheduler exposes `BuildQueueState` gRPC on `:8984` (see upstream [`scheduler.jsonnet`](https://raw.githubusercontent.com/buildbarn/bb-deployments/master/docker-compose/config/scheduler.jsonnet)) which returns structured protobuf messages with `(queued, in-flight, idle workers)` counters per platform queue. The scaler uses this as its decision input. This is *not* Prometheus `/metrics` (that port exposes the HTML admin UI only, and the real Prometheus endpoint is at `global.diagnosticsHttpServer:80` inside the scheduler container, not exposed by default). See §6 for the exact RPCs.
 
@@ -605,22 +608,35 @@ Both phases use identical mechanics — the below is written for the dev-phase `
 
 **Zero-secret push via GitHub Actions.** A workflow file (`.github/workflows/build-runners.yml` in `vorsel/jenkins-pipelines` during dev, promoted to `percona/jenkins-pipelines` for production) builds each runner image and pushes to ghcr.io. Authentication uses the auto-provisioned `GITHUB_TOKEN` (no PAT stored anywhere):
 
+The actual implementation is in [`.github/workflows/build-psmdb-buildbarn-runners.yml`](../../.github/workflows/build-psmdb-buildbarn-runners.yml). Its matrix has two dimensions — 11 `(distro, arch)` runners × 3 PSMDB release lines (`8.0`, `8.3`, `master`) — for 33 total jobs per run. Simplified:
+
 ```yaml
-name: build-runners
+name: build-psmdb-buildbarn-runners
 on:
   push:
-    paths: [ 'jenkins-pipelines/IaC/buildbarn/runners/**' ]
+    paths:
+      - 'IaC/buildbarn/runners/**'
+      - '.github/workflows/build-psmdb-buildbarn-runners.yml'
   schedule:
-    - cron: '0 3 * * 0'     # weekly rebuild to catch upstream package updates
+    - cron: '0 3 * * 1'     # weekly rebuild, Mondays 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      variants: { description: "Subset of runners (space-separated; empty = all)", default: "" }
+      versions: { description: "Subset of PSMDB release lines (8.0 8.3 master)",   default: "" }
 permissions:
   contents: read
   packages: write            # scope needed to push to ghcr.io/<org>
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
-        variant: [ubuntu-noble-x86_64, debian-bookworm-x86_64, ...]
-    runs-on: ubuntu-24.04
+        psmdb_version: ["8.0", "8.3", "master"]
+        runner:        [ubuntu-noble-x86_64, debian-bookworm-x86_64, ...]   # 11 values
+        include:
+          - { runner: ubuntu-noble-aarch64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
+          # ... one per aarch64 runner; x86_64 defaults to ubuntu-24.04 / linux/amd64
+    runs-on: ${{ matrix.runs_on || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
@@ -628,18 +644,22 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}   # auto-generated per run
-      - uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v6
         with:
-          context: jenkins-pipelines/IaC/buildbarn/runners/${{ matrix.variant }}
+          context: IaC/buildbarn/runners/${{ matrix.runner }}
+          platforms: ${{ matrix.platform || 'linux/amd64' }}
           push: true
+          build-args: |
+            PSMDB_VERSION=${{ matrix.psmdb_version }}
+            PSMDB_BUILDER_SCRIPT_PATH=IaC/buildbarn/runners/psmdb_builder_${{ matrix.psmdb_version == 'master' && 'master' || (matrix.psmdb_version == '8.0' && '8_0' || '8_3') }}.sh
           tags: |
-            ghcr.io/vorsel/psmdb-buildbarn-runners/${{ matrix.variant }}:${{ github.sha }}
-            ghcr.io/vorsel/psmdb-buildbarn-runners/${{ matrix.variant }}:latest
+            ghcr.io/vorsel/psmdb-buildbarn-runners/${{ matrix.runner }}:${{ matrix.psmdb_version }}-${{ github.sha }}
+            ghcr.io/vorsel/psmdb-buildbarn-runners/${{ matrix.runner }}:${{ matrix.psmdb_version }}
 ```
 
-(When migrating to production: replace `vorsel` → `percona` in the `tags:` block — one edit, same workflow.)
+(When migrating to production: replace `vorsel` → `percona` in the `tags:` block — one edit, same workflow. aarch64 images build natively on `ubuntu-24.04-arm` to avoid QEMU overhead.)
 
-**Zero-credential pull on workers.** Images are marked public in ghcr.io UI (Settings → Packages → change visibility). Cloud-init on worker VMs runs `docker pull ghcr.io/vorsel/psmdb-buildbarn-runners/<variant>:latest` (or `ghcr.io/percona/...` in production) without any `docker login` — anonymous pull works for public packages.
+**Zero-credential pull on workers.** Images are marked public in ghcr.io UI (Settings → Packages → change visibility). Cloud-init on worker VMs runs `docker pull ghcr.io/vorsel/psmdb-buildbarn-runners/<variant>:<psmdb-version>` (e.g. `:8.3`, or `:<version>-<sha>` when pinning to an immutable build; `ghcr.io/percona/...` in production) without any `docker login` — anonymous pull works for public packages.
 
 **If policy ever demands private images**: mark packages private in ghcr.io, issue a long-lived fine-grained PAT scoped `packages:read`, inject via Hetzner `user_data` (first-boot only, pull, then remove the token from disk). Not needed for phase 1 since `psmdb_builder.sh` and its derived images contain only public OSS content.
 
@@ -660,7 +680,7 @@ In strict dependency order — each step unblocks the next.
 ### Phase 0 — Prerequisites (all-new resources)
 
 1. **Set up registry** (see §7). Create the GHA workflow in `vorsel/jenkins-pipelines` (personal fork) that builds runners and pushes to `ghcr.io/vorsel/psmdb-buildbarn-runners/*`. Mark packages public in ghcr.io UI after first push. No PATs or repo-stored credentials — Actions' `GITHUB_TOKEN` with `packages:write` scope is sufficient. Migration to `ghcr.io/percona/...` happens in the final production step, one-line change in `ondemand-pools.yaml`.
-2. **Build and push `ubuntu-noble-x86_64` and `debian-bookworm-x86_64` runner images** via the GHA workflow. Validate end-to-end: pick any fresh Hetzner VM (throwaway), `docker pull ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:latest`, `docker run` it, confirm `psmdb_builder.sh install_deps` artefacts are in place. **Do not** re-deploy the existing `bb-psmdb` / worker-1 / worker-2 / mongot containers to use this registry; they keep running their current `docker save/load` tarball images untouched.
+2. **Build and push `ubuntu-noble-x86_64` and `debian-bookworm-x86_64` runner images** via the GHA workflow. Validate end-to-end: pick any fresh Hetzner VM (throwaway), `docker pull ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.3`, `docker run` it, confirm `psmdb_builder.sh install_deps` artefacts are in place. **Do not** re-deploy the existing `bb-psmdb` / worker-1 / worker-2 / mongot containers to use this registry; they keep running their current `docker save/load` tarball images untouched.
 3. **Create the NEW central VM and CAS volume.** Parallel to the existing `bb-psmdb`, we spin up a sibling host dedicated to the ondemand experiment:
    ```bash
    # new volume for ondemand CAS (500 GB xfs)
@@ -732,7 +752,7 @@ Scaler keeps the reservation for `ttl_seconds` — skips scale-down for those no
 Mechanics:
 
 1. Spawn a `cpx51` from stock `ubuntu-24.04` cloud-image.
-2. Run cloud-init that ends with `docker pull ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:latest && docker pull ghcr.io/buildbarn/bb-worker:PINNED && docker pull ghcr.io/buildbarn/bb-runner-installer:PINNED && systemctl stop docker && sync` (replace `vorsel` with `percona` post-migration).
+2. Run cloud-init that ends with `docker pull ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.3 && docker pull ghcr.io/buildbarn/bb-worker:PINNED && docker pull ghcr.io/buildbarn/bb-runner-installer:PINNED && systemctl stop docker && sync` (replace `vorsel` with `percona` post-migration; template the version from the pool config).
 3. Call `hcloud server create-image --type=snapshot --description=psmdb-runner-noble-YYYYMMDD`.
 4. Record the returned snapshot ID (e.g. `114690400`) in `ondemand-pools.yaml`:
    ```yaml
@@ -822,7 +842,7 @@ The existing prod fleet (`bb-psmdb` + 3 workers + mongot) stays running and unto
 
 **Immediate (Phase 0):**
 
-1. Create `.github/workflows/build-runners.yml` in `vorsel/jenkins-pipelines`, push first runner images to `ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:<sha>` and `:latest`. Mark packages public.
+1. Create `.github/workflows/build-psmdb-buildbarn-runners.yml` in `vorsel/jenkins-pipelines`, push first runner images to `ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:<version>-<sha>` (immutable) and `:<version>` (moving). Mark packages public.
 2. Validate pull path on a throwaway Hetzner VM: `docker pull ghcr.io/vorsel/...` → `docker run` → confirm `psmdb_builder.sh` artefacts present.
 3. Create `psmdb-buildbarn-cas-ondemand` 500 GB xfs volume + new `bb-psmdb-ondemand` cpx42 host in hel1. Install BuildBarn control-plane (scheduler, 2 storage shards, frontend, browser, Envoy REAPI proxy) on the new host, all state on volume at `/var/lib/buildbarn`.
 

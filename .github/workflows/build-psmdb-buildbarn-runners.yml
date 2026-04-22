@@ -1,13 +1,21 @@
 name: build-psmdb-buildbarn-runners
 
-# Builds the 11 PSMDB BuildBarn runner images from
-# IaC/buildbarn/runners/<runner-name>/Dockerfile and pushes them to
-# ghcr.io/<repo-owner>/psmdb-buildbarn-runners/<runner-name>:{<sha>,latest}.
+# Builds the PSMDB BuildBarn runner images across three dimensions:
+#   - 11 (distro, arch) pairs defined by IaC/buildbarn/runners/<name>/Dockerfile,
+#     taken 1:1 from the parallel stages of
+#     psmdb/jenkins/percona-server-for-mongodb-8.3.groovy (see
+#     IaC/buildbarn/buildbarn-ondemand-scaler.md §3.1)
+#   - 3 PSMDB release lines: 8.0, 8.3, master — each with its own
+#     psmdb_builder_<version>.sh copy in IaC/buildbarn/runners/
 #
-# The matrix is the authoritative list of runner images defined in
-# IaC/buildbarn/buildbarn-ondemand-scaler.md §3.1. One entry per
-# (distro, architecture) pair, exactly matching the parallel stages in
-# psmdb/jenkins/percona-server-for-mongodb-8.3.groovy.
+# Total matrix: 11 × 3 = 33 jobs. Each pushes to
+#   ghcr.io/<owner>/psmdb-buildbarn-runners/<runner>:<version>-<sha>   (immutable)
+#   ghcr.io/<owner>/psmdb-buildbarn-runners/<runner>:<version>          (moving)
+#
+# Version tagging lets a single runner repo (e.g. ubuntu-noble-x86_64) carry
+# one tag per PSMDB release line, so BuildBarn worker configs pin images by
+# `container-image=ghcr.io/.../<runner>:<version>-<sha>` and we can route
+# different PSMDB client builds to the right deps without duplicating repos.
 #
 # aarch64 images build natively on GitHub-hosted ARM runners
 # (`ubuntu-24.04-arm`, free for public repos), avoiding 10-20x QEMU
@@ -22,8 +30,12 @@ on:
         description: "Subset of runners to build (space-separated; empty = all 11)"
         required: false
         default: ""
-      push_latest:
-        description: "Also push :latest tag (disable for branch experiments)"
+      versions:
+        description: "Subset of PSMDB release lines to build (space-separated: 8.0 8.3 master; empty = all)"
+        required: false
+        default: ""
+      push_moving:
+        description: "Also push the :<version> moving tag (disable for isolated branch experiments)"
         required: false
         default: "true"
         type: choice
@@ -39,7 +51,7 @@ on:
       - ".github/workflows/build-psmdb-buildbarn-runners.yml"
   schedule:
     # Weekly rebuild to pick up upstream CVE updates in base images and any
-    # drift in psmdb_builder.sh install_deps() — Mondays 03:00 UTC.
+    # drift in psmdb_builder_<version>.sh install_deps() — Mondays 03:00 UTC.
     - cron: "0 3 * * 1"
 
 env:
@@ -48,7 +60,7 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.runner }}
+    name: ${{ matrix.runner }} (psmdb-${{ matrix.psmdb_version }})
     runs-on: ${{ matrix.runs_on }}
     permissions:
       contents: read
@@ -56,8 +68,28 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 10
       matrix:
+        # Cartesian product of psmdb_version × runner (3 × 11 = 33 combinations).
+        # The `include` entries below add `platform` and `runs_on` fields to
+        # each (version, runner) cell based on the runner name — they do NOT
+        # introduce new combinations.
+        psmdb_version:
+          - "8.0"
+          - "8.3"
+          - "master"
+        runner:
+          - oraclelinux-8-x86_64
+          - oraclelinux-8-aarch64
+          - oraclelinux-9-x86_64
+          - oraclelinux-9-aarch64
+          - amazonlinux-2023-x86_64
+          - amazonlinux-2023-aarch64
+          - ubuntu-jammy-x86_64
+          - ubuntu-jammy-aarch64
+          - ubuntu-noble-x86_64
+          - ubuntu-noble-aarch64
+          - debian-bookworm-x86_64
         include:
           - runner: oraclelinux-8-x86_64
             platform: linux/amd64
@@ -94,25 +126,42 @@ jobs:
             runs_on: ubuntu-24.04
 
     steps:
-      - name: Skip if variant filtered out
+      - name: Skip if variant or version filtered out
         id: filter
         shell: bash
         env:
-          FILTER: ${{ github.event.inputs.variants }}
-          THIS: ${{ matrix.runner }}
+          VARIANTS_FILTER: ${{ github.event.inputs.variants }}
+          VERSIONS_FILTER: ${{ github.event.inputs.versions }}
+          THIS_RUNNER: ${{ matrix.runner }}
+          THIS_VERSION: ${{ matrix.psmdb_version }}
         run: |
-          if [[ -z "${FILTER}" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            for v in ${FILTER}; do
-              if [[ "${v}" == "${THIS}" ]]; then
-                echo "run=true" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
+          # Variant filter (runner name)
+          if [[ -n "${VARIANTS_FILTER}" ]]; then
+            hit="false"
+            for v in ${VARIANTS_FILTER}; do
+              if [[ "${v}" == "${THIS_RUNNER}" ]]; then hit="true"; break; fi
             done
-            echo "variant ${THIS} not in filter [${FILTER}], skipping"
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            if [[ "${hit}" == "false" ]]; then
+              echo "runner ${THIS_RUNNER} not in variants filter [${VARIANTS_FILTER}], skipping"
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
+
+          # Version filter (psmdb_version)
+          if [[ -n "${VERSIONS_FILTER}" ]]; then
+            hit="false"
+            for v in ${VERSIONS_FILTER}; do
+              if [[ "${v}" == "${THIS_VERSION}" ]]; then hit="true"; break; fi
+            done
+            if [[ "${hit}" == "false" ]]; then
+              echo "version ${THIS_VERSION} not in versions filter [${VERSIONS_FILTER}], skipping"
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         if: steps.filter.outputs.run == 'true'
@@ -134,6 +183,8 @@ jobs:
         if: steps.filter.outputs.run == 'true'
         id: meta
         shell: bash
+        env:
+          PSMDB_VERSION: ${{ matrix.psmdb_version }}
         run: |
           # GHCR paths must be lowercase; repo owners like "Percona" would
           # otherwise cause 400 at push time.
@@ -142,16 +193,23 @@ jobs:
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "cache_bust=$(date +%s)" >> "$GITHUB_OUTPUT"
 
-          # Tag set: always the commit SHA; :latest only on push_latest=true
-          # or on the default/main branch push/schedule events.
-          TAGS="${IMAGE}:${{ github.sha }}"
-          PUSH_LATEST="${{ github.event.inputs.push_latest }}"
-          if [[ -z "${PUSH_LATEST}" || "${PUSH_LATEST}" == "true" ]]; then
-            TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
-            # Also tag with the branch name so feature branches get a
-            # deterministic moving tag (e.g. :PSMDB-2034_buildbarn_setup).
-            BRANCH_TAG="$(echo '${{ github.ref_name }}' | tr '/ ' '__')"
-            TAGS="${TAGS}"$'\n'"${IMAGE}:${BRANCH_TAG}"
+          # Normalize version to a filename-safe slug for the script path:
+          #   "8.0"    -> "8_0"    -> psmdb_builder_8_0.sh
+          #   "8.3"    -> "8_3"    -> psmdb_builder_8_3.sh
+          #   "master" -> "master" -> psmdb_builder_master.sh
+          SLUG="${PSMDB_VERSION//./_}"
+          SCRIPT_PATH="IaC/buildbarn/runners/psmdb_builder_${SLUG}.sh"
+          echo "script_path=${SCRIPT_PATH}" >> "$GITHUB_OUTPUT"
+
+          # Tag set:
+          #   :<version>-<sha> — immutable, for production worker pinning
+          #   :<version>       — moving alias, for dev iteration (default on)
+          # Disable the moving tag with push_moving=false for isolated branch
+          # experiments that must not overwrite the current :<version> pointer.
+          TAGS="${IMAGE}:${PSMDB_VERSION}-${{ github.sha }}"
+          PUSH_MOVING="${{ github.event.inputs.push_moving }}"
+          if [[ -z "${PUSH_MOVING}" || "${PUSH_MOVING}" == "true" ]]; then
+            TAGS="${TAGS}"$'\n'"${IMAGE}:${PSMDB_VERSION}"
           fi
           {
             echo "tags<<EOF"
@@ -159,7 +217,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push ${{ matrix.runner }}
+      - name: Build and push ${{ matrix.runner }} (psmdb-${{ matrix.psmdb_version }})
         if: steps.filter.outputs.run == 'true'
         uses: docker/build-push-action@v6
         with:
@@ -173,19 +231,23 @@ jobs:
           build-args: |
             JENKINS_PIPELINES_REPO=https://github.com/${{ github.repository }}.git
             JENKINS_PIPELINES_BRANCH=${{ github.ref_name }}
-            PSMDB_BUILDER_SCRIPT_PATH=IaC/buildbarn/runners/psmdb_builder.sh
+            PSMDB_VERSION=${{ matrix.psmdb_version }}
+            PSMDB_BUILDER_SCRIPT_PATH=${{ steps.meta.outputs.script_path }}
             CACHE_BUST=${{ steps.meta.outputs.cache_bust }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+            org.percona.psmdb.version=${{ matrix.psmdb_version }}
 
       - name: Summarize
         if: steps.filter.outputs.run == 'true'
         shell: bash
         run: |
           {
-            echo "### ${{ matrix.runner }} (${{ matrix.platform }})"
+            echo "### ${{ matrix.runner }} — psmdb-${{ matrix.psmdb_version }} (${{ matrix.platform }})"
+            echo ""
+            echo "Script: \`${{ steps.meta.outputs.script_path }}\`"
             echo ""
             echo "Pushed tags:"
             echo '```'
@@ -194,12 +256,12 @@ jobs:
             echo ""
             echo "Pull:"
             echo '```bash'
-            echo "docker pull ${{ steps.meta.outputs.image }}:${{ github.sha }}"
+            echo "docker pull ${{ steps.meta.outputs.image }}:${{ matrix.psmdb_version }}-${{ github.sha }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Aggregate job surfaces a single "all green" status check suitable for
-  # branch protection; avoids requiring 11 separate checks to stay in sync.
+  # branch protection; avoids requiring 33 separate checks to stay in sync.
   report:
     name: report
     needs: build
@@ -213,6 +275,6 @@ jobs:
         run: |
           echo "build matrix result: ${RESULT}"
           if [[ "${RESULT}" != "success" ]]; then
-            echo "one or more variants failed"
+            echo "one or more variant/version combinations failed"
             exit 1
           fi

@@ -33,7 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ARG JENKINS_PIPELINES_REPO=https://github.com/vorsel/jenkins-pipelines.git
 ARG JENKINS_PIPELINES_BRANCH=PSMDB-2034_buildbarn_setup
-ARG PSMDB_BUILDER_SCRIPT_PATH=IaC/buildbarn/runners/psmdb_builder.sh
+ARG PSMDB_VERSION=8.3
+ARG PSMDB_BUILDER_SCRIPT_PATH=IaC/buildbarn/runners/psmdb_builder_8_3.sh
 
 # Fetch psmdb_builder.sh from the current branch of the IaC repo and
 # run it with --install_deps=1. CACHE_BUST forces wget re-run on every
@@ -53,7 +54,8 @@ LABEL org.opencontainers.image.description="BuildBarn runner built from psmdb_bu
 LABEL org.percona.psmdb.os="ubuntu-noble"
 LABEL org.percona.psmdb.glibc="2.39"
 LABEL org.percona.psmdb.arch="x86_64"
-LABEL org.percona.psmdb.builder_script="IaC/buildbarn/runners/psmdb_builder.sh install_deps()"
+LABEL org.percona.psmdb.version=$PSMDB_VERSION
+LABEL org.percona.psmdb.builder_script="${PSMDB_BUILDER_SCRIPT_PATH} install_deps()"
 
 # No CMD / ENTRYPOINT: BuildBarn's docker-compose.yml overrides the command
 # to run bb_runner after runner-installer drops the binary into /bb.

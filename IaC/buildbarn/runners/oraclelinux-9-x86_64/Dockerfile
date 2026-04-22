@@ -20,7 +20,8 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 
 ARG JENKINS_PIPELINES_REPO=https://github.com/vorsel/jenkins-pipelines.git
 ARG JENKINS_PIPELINES_BRANCH=PSMDB-2034_buildbarn_setup
-ARG PSMDB_BUILDER_SCRIPT_PATH=IaC/buildbarn/runners/psmdb_builder.sh
+ARG PSMDB_VERSION=8.3
+ARG PSMDB_BUILDER_SCRIPT_PATH=IaC/buildbarn/runners/psmdb_builder_8_3.sh
 
 ARG CACHE_BUST=0
 RUN mkdir -p /tmp/build \
@@ -36,4 +37,5 @@ LABEL org.opencontainers.image.description="BuildBarn runner built from psmdb_bu
 LABEL org.percona.psmdb.os="oraclelinux-9"
 LABEL org.percona.psmdb.glibc="2.34"
 LABEL org.percona.psmdb.arch="x86_64"
-LABEL org.percona.psmdb.builder_script="IaC/buildbarn/runners/psmdb_builder.sh install_deps()"
+LABEL org.percona.psmdb.version=$PSMDB_VERSION
+LABEL org.percona.psmdb.builder_script="${PSMDB_BUILDER_SCRIPT_PATH} install_deps()"
