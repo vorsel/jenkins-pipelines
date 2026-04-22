@@ -365,9 +365,9 @@ install_deps() {
       fi
       yum -y install wget sudo
       yum -y install perl
-      if [ x"$RHEL" != x2023 ]; then
-          install_mongodbtoolchain
-      fi
+      #if [ x"$RHEL" != x2023 ]; then
+          #install_mongodbtoolchain
+      #fi
       if [ x"$ARCH" = "xx86_64" ]; then
         yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm
         percona-release enable tools testing
@@ -387,7 +387,7 @@ install_deps() {
         yum -y install devtoolset-9
         yum -y install devtoolset-11-elfutils devtoolset-11-dwz
 
-        PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
+        #PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
 
         pip install --upgrade pip
         pip install --user setuptools --upgrade
@@ -404,7 +404,7 @@ install_deps() {
         yum -y install gcc-toolset-11-dwz gcc-toolset-11-elfutils
         yum -y install python38 python38-devel python38-pip
 
-        PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
+        #PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
         /usr/bin/pip install --user typing pyyaml regex Cheetah3
       elif [ x"$RHEL" = x9  -o x"$RHEL" = x2023 ]; then
         dnf config-manager --enable ol9_codeready_builder
