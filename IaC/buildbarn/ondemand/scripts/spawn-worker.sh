@@ -336,26 +336,70 @@ REMOTE
 }
 
 # -----------------------------------------------------------------------------
-# Confirm the worker registered with the central's scheduler. The scheduler
-# admin UI at :7982 lists all connected workers by hostname — scraping the
-# HTML is the cheapest check that doesn't require grpcurl on the laptop.
+# Confirm the worker registered. Two independent signals are checked because
+# either alone gave us false positives/negatives during Phase 1 bring-up:
+#
+#   1. Worker-side "no recent fatal":
+#      bb-worker spams "Fatal error: ... readiness check ... no such file or
+#      directory" while it's waiting for the runner unix socket to appear at
+#      startup, which is normal. Once it connects, it goes silent. So if the
+#      last 30 s of `docker compose logs` are EMPTY (no fatals, no panics),
+#      the worker is healthy and idle. This is the strongest signal.
+#
+#   2. Scheduler-side "platform queue exists":
+#      The scheduler admin root page (:7982) lists each platform queue with
+#      its container-image SHA. If our worker registered, our pool's queue
+#      will appear there. Hostnames are NOT shown at this level (they live
+#      on a drill-down sub-page that we don't try to scrape).
+#
+# A worker is declared "registered" only if both signals agree — accidental
+# silence on the worker side without scheduler-side queue creation usually
+# means the scheduler dropped the connection and we'd otherwise miss it.
 # -----------------------------------------------------------------------------
+
+# The platform property string we look for in the scheduler page. It needs to
+# match exactly what's emitted in worker.jsonnet — keep in sync if you ever
+# change the platform properties there.
+SCHEDULER_POOL_MARKER='Pool="x86_64"'
+
 verify_registered() {
   step "Verify registration"
 
-  log "polling http://$CENTRAL_PUBLIC_IP:7982/ for hostname '$WORKER_HOSTNAME' …"
-  for i in {1..20}; do
+  log "waiting up to ~3 min for worker '$WORKER_HOSTNAME' to settle …"
+
+  local i worker_quiet=0 scheduler_sees_pool=0
+  for i in {1..36}; do
+    sleep 5
+    [[ $((i % 6)) -eq 0 ]] && log "  still waiting ($((i * 5)) s elapsed) …"
+
+    # Signal 1 — worker side. `docker compose logs --since 15s worker` returns
+    # only the last 15 s. Empty (or no Fatal) means worker is healthy.
+    local recent_fatal
+    recent_fatal=$(rssh "cd $REMOTE_BASE && docker compose logs --no-color --since 15s worker 2>/dev/null | grep -c 'Fatal error' || true")
+    if [[ "$recent_fatal" =~ ^0+$ ]] || [[ -z "$recent_fatal" ]]; then
+      worker_quiet=1
+    else
+      worker_quiet=0
+    fi
+
+    # Signal 2 — scheduler side. Just check that our pool is listed at all.
     if curl -sS -m 5 "http://$CENTRAL_PUBLIC_IP:7982/" \
-         | grep -q "$WORKER_HOSTNAME"; then
-      ok "worker '$WORKER_HOSTNAME' visible on scheduler admin page"
+         | grep -qF "$SCHEDULER_POOL_MARKER"; then
+      scheduler_sees_pool=1
+    fi
+
+    if [[ "$worker_quiet" -eq 1 && "$scheduler_sees_pool" -eq 1 ]]; then
+      ok "worker is quiet (no recent fatals) and pool is registered on scheduler"
+      ok "scheduler admin: http://$CENTRAL_PUBLIC_IP:7982/"
       return
     fi
-    sleep 3
-    [[ $((i % 5)) -eq 0 ]] && log "  still waiting ($((i * 3)) s elapsed) …"
   done
-  warn "worker not visible on scheduler admin page after ~60 s."
-  warn "The VM is up — check logs with:"
+
+  warn "worker did NOT pass both readiness signals after ~3 min."
+  warn "  worker_quiet=$worker_quiet  scheduler_sees_pool=$scheduler_sees_pool"
+  warn "The VM is up — investigate with:"
   warn "  ssh -i $SSH_PRIV_KEY root@$PUBLIC_IP 'cd $REMOTE_BASE && docker compose logs --tail=100 worker runner'"
+  warn "  curl -s http://$CENTRAL_PUBLIC_IP:7982/ | grep -A1 hardlinking"
 }
 
 # -----------------------------------------------------------------------------
