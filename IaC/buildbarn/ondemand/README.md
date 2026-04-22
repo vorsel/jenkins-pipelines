@@ -26,8 +26,16 @@ ondemand/
 │       │                             buildQueueState :8984
 │       ├── frontend.jsonnet        ← gRPC :8980 (internal)
 │       └── browser.jsonnet         ← HTTP :7984
+├── worker/                         ← template for an ondemand bb-worker VM
+│   ├── cloud-init.yml.tmpl         ← Debian 13 + Docker + sysctl tuning
+│   ├── docker-compose.yml          ← runner-installer + bb-worker + pool runner
+│   └── config/
+│       ├── common.libsonnet        ← blobstore → central's envoy; browserUrl
+│       ├── worker.jsonnet          ← scheduler addr, concurrency, platform
+│       └── runner.jsonnet          ← unix-socket runner (verbatim from prod)
 └── scripts/
-    └── create-central.sh           ← the one-shot bootstrap / adopt tool
+    ├── create-central.sh           ← one-shot bootstrap / adopt of the central
+    └── spawn-worker.sh             ← create a single ondemand worker VM
 
 ../reapi-proxy/                     ← shared with other BuildBarn deployments;
                                       the bootstrap script rsyncs these into
@@ -137,12 +145,70 @@ Re-run the script and answer `wipe-attach`.
 `/var/lib/buildbarn/_backups/<timestamp>/` before overwriting. SSH in,
 `rsync` them back, `docker compose up -d`.
 
+## Spawning a worker (Phase 1, manual)
+
+Once the central is up, you can bring up a single worker VM with:
+
+```bash
+POOL=ubuntu-noble-x86_64 PSMDB_VERSION=8.3 \
+  ./scripts/spawn-worker.sh
+```
+
+Defaults (all overridable via env):
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `SERVER_TYPE` | `cpx42` | 8c shared / 16 GB / 320 GB disk — enough for one `--jobs=12` pool with ~100 GB hardlinking cache |
+| `LOCATION` | `hel1` | same as the central so the private network works |
+| `OS_IMAGE` | `debian-13` | matches the central's host OS |
+| `NETWORK_ID` | `11374636` | `psmdb.cd.percona.com` private net |
+| `SSH_KEY_IDS` | `24333399 111196538` | both ops keys injected, same as central |
+| `RUNNER_REGISTRY` | `ghcr.io/vorsel/psmdb-buildbarn-runners` | anonymous pull |
+| `RUNNER_IMAGE` | `${RUNNER_REGISTRY}/${POOL}:${PSMDB_VERSION}` | what the runner container runs |
+| `CENTRAL_NAME` | `bb-psmdb-ondemand` | discovered via `hcloud server describe` |
+| `SERVER_NAME` | `bb-worker-${POOL}-${TS}` | must be unique per run |
+
+Phase 1 VMs get a **public IPv4** so the operator can SSH in for debugging.
+Phase 2 will drop that for workers spawned programmatically by the scaler.
+
+What the script does:
+
+1. **Preflight.** Local binaries, hcloud auth, SSH key, central reachable
+   with a private IP on the expected network.
+2. **Render.** Copies `worker/` into a staging dir, `sed`-replaces all
+   `__CENTRAL_PRIVATE_IP__` / `__CENTRAL_PUBLIC_URL__` / `__POOL_NAME__` /
+   `__WORKER_HOSTNAME__` / `__RUNNER_IMAGE__` placeholders. Refuses to
+   proceed if any placeholder remains — that would ship broken configs.
+3. **Create server.** `hcloud server create` with the rendered cloud-init
+   as user-data and both SSH keys + the private network attached. Labels
+   `role=bb-worker project=psmdb-buildbarn pool=$POOL psmdb-version=$PSMDB_VERSION`.
+4. **Wait for SSH**, then `cloud-init status --wait`. If cloud-init fails,
+   the tail of `/var/log/cloud-init-output.log` is printed and the script
+   exits — the VM is left running for the operator to investigate.
+5. **Deploy.** Rsyncs the rendered `worker/` tree into `/opt/buildbarn/` on
+   the VM, then `docker compose pull && docker compose up -d`.
+6. **Verify.** Polls `http://$CENTRAL_PUBLIC_IP:7982/` until the worker's
+   hostname shows up on the scheduler admin page (or times out at ~60 s
+   and prints a log command you can run to dig in).
+7. **Summary.** SSH command, compose log cheat-sheet, and the `hcloud
+   server delete` command to tear the VM back down.
+
+**Tear down**:
+
+```bash
+hcloud server delete bb-worker-ubuntu-noble-x86_64-<timestamp>
+```
+
+Workers are stateless — everything under `/opt/buildbarn` on the VM
+(including the ~100 GB hardlinking cache) is scratch and dies with the VM.
+
 ## What's *not* here yet
 
 | Future component | Status | Lives in |
 | ---------------- | ------ | -------- |
-| `spawn-worker.sh` — manual worker VM creation | to do (Phase 1) | `ondemand/scripts/` |
 | `scaler/` — the daemon that watches `BuildQueueState` and manages VMs | to do (Phase 2) | `ondemand/scaler/` |
 | `ondemand-pools.yaml` — per-`(distro, arch)` pool definitions | to do (Phase 2) | `ondemand/` |
+| FUSE-mode worker (more efficient than hardlinking, needs `privileged: true`) | post-Phase-2 | `ondemand/worker/` |
+| Snapshot-based fast boot (~40 s instead of ~120 s) | post-Phase-2 | Hetzner snapshots |
 
 Design and milestones in [`../buildbarn-ondemand-scaler.md`](../buildbarn-ondemand-scaler.md).

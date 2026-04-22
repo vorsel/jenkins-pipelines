@@ -1,0 +1,81 @@
+# bb-worker stack for an ondemand Hetzner VM. Gets rendered on disk at
+# /opt/buildbarn/docker-compose.yml by cloud-init (see cloud-init.yml.tmpl).
+#
+# Three services:
+#
+#   runner-installer  one-shot image that copies the bb_runner binary into the
+#                     shared /bb volume, then drops a sentinel file
+#                     /bb/installed before exiting. The runner container below
+#                     polls for that sentinel, so we need no network wait logic.
+#
+#   worker            bb-worker process. Pulls work from the central's
+#                     scheduler at <central private IP>:8983 over the Hetzner
+#                     private network (the actual address is baked into
+#                     config/worker.jsonnet by spawn-worker.sh), talks to the
+#                     runner via a unix socket
+#                     in the shared /worker volume, and reports artefacts to
+#                     the central's blobstore via envoy on :8981. Runs in
+#                     privileged: false + hardlinking mode — simpler than
+#                     FUSE and doesn't need any capability elevation.
+#
+#   runner            the pool-specific Percona runner image (built by
+#                     .github/workflows/build-psmdb-buildbarn-runners.yml)
+#                     with install_deps() already baked in. Waits for
+#                     /bb/installed, then execs /bb/bb_runner against
+#                     /config/runner.jsonnet.
+#
+# Placeholders resolved by scripts/spawn-worker.sh at spawn time:
+#   __RUNNER_IMAGE__           e.g. ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.3
+#   (image tags for bb-worker and bb-runner-installer are hardcoded below to
+#    match the currently-deployed barn-psmdb control plane; bumping them
+#    requires bumping the central's tags in lockstep.)
+
+name: bb-psmdb-worker
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+services:
+  runner-installer:
+    <<: *common
+    image: ghcr.io/buildbarn/bb-runner-installer:20260326T163248Z-e6ab874
+    volumes:
+      - ./volumes/bb:/bb
+    # Runs once and exits; restart: "no" would be more correct, but keeping
+    # restart: unless-stopped matches upstream bb-deployments and the
+    # container exits cleanly after copying the binary — no restart loop.
+    restart: "no"
+
+  worker:
+    <<: *common
+    image: ghcr.io/buildbarn/bb-worker:20260326T163248Z-e6ab874
+    command: [/config/worker.jsonnet]
+    privileged: false
+    volumes:
+      - ./config:/config:ro
+      - ./volumes/worker:/worker
+    depends_on:
+      - runner-installer
+
+  runner:
+    <<: *common
+    image: __RUNNER_IMAGE__
+    command:
+      - sh
+      - -c
+      # Wait for runner-installer to drop /bb/bb_runner + /bb/installed,
+      # then take over as the runner process for this container.
+      - |
+        while ! test -f /bb/installed; do sleep 1; done
+        exec /bb/bb_runner /config/runner.jsonnet
+    volumes:
+      - ./config:/config:ro
+      - ./volumes/bb:/bb
+      - ./volumes/worker:/worker
+    depends_on:
+      - runner-installer

@@ -1,0 +1,85 @@
+#cloud-config
+#
+# Minimal cloud-init for a bb-psmdb ondemand worker VM. Intentionally stops
+# after "docker is installed and the host is ready" — the rest (docker-compose
+# stack, jsonnet configs, `docker compose up -d`) is pushed from the
+# operator's laptop by scripts/spawn-worker.sh over SSH, same pattern as
+# scripts/create-central.sh uses for the central node.
+#
+# Why not write_files the whole compose stack here: keeps cloud-init small
+# and readable, keeps the single source of truth for configs in the repo's
+# worker/ directory, and lets us re-run `docker compose up -d` later without
+# re-provisioning the VM.
+#
+# Placeholders resolved by scripts/spawn-worker.sh (plain sed):
+#   __WORKER_HOSTNAME__     hostname of this VM (e.g. bb-worker-ubuntu-noble-x86_64-20260422-1915)
+
+fqdn: __WORKER_HOSTNAME__
+hostname: __WORKER_HOSTNAME__
+
+package_update: true
+package_upgrade: false
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - jq
+  - lsb-release
+  - rsync
+
+# Prevent cloud-init's default resolv.conf template from clobbering the
+# Quad9/Cloudflare entries we pin below — this mirrors the Jenkins
+# htz.cloud.groovy 'deb-docker' pattern.
+write_files:
+  - path: /etc/cloud/cloud.cfg.d/99-disable-manage-resolv-conf.cfg
+    content: |
+      manage_resolv_conf: false
+    permissions: '0644'
+
+runcmd:
+  # DNS pinning — matches the existing Jenkins Hetzner fleet.
+  - |
+    cat > /etc/resolv.conf <<EOF
+    nameserver 9.9.9.9
+    nameserver 1.1.1.1
+    EOF
+
+  # repo.ci.percona.com is occasionally reached during build actions for
+  # artifact pulls; pin its internal address so DNS hiccups don't fail builds.
+  - sh -c 'grep -q repo.ci.percona.com /etc/hosts || echo "10.30.6.9 repo.ci.percona.com" >> /etc/hosts'
+
+  # 32 GB swap file — proven safety net for memory spikes during linking on
+  # cpx42 (16 GB RAM). Persists across reboots via fstab.
+  - |
+    if ! swapon --show | grep -q /swapfile; then
+      fallocate -l 32G /swapfile
+      chmod 600 /swapfile
+      mkswap /swapfile
+      swapon /swapfile
+      echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    fi
+
+  # Kernel tuning for high connection churn + many file descriptors.
+  - sysctl -w net.ipv4.tcp_fin_timeout=15
+  - sysctl -w net.ipv6.conf.all.disable_ipv6=1
+  - sysctl -w net.ipv6.conf.default.disable_ipv6=1
+  - sysctl -w fs.inotify.max_user_watches=10000000
+  - sysctl -w fs.aio-max-nr=1048576
+  - sysctl -w fs.file-max=6815744
+
+  # Docker. We use get.docker.com for parity with the central node's
+  # bootstrap; the script is maintained by Docker Inc. and handles
+  # Debian/Ubuntu/Amazon Linux uniformly.
+  - curl -fsSL https://get.docker.com | sh
+  - systemctl enable --now docker
+
+  # Workdir; scripts/spawn-worker.sh rsyncs the compose stack into here.
+  - mkdir -p /opt/buildbarn/config /opt/buildbarn/volumes
+
+  # Sentinel for spawn-worker.sh to detect "cloud-init finished". `cloud-init
+  # status --wait` is the canonical way, but having a dedicated file means
+  # the script can add a fast path if cloud-init is slow.
+  - touch /run/bb-worker.cloud-init.ok
+
+final_message: "bb-psmdb-worker cloud-init done in $UPTIME s"
