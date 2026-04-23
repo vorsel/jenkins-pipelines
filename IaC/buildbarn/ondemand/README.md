@@ -1,10 +1,10 @@
 # `bb-psmdb-ondemand` — BuildBarn control plane for ephemeral workers
 
 Green-field BuildBarn deployment that runs **only the control plane** on a
-single permanent Hetzner Cloud VM. Workers are ephemeral: an external scaler
-(not yet implemented — see [`buildbarn-ondemand-scaler.md`](../buildbarn-ondemand-scaler.md))
-spins Hetzner VMs up when `(distro, arch)` work is queued and tears them down
-after an idle timeout.
+single permanent Hetzner Cloud VM. Workers are ephemeral: the `scaler`
+daemon that lives next to the control plane (see [`scaler/`](scaler/))
+spins Hetzner VMs up when `(distro, arch)` work is queued and tears them
+down after an idle timeout.
 
 This directory contains everything needed to stand the central node up from
 an operator's laptop with one command.
@@ -25,17 +25,23 @@ ondemand/
 │       ├── scheduler.jsonnet       ← admin :7982, client :8982, worker :8983,
 │       │                             buildQueueState :8984
 │       ├── frontend.jsonnet        ← gRPC :8980 (internal)
-│       └── browser.jsonnet         ← HTTP :7984
+│       ├── browser.jsonnet         ← HTTP :7984
+│       └── ondemand-pools.yaml     ← declarative pool config for the scaler
 ├── worker/                         ← template for an ondemand bb-worker VM
-│   ├── cloud-init.yml.tmpl         ← Debian 13 + Docker + sysctl tuning
+│   ├── cloud-init.yml.tmpl         ← Debian 13 + Docker + sysctl tuning (spawn-worker.sh only)
 │   ├── docker-compose.yml          ← runner-installer + bb-worker + pool runner
 │   └── config/
 │       ├── common.libsonnet        ← blobstore → central's envoy; browserUrl
 │       ├── worker.jsonnet          ← scheduler addr, concurrency, platform
 │       └── runner.jsonnet          ← unix-socket runner (verbatim from prod)
+├── scaler/                         ← autoscale daemon (Phase 2)
+│   ├── scaler.py                   ← control loop (BuildQueueState → hcloud)
+│   ├── bootstrap.py                ← cloud-init renderer (reads worker/ tree)
+│   ├── Dockerfile                  ← python:3.12-slim + grpcurl
+│   └── requirements.txt            ← hcloud-python + PyYAML (pinned)
 └── scripts/
     ├── create-central.sh           ← one-shot bootstrap / adopt of the central
-    └── spawn-worker.sh             ← create a single ondemand worker VM
+    └── spawn-worker.sh             ← create a single ondemand worker VM (manual/debug)
 
 ../reapi-proxy/                     ← shared with other BuildBarn deployments;
                                       the bootstrap script rsyncs these into
@@ -202,13 +208,90 @@ hcloud server delete bb-worker-ubuntu-noble-x86_64-<timestamp>
 Workers are stateless — everything under `/opt/buildbarn` on the VM
 (including the ~100 GB hardlinking cache) is scratch and dies with the VM.
 
+## Scaler (Phase 2 MVP)
+
+A small Python daemon running on the central node, next to the rest of the
+control plane. Every `poll_interval_seconds` (default 30 s) it:
+
+1. Reads the scheduler's `BuildQueueState` gRPC at `127.0.0.1:8984` — each
+   platform queue reports its queued operations and active-worker count.
+2. Enumerates the Hetzner VMs it owns via the label
+   `psmdb.managed-by=bb-ondemand-scaler`.
+3. For every pool in [`compose/config/ondemand-pools.yaml`](compose/config/ondemand-pools.yaml),
+   decides:
+   - *scale up* — queue has work but no workers AND no VM is already booting
+   - *scale down* — a managed VM has been idle for more than
+     `scale_down_idle_seconds` (default 600 s)
+4. Executes those decisions via `hcloud-python`, UNLESS `SCALER_DRY_RUN=true`
+   (the default until the operator flips it off).
+
+How workers are delivered: the scaler renders a **self-contained cloud-init**
+that includes the entire `worker/` tree as `write_files` entries, so the VM
+needs no outbound SSH from the scaler. Source of truth for both manual
+(`spawn-worker.sh`) and automatic (`scaler.py`) paths is the same `worker/`
+directory on the central.
+
+### Dry-run → live workflow
+
+```bash
+# 1. After create-central.sh: scaler is already running in dry-run mode.
+ssh root@$CENTRAL 'cd /var/lib/buildbarn/compose && docker compose logs -f scaler'
+```
+
+Expected output on an empty cluster:
+
+```
+scaler: tick: 0 platform queues, 0 managed VMs (dry_run=True)
+```
+
+Trigger a Bazel build from a client. You should see the queue appear and the
+scaler log `[DRY_RUN] would spawn pool=ubuntu-noble-x86_64 queued=N`.
+
+```bash
+# 2. Once dry-run decisions look sane, go live:
+ssh root@$CENTRAL bash <<'EOF'
+  cd /var/lib/buildbarn/compose
+  sed -i 's/^SCALER_DRY_RUN=true/SCALER_DRY_RUN=false/' .env
+  docker compose up -d scaler
+EOF
+```
+
+### Pool configuration
+
+[`compose/config/ondemand-pools.yaml`](compose/config/ondemand-pools.yaml)
+is the single knob you edit to add / remove / resize pools. Each pool:
+
+| Field | Purpose |
+| ----- | ------- |
+| `container_image_sha` | scheduler routing key — must match `bazel/platforms/remote_execution_containers.bzl` on the PSMDB side |
+| `psmdb_version` | appended to `runner_image_base` — `ubuntu-noble-x86_64:8.3`, etc. |
+| `server_type` | `cpx42` default; bump to `cpx52` when we trust the config |
+| `concurrency` | must match `worker.jsonnet`'s `runners[0].concurrency` |
+| `min_nodes` / `max_nodes` | per-pool caps; a global cap lives under `global.max_total_nodes` |
+
+The scaler **refuses to spawn** if `global.max_total_nodes` is reached, so
+it can never cost-balloon beyond the hard cap set in the YAML.
+
+### Running the scaler standalone (ops)
+
+```bash
+# On the central:
+cd /var/lib/buildbarn/compose
+docker compose up -d scaler
+docker compose logs -f scaler
+docker compose restart scaler      # after editing ondemand-pools.yaml
+```
+
+The scaler reloads config on restart (no SIGHUP handling in the MVP).
+
 ## What's *not* here yet
 
 | Future component | Status | Lives in |
 | ---------------- | ------ | -------- |
-| `scaler/` — the daemon that watches `BuildQueueState` and manages VMs | to do (Phase 2) | `ondemand/scaler/` |
-| `ondemand-pools.yaml` — per-`(distro, arch)` pool definitions | to do (Phase 2) | `ondemand/` |
-| FUSE-mode worker (more efficient than hardlinking, needs `privileged: true`) | post-Phase-2 | `ondemand/worker/` |
-| Snapshot-based fast boot (~40 s instead of ~120 s) | post-Phase-2 | Hetzner snapshots |
+| Multi-VM scale-up per pool (fill `--jobs=96` with N workers) | post-MVP | `scaler/scaler.py` |
+| Pre-warm HTTP API (Jenkins hints before a release matrix) | post-MVP | `scaler/scaler.py` |
+| Snapshot-based fast boot (~40 s instead of ~120 s) | post-MVP | Hetzner snapshots |
+| FUSE-mode worker (more efficient than hardlinking, needs `privileged: true`) | post-MVP | `ondemand/worker/` |
+| Prometheus `/metrics` endpoint on the scaler | post-MVP | `scaler/scaler.py` |
 
 Design and milestones in [`../buildbarn-ondemand-scaler.md`](../buildbarn-ondemand-scaler.md).

@@ -1,0 +1,4 @@
+# Pinned for reproducibility — bump deliberately when a new feature is needed
+# or a CVE forces it. Same discipline as the compose image tags in .env.example.
+hcloud==2.2.0        # official Hetzner Cloud Python SDK
+PyYAML==6.0.2        # read ondemand-pools.yaml

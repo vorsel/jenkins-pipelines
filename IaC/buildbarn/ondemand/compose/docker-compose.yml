@@ -173,3 +173,37 @@ services:
     depends_on:
       - reapi-proxy
       - frontend
+
+  # ---------------------------------------------------------------------
+  # Scaler — the control loop that spawns and reaps worker VMs based on
+  # BuildQueueState. Built from IaC/buildbarn/ondemand/scaler/ in this repo
+  # (rsync'd by create-central.sh to /var/lib/buildbarn/scaler). It needs:
+  #
+  #   * network_mode: host — to reach the scheduler's BuildQueueState at
+  #     127.0.0.1:8984 (which is only bound to loopback on the host).
+  #   * HCLOUD_TOKEN — Hetzner Cloud API token (from .env).
+  #   * SCALER_DRY_RUN=true for initial cut — the scaler logs "would
+  #     spawn / would delete" without touching Hetzner. Flip to false in
+  #     .env once the decisions match operator expectations.
+  #   * The worker/ tree mounted read-only so the scaler renders cloud-init
+  #     from the same source spawn-worker.sh uses — no drift between the
+  #     manual and automatic paths.
+  # ---------------------------------------------------------------------
+  scaler:
+    <<: *bb-image-common
+    build:
+      context: /var/lib/buildbarn/scaler
+      dockerfile: Dockerfile
+    image: psmdb-bb-scaler:local
+    network_mode: host
+    environment:
+      - HCLOUD_TOKEN=${HCLOUD_TOKEN}
+      - SCALER_DRY_RUN=${SCALER_DRY_RUN:-true}
+      - POOLS_CONFIG=/config/ondemand-pools.yaml
+      - WORKER_SRC=/worker
+      - SCHEDULER_STATE_GRPC=127.0.0.1:8984
+    volumes:
+      - ./config:/config:ro
+      - /var/lib/buildbarn/worker:/worker:ro
+    depends_on:
+      - scheduler

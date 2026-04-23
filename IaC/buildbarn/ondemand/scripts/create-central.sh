@@ -61,13 +61,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ONDEMAND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_SRC="$ONDEMAND_DIR/compose"
+WORKER_SRC="$ONDEMAND_DIR/worker"
+SCALER_SRC="$ONDEMAND_DIR/scaler"
 REAPI_PROXY_SRC="$(cd "$ONDEMAND_DIR/../reapi-proxy" && pwd)"
 
 # Remote paths on the central host.
 REMOTE_BASE=/var/lib/buildbarn
 REMOTE_COMPOSE="$REMOTE_BASE/compose"
 REMOTE_REAPI="$REMOTE_BASE/reapi-proxy"
+REMOTE_WORKER="$REMOTE_BASE/worker"
+REMOTE_SCALER="$REMOTE_BASE/scaler"
 VOLUME_DEV="/dev/disk/by-id/scsi-0HC_Volume_${VOLUME_ID}"
+
+# Hetzner Cloud API token for the scaler daemon. Must be scoped to the
+# psmdb-buildbarn project with read+write on servers / networks / SSH keys.
+# Inherited from the operator's shell env (same var hcloud CLI uses) — if
+# unset here, we prompt interactively rather than silently shipping a broken
+# scaler config. Pass HCLOUD_TOKEN_FILE to read from a file instead (keeps
+# the token out of bash history).
+: "${HCLOUD_TOKEN:=}"
+: "${HCLOUD_TOKEN_FILE:=}"
 
 # -----------------------------------------------------------------------------
 # Pretty logging.
@@ -105,7 +118,37 @@ preflight() {
   [[ -d "$REAPI_PROXY_SRC" ]]  || die "reapi-proxy source missing: $REAPI_PROXY_SRC"
   [[ -f "$REAPI_PROXY_SRC/Dockerfile" ]] \
     || die "reapi-proxy/Dockerfile missing"
+  [[ -d "$WORKER_SRC" ]]       || die "worker source missing: $WORKER_SRC"
+  [[ -f "$WORKER_SRC/docker-compose.yml" ]] \
+    || die "worker/docker-compose.yml missing"
+  [[ -d "$SCALER_SRC" ]]       || die "scaler source missing: $SCALER_SRC"
+  [[ -f "$SCALER_SRC/Dockerfile" ]] \
+    || die "scaler/Dockerfile missing"
+  [[ -f "$SCALER_SRC/scaler.py" ]] \
+    || die "scaler/scaler.py missing"
+  [[ -f "$COMPOSE_SRC/config/ondemand-pools.yaml" ]] \
+    || die "compose/config/ondemand-pools.yaml missing"
   ok "repo layout OK"
+
+  # HCLOUD_TOKEN is required by the scaler. We prefer HCLOUD_TOKEN_FILE so
+  # the token never lands in argv / shell history; fall back to the env var
+  # (same one hcloud CLI already reads) and finally to an interactive
+  # prompt. Never bake a default or silently ship an empty token.
+  if [[ -z "$HCLOUD_TOKEN" && -n "$HCLOUD_TOKEN_FILE" ]]; then
+    [[ -r "$HCLOUD_TOKEN_FILE" ]] || die "HCLOUD_TOKEN_FILE not readable: $HCLOUD_TOKEN_FILE"
+    HCLOUD_TOKEN=$(tr -d '\r\n' < "$HCLOUD_TOKEN_FILE")
+  fi
+  if [[ -z "$HCLOUD_TOKEN" ]]; then
+    warn "HCLOUD_TOKEN not in environment — scaler needs it to call Hetzner API"
+    read -rsp "Paste HCLOUD_TOKEN (input hidden): " HCLOUD_TOKEN; echo
+  fi
+  [[ -n "$HCLOUD_TOKEN" ]] || die "HCLOUD_TOKEN is empty — aborting"
+  # Loose sanity: Hetzner tokens are 64 chars of alphanumerics. Don't fail
+  # hard on length drift — just warn, because token formats could evolve.
+  if ! [[ "$HCLOUD_TOKEN" =~ ^[A-Za-z0-9]{40,}$ ]]; then
+    warn "HCLOUD_TOKEN doesn't look like a typical Hetzner token — proceeding anyway"
+  fi
+  ok "HCLOUD_TOKEN captured (${#HCLOUD_TOKEN} chars)"
 
   for key_id in $SSH_KEY_IDS; do
     hcloud ssh-key describe "$key_id" >/dev/null 2>&1 \
@@ -434,12 +477,12 @@ for shard in 0 1; do
     mkdir -p "$REMOTE_BASE/storage-$kind-$shard/persistent_state"
   done
 done
-mkdir -p "$REMOTE_BASE/compose" "$REMOTE_BASE/reapi-proxy"
+mkdir -p "$REMOTE_BASE/compose" "$REMOTE_BASE/reapi-proxy" "$REMOTE_BASE/worker" "$REMOTE_BASE/scaler"
 REMOTE
   ok "state dirs in place"
 
-  # 2) In attach mode, snapshot existing compose/ and reapi-proxy/ before
-  #    overwriting them — cheap and makes rollback trivial.
+  # 2) In attach mode, snapshot existing compose/, reapi-proxy/, worker/,
+  #    and scaler/ before overwriting them — cheap and makes rollback trivial.
   if [[ "$MODE" == "attach" ]]; then
     local ts; ts=$(date +%Y%m%dT%H%M%S)
     rssh "REMOTE_BASE='$REMOTE_BASE' TS='$ts' bash -se" <<'REMOTE'
@@ -448,11 +491,18 @@ BACKUP="$REMOTE_BASE/_backups/$TS"
 mkdir -p "$BACKUP"
 [[ -d "$REMOTE_BASE/compose" ]]     && cp -a "$REMOTE_BASE/compose"     "$BACKUP/" || true
 [[ -d "$REMOTE_BASE/reapi-proxy" ]] && cp -a "$REMOTE_BASE/reapi-proxy" "$BACKUP/" || true
+[[ -d "$REMOTE_BASE/worker" ]]      && cp -a "$REMOTE_BASE/worker"      "$BACKUP/" || true
+[[ -d "$REMOTE_BASE/scaler" ]]      && cp -a "$REMOTE_BASE/scaler"      "$BACKUP/" || true
 echo "  ✓ snapshot at $BACKUP"
 REMOTE
   fi
 
-  # 3) Push compose/ and reapi-proxy/ from the local repo.
+  # 3) Push compose/, reapi-proxy/, worker/, and scaler/ from the local repo.
+  #    worker/ is the source of truth BOTH for spawn-worker.sh (rsyncs from
+  #    laptop directly into the worker VM) AND for the scaler daemon (reads
+  #    this directory read-only and inlines the rendered configs into the
+  #    cloud-init user-data it hands to the Hetzner API). Shipping a single
+  #    authoritative copy here prevents drift between the two spawn paths.
   log "rsync compose/ → $REMOTE_COMPOSE"
   rrsync \
     --exclude=.env \
@@ -463,12 +513,32 @@ REMOTE
     --exclude=docker-compose.yml \
     "$REAPI_PROXY_SRC/" "root@$PUBLIC_IP:$REMOTE_REAPI/"
 
+  log "rsync worker/ → $REMOTE_WORKER"
+  rrsync \
+    "$WORKER_SRC/" "root@$PUBLIC_IP:$REMOTE_WORKER/"
+
+  log "rsync scaler/ → $REMOTE_SCALER"
+  rrsync \
+    --exclude=__pycache__ \
+    "$SCALER_SRC/" "root@$PUBLIC_IP:$REMOTE_SCALER/"
+
   ok "configs synced"
 
-  # 4) Write .env with current IPs, sed the browserUrl placeholder.
-  rssh "REMOTE_COMPOSE='$REMOTE_COMPOSE' PRIVATE_IP='$PRIVATE_IP' PUBLIC_IP='$PUBLIC_IP' bash -se" <<'REMOTE'
+  # 4) Write .env with current IPs + HCLOUD_TOKEN; sed the browserUrl
+  #    placeholder in common.libsonnet; patch ondemand-pools.yaml with the
+  #    central's own IPs (the YAML ships with `null` placeholders so a raw
+  #    `git checkout` doesn't accidentally carry someone else's IPs).
+  rssh \
+    "REMOTE_COMPOSE='$REMOTE_COMPOSE'" \
+    "PRIVATE_IP='$PRIVATE_IP'" \
+    "PUBLIC_IP='$PUBLIC_IP'" \
+    "HCLOUD_TOKEN='$HCLOUD_TOKEN'" \
+    "bash -se" <<'REMOTE'
 set -euo pipefail
 
+# The .env file is not rsync'd from the laptop (see --exclude=.env above),
+# so we write it from scratch here every run — the previous .env is
+# snapshotted into $REMOTE_BASE/_backups/ during step 2.
 cat > "$REMOTE_COMPOSE/.env" <<EOF
 # Generated by create-central.sh — edit by hand if you know what you're doing.
 # Tags below mirror the currently-working barn-psmdb control plane.
@@ -477,7 +547,13 @@ BB_SCHEDULER_TAG=20260326T163248Z-e6ab874
 BB_BROWSER_TAG=20260319T101727Z-1731858
 ENVOY_IMAGE_TAG=v1.31-latest
 PRIVATE_IP=$PRIVATE_IP
+HCLOUD_TOKEN=$HCLOUD_TOKEN
+# Safer default — scaler LOGS decisions instead of executing them. Operator
+# flips this to `false` once they've watched a full queue-up / queue-drain
+# cycle in the scaler logs without surprises.
+SCALER_DRY_RUN=true
 EOF
+chmod 600 "$REMOTE_COMPOSE/.env"   # token inside; keep off `ls -l` casual reads.
 
 # Replace the __BB_PUBLIC_URL__ placeholder in the jsonnet library so the
 # scheduler admin UI, browser, and frontend all emit links that work from the
@@ -486,7 +562,15 @@ EOF
 sed -i "s|__BB_PUBLIC_URL__|http://$PUBLIC_IP:7984|g" \
   "$REMOTE_COMPOSE/config/common.libsonnet"
 
-echo "  ✓ .env and browserUrl substitution done"
+# Patch ondemand-pools.yaml — the `null` placeholders must become the real
+# IPs before the scaler can render a usable cloud-init for workers.
+# We do a line-anchored sed (`^key:`) so we only touch the two lines and
+# never accidentally rewrite fields deeper in the YAML.
+POOLS="$REMOTE_COMPOSE/config/ondemand-pools.yaml"
+sed -i "s|^\(  scheduler_public_url:\).*|\1 http://$PUBLIC_IP:7982|"  "$POOLS"
+sed -i "s|^\(  scheduler_private_ip:\).*|\1 $PRIVATE_IP|"              "$POOLS"
+
+echo "  ✓ .env, browserUrl, and ondemand-pools.yaml baked in"
 REMOTE
   ok "environment baked in"
 }
@@ -501,7 +585,7 @@ compose_up() {
 set -euo pipefail
 cd "$REMOTE_COMPOSE"
 
-docker compose build reapi-proxy
+docker compose build reapi-proxy scaler
 docker compose pull --ignore-buildable
 docker compose up -d
 
@@ -543,6 +627,17 @@ smoke() {
   else
     warn "envoy-proxy NOT accepting on :8981 — check 'docker compose logs envoy-proxy'"
   fi
+
+  # Scaler: successful boot prints a "loaded config" line within the first
+  # seconds. We look for that literal in the last ~60 lines rather than
+  # assuming a specific port is open — the scaler has no externally exposed
+  # listener in the MVP. grep -q returns non-zero when absent so we can
+  # surface a clear warning pointing at the right logs.
+  if rssh "REMOTE_COMPOSE='$REMOTE_COMPOSE' bash -c 'cd \$REMOTE_COMPOSE && docker compose logs --tail=60 scaler 2>/dev/null | grep -q \"loaded config\"'"; then
+    ok "scaler booted and loaded config (SCALER_DRY_RUN=true by default)"
+  else
+    warn "scaler did NOT log 'loaded config' yet — check 'docker compose logs scaler'"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -565,10 +660,16 @@ summary() {
   Localhost (on central host only):
     BuildQueueState  : grpc://127.0.0.1:8984          (scaler consumes this)
 
+  Scaler:
+    Mode             : SCALER_DRY_RUN=true            (logs decisions, no API calls)
+    Logs             : ssh root@$PUBLIC_IP 'cd $REMOTE_COMPOSE && docker compose logs -f scaler'
+    Go live          : edit $REMOTE_COMPOSE/.env → SCALER_DRY_RUN=false
+                       then: ssh root@$PUBLIC_IP 'cd $REMOTE_COMPOSE && docker compose up -d scaler'
+
   Next steps:
-    * Phase 1: spawn a worker with scripts/spawn-worker.sh once it exists.
-    * Phase 2: wire the scaler daemon to grpc://127.0.0.1:8984.
-    * Point Bazel clients at --remote_executor=grpc://$PUBLIC_IP:8981
+    * Manual worker  : scripts/spawn-worker.sh            (for debugging, always works)
+    * Autoscaling    : flip SCALER_DRY_RUN=false after watching a dry-run cycle
+    * Bazel clients  : --remote_executor=grpc://$PUBLIC_IP:8981
 EOF
 }
 

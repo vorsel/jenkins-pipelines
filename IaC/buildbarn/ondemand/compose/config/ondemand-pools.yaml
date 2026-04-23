@@ -1,0 +1,66 @@
+# Declarative pool config consumed by the scaler daemon.
+#
+# Every pool is matched to a scheduler platform queue by its `container_image_sha`
+# (which must equal what PSMDB's Bazel client sets in
+# bazel/platforms/remote_execution_containers.bzl). When the scheduler reports
+# that queue has queued operations but no workers, the scaler spawns a Hetzner
+# VM from this pool's template. Pool-less platform queues are ignored.
+#
+# All placeholders in worker/config/{common,worker,runner}.jsonnet and
+# worker/docker-compose.yml are substituted by the scaler at spawn time — see
+# scaler/bootstrap.py:render_user_data() for the exact mapping.
+
+global:
+  # Scheduler endpoints the scaler itself talks to.
+  scheduler_state_grpc: 127.0.0.1:8984   # BuildQueueState (scaler reads)
+  scheduler_public_url: null             # filled by create-central.sh (used for worker's browserUrl)
+  scheduler_private_ip: null             # filled by create-central.sh (workers dial this for gRPC)
+
+  # Hetzner project-wide defaults that every pool inherits.
+  hcloud_ssh_key_ids:
+    - 24333399         # htz.cd.key — operator's daily-driver key
+    - 111196538        # htz.cd.bb-psmdb-ondemand — per-fleet key
+  hcloud_network_id: 11374636            # psmdb.cd.percona.com private net
+  hcloud_os_image: debian-13             # host OS for workers; decoupled from runner distro
+
+  # Region try-chain. hel1 first because the central lives there → lowest
+  # intra-AZ latency between workers and CAS. nbg1/fsn1 are fallbacks for
+  # capacity errors during EU peak (same pattern as htz.cloud.groovy).
+  region_try_chain: [hel1, nbg1, fsn1]
+
+  # Safety rails. The scaler REFUSES any action that would exceed these.
+  max_total_nodes: 12                    # cap across all pools combined
+  max_cost_per_hour_eur: 2.0             # sum of current VM hourly rates
+
+  # Control loop timings.
+  poll_interval_seconds: 30              # how often the scaler polls BuildQueueState
+  scale_down_idle_seconds: 600           # 10 min — matches Hetzner per-hour billing granularity
+  scale_up_threshold: 1                  # minimum queued ops before we spawn (Phase 2 MVP: aggressive, revisit)
+
+# Pools. Each key becomes the Hetzner label `psmdb.pool=<key>` on spawned VMs.
+pools:
+
+  ubuntu-noble-x86_64:
+    # Routing key — MUST match what Bazel sends in platform.properties.
+    # From: percona-server-mongodb/bazel/platforms/remote_execution_containers.bzl
+    # "ubuntu24" entry.
+    container_image_sha: "f1bd96104b3b8d33fff1500421917f3e15d9525795043e8d3f7f382e87c10002"
+
+    # Phase 2 MVP ships only 8.3 because that's the actively-tested tag.
+    # Add 8.0/master when their runner images go through the same smoke.
+    psmdb_version: "8.3"
+
+    # Runner image reference — anonymous pull from ghcr.io as long as the
+    # package visibility stays public (see worker/docker-compose.yml).
+    runner_image_base: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64"
+
+    # Hetzner VM geometry. cpx42 matches the central (8c/16GB/320GB) — plenty
+    # of headroom for concurrency=12 and ~100 GB hardlinking cache. Upgrade
+    # to cpx52 (12c/24GB) once we trust the setup and want more throughput.
+    server_type: cpx42
+    concurrency: 12                      # must match worker.jsonnet's runners[0].concurrency
+
+    # Per-pool caps. max_nodes sets the ceiling for THIS pool alone;
+    # global.max_total_nodes is the hard ceiling across pools.
+    min_nodes: 0
+    max_nodes: 2
