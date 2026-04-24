@@ -8,6 +8,12 @@
 // Port visibility (public / private / localhost) is controlled in docker-compose.yml,
 // NOT here.
 local common = import 'common.libsonnet';
+// Generated at deploy time by create-central.sh's bake_predeclared() step
+// from compose/config/ondemand-pools.yaml. See that file for the priming
+// flow and the MAINTENANCE CONTRACT below. Ships as a small JSON array of
+// PredeclaredPlatformQueueConfiguration entries, one per pool with a
+// non-null container_image_sha.
+local predeclared = import 'predeclared.libsonnet';
 
 {
   adminHttpServers: [{
@@ -78,38 +84,16 @@ local common = import 'common.libsonnet';
   // Source: bb-remote-execution bb_scheduler.proto, field #12
   //   PredeclaredPlatformQueueConfiguration predeclared_platform_queues = 12;
   //
-  // MAINTENANCE CONTRACT: every pool in compose/config/ondemand-pools.yaml
-  // MUST appear below with the SAME container-image SHA. create-central.sh
-  // enforces this via a preflight check — if you see the check fail, copy
-  // the pool's `container_image_sha` from the YAML into a new entry here,
-  // matching the `Pool` + `dockerNetwork` properties a Bazel client actually
-  // sends. (Capture them live with `grpcurl ... ListPlatformQueues` after
-  // a successful build, in case PSMDB adds more platform properties.)
+  // MAINTENANCE CONTRACT: the list below is AUTO-GENERATED from
+  // compose/config/ondemand-pools.yaml by create-central.sh's
+  // bake_predeclared() step. Do NOT hand-edit predeclared.libsonnet —
+  // edit the YAML and redeploy. One entry is emitted per pool whose
+  // `container_image_sha` is non-null (null scaffolds an inactive pool
+  // that awaits priming — see ondemand-pools.yaml for the priming flow).
   //
-  // TODO: when we outgrow 1–2 pools, replace this list with a generator
-  // script that reads ondemand-pools.yaml and emits the jsonnet. Manual
-  // sync is fine at this scale; error-prone once we're tracking 11.
-  predeclaredPlatformQueues: [
-    {
-      // Pool ubuntu-noble-x86_64 (psmdb 8.3 actively developed).
-      // Platform properties captured from a real Bazel Execute error log:
-      //   FAILED_PRECONDITION: No workers exist for instance name prefix
-      //   "hardlinking" platform {"properties":[
-      //     {"name":"Pool","value":"x86_64"},
-      //     {"name":"container-image","value":"docker://...@sha256:f1bd9610..."},
-      //     {"name":"dockerNetwork","value":"standard"}]}
-      instanceNamePrefix: 'hardlinking',
-      platform: {
-        properties: [
-          { name: 'Pool', value: 'x86_64' },
-          { name: 'container-image', value: 'docker://quay.io/mongodb/bazel-remote-execution@sha256:f1bd96104b3b8d33fff1500421917f3e15d9525795043e8d3f7f382e87c10002' },
-          { name: 'dockerNetwork', value: 'standard' },
-        ],
-      },
-      // Single uniform worker size (concurrency=12 in worker.jsonnet).
-      // `0` means "unsized" — use when there is no feedback-driven size
-      // classification. See bb_scheduler.proto PredeclaredPlatformQueueConfiguration.size_classes.
-      sizeClasses: [0],
-    },
-  ],
+  // `sizeClasses: [0]` is applied uniformly: our workers register with the
+  // default size_class=0, and we don't use feedback-driven size
+  // classification. See bb_scheduler.proto
+  // PredeclaredPlatformQueueConfiguration.size_classes for the rationale.
+  predeclaredPlatformQueues: predeclared,
 }

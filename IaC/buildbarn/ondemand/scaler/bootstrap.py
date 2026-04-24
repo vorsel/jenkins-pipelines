@@ -35,12 +35,21 @@ log = logging.getLogger(__name__)
 # Placeholder tokens shared with spawn-worker.sh. Keep this list in lockstep
 # with the sed invocations in scripts/spawn-worker.sh:render() — a divergence
 # means manual and automatic spawns ship different configs.
+#
+# __CONTAINER_IMAGE_SHA__ and __BAZEL_POOL_VALUE__ are the routing keys for
+# scheduler platform queue matching (see worker.jsonnet header). If either
+# is wrong the worker registers into a queue no client writes to, actions
+# hang until `platformQueueWithNoWorkersTimeout` drops them — that's the
+# silent-failure shape we hit before these placeholders existed, so
+# bootstrap refuses to render if a pool doesn't supply them.
 _PLACEHOLDERS = [
     "__CENTRAL_PRIVATE_IP__",
     "__CENTRAL_PUBLIC_URL__",
     "__POOL_NAME__",
     "__WORKER_HOSTNAME__",
     "__RUNNER_IMAGE__",
+    "__BAZEL_POOL_VALUE__",
+    "__CONTAINER_IMAGE_SHA__",
 ]
 
 _PLACEHOLDER_RE = re.compile(r"__[A-Z_]+__")
@@ -74,6 +83,8 @@ def render_user_data(
     central_public_url: str,
     pool_name: str,
     runner_image: str,
+    bazel_pool_value: str,
+    container_image_sha: str,
 ) -> str:
     """
     Produce a #cloud-config document as a string, ready to pass straight into
@@ -96,12 +107,30 @@ def render_user_data(
           - ... docker install, sysctl, swap ...
           - cd /opt/buildbarn && docker compose up -d
     """
+    # Empty-string SHA here would produce a worker registered with a
+    # literal `sha256:` platform property — that would match nothing.
+    # Refuse loudly; the scaler's caller is expected to skip pools
+    # with container_image_sha=null rather than let bootstrap cover up
+    # a config hole.
+    if not container_image_sha:
+        raise ValueError(
+            f"pool '{pool_name}' has no container_image_sha — cannot render "
+            f"worker config (would register into an unmatched platform queue)"
+        )
+    if not bazel_pool_value:
+        raise ValueError(
+            f"pool '{pool_name}' has no bazel_pool_value — cannot render "
+            f"worker config (would register with Pool='' which matches nothing)"
+        )
+
     subs = {
         "__CENTRAL_PRIVATE_IP__": central_private_ip,
         "__CENTRAL_PUBLIC_URL__": central_public_url,
         "__POOL_NAME__": pool_name,
         "__WORKER_HOSTNAME__": worker_hostname,
         "__RUNNER_IMAGE__": runner_image,
+        "__BAZEL_POOL_VALUE__": bazel_pool_value,
+        "__CONTAINER_IMAGE_SHA__": container_image_sha,
     }
 
     # Render each file upfront so we bail on a missing/bad placeholder BEFORE
@@ -243,5 +272,7 @@ if __name__ == "__main__":
         central_public_url="http://CENTRAL_PUB:7984",
         pool_name="ubuntu-noble-x86_64",
         runner_image="ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.3",
+        bazel_pool_value="x86_64",
+        container_image_sha="0" * 64,
     )
     print(rendered)

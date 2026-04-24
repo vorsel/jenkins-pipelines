@@ -403,6 +403,16 @@ install_deps() {
         yum -y install gcc-toolset-9 gcc-c++
         yum -y install gcc-toolset-11-dwz gcc-toolset-11-elfutils
         yum -y install python38 python38-devel python38-pip
+        # PSMDB master's buildscripts use PEP 585 generics (list[str],
+        # dict[str,int], etc.) which need Python >= 3.9. OL8 default python3
+        # is 3.8 (python38 above), which fails on import with
+        # `TypeError: 'type' object is not subscriptable`. Install python3.11
+        # from the OL8 AppStream and flip the `python3` alternative to it so
+        # unqualified `python3 buildscripts/*.py` invocations work. python38
+        # is kept installed for anything that explicitly calls `python3.8`.
+        yum -y install python3.11 python3.11-devel python3.11-pip
+        alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 11
+        alternatives --set python3 /usr/bin/python3.11
 
         #PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
         /usr/bin/pip install --user typing pyyaml regex Cheetah3

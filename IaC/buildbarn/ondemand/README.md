@@ -151,6 +151,39 @@ Re-run the script and answer `wipe-attach`.
 `/var/lib/buildbarn/_backups/<timestamp>/` before overwriting. SSH in,
 `rsync` them back, `docker compose up -d`.
 
+**Debugging a worker from the central.**
+Every `create-central.sh` run ensures the central has its own ed25519
+keypair at `/root/.ssh/id_ed25519` and that its public key is registered
+with Hetzner as the named SSH key `bb-psmdb-ondemand-central`. The
+numeric id of that key is auto-appended to
+`hcloud_ssh_key_ids` in the baked `ondemand-pools.yaml`, so every worker
+the scaler (or `spawn-worker.sh`) spawns from that point on trusts the
+central for SSH. A small wrapper lands on the central at
+`/usr/local/bin/ssh-worker` with host-key-checking disabled (workers are
+ephemeral and Hetzner recycles IPs):
+
+```bash
+ssh root@<central-public-ip>
+ssh-worker 10.30.242.10                          # interactive shell on a worker
+ssh-worker 10.30.242.10 'cd /opt/buildbarn && docker compose ps'
+ssh-worker 10.30.242.10 'docker compose logs --tail=100 runner worker'
+```
+
+Two caveats:
+
+1. Workers spawned **before** the key was registered (or under a *previous*
+   central keypair, e.g. if the central VM itself was replaced) are NOT
+   SSH-reachable from the current central. Hetzner does not allow adding
+   SSH keys to an already-created VM. Either wait for the idle-reap to
+   replace them, or `hcloud server delete <worker-name>` them and let the
+   scaler recreate under the new key.
+
+2. The central's keypair survives volume detach/reattach (it lives on the
+   boot disk, not the XFS volume). But `hcloud server delete` on the central
+   destroys the keypair — the next `create-central.sh` generates a new one
+   and rotates the Hetzner named key; all existing workers become
+   unreachable from the new central. Plan worker rotation accordingly.
+
 ## Spawning a worker (Phase 1, manual)
 
 Once the central is up, you can bring up a single worker VM with:
@@ -267,7 +300,8 @@ is the single knob you edit to add / remove / resize pools. Each pool:
 
 | Field | Purpose |
 | ----- | ------- |
-| `container_image_sha` | scheduler routing key — must match `bazel/platforms/remote_execution_containers.bzl` on the PSMDB side **and** the `predeclaredPlatformQueues` entry in `compose/config/scheduler.jsonnet` (preflight check enforces the second) |
+| `container_image_sha` | scheduler routing key — must equal whatever the PSMDB Bazel client sends for this OS (ultimately from `bazel/platforms/remote_execution_containers.bzl` on the PSMDB side). `null` scaffolds a not-yet-primed pool; `scripts/create-central.sh` auto-generates the matching `predeclaredPlatformQueues` entry in `compose/config/predeclared.libsonnet` at bake time, so YAML and scheduler config stay in sync by construction. See the priming flow in the YAML header for how to activate a new pool |
+| `bazel_pool_value` | value of Bazel's `Pool` platform property — `x86_64` or `aarch64`. Explicit per-pool rather than inferred from the pool name |
 | `psmdb_version` | appended to `runner_image_base` — `ubuntu-noble-x86_64:8.3`, etc. |
 | `server_type` | `cpx42` default; bump to `cpx52` when we trust the config |
 | `concurrency` | must match `worker.jsonnet`'s `runners[0].concurrency` |
@@ -302,18 +336,42 @@ registration. Bazel's `Execute` succeeds (action queues), the scaler sees
 `queued > 0`, spawns a VM, and the action runs once the worker joins.
 Bazel's default 3600 s `--remote_timeout` absorbs the wait.
 
-**Keeping the files in sync.** Every `container_image_sha` in
-`compose/config/ondemand-pools.yaml` must appear verbatim in
-`compose/config/scheduler.jsonnet`. `scripts/create-central.sh` fails the
-preflight if it doesn't, so drift is caught before deploy.
+**One source of truth.** `compose/config/ondemand-pools.yaml` is the only
+file you edit. At deploy time, `scripts/create-central.sh` runs
+`bake_predeclared()` which reads the YAML and generates
+`compose/config/predeclared.libsonnet` — a small JSON array of
+`PredeclaredPlatformQueueConfiguration` entries, one per pool with a
+non-null `container_image_sha`. `scheduler.jsonnet` imports that file.
+YAML and scheduler config stay in sync **by construction** — there is
+nothing to drift. Hand-editing `predeclared.libsonnet` is not
+supported; the file carries a `// AUTO-GENERATED` header and is
+overwritten on every deploy.
 
-To add a new pool:
+**Where SHAs come from.** `container_image_sha` for each pool mirrors
+upstream PSMDB master's
+`bazel/platforms/remote_execution_containers.bzl`. The YAML header
+documents the exact `bzl key → pool name` mapping. When PSMDB rebases
+master and regenerates that file, re-sync the SHAs below: paste the
+new `.bzl` and diff. That's the happy path — no FAILED_PRECONDITION
+needed.
 
-1. Append the pool block to `ondemand-pools.yaml`.
-2. Append a matching `predeclaredPlatformQueues` entry to
-   `scheduler.jsonnet` (copy an existing entry, swap the SHA and `Pool`
-   property).
-3. Re-run `scripts/create-central.sh`.
+**Priming an unknown SHA** (for a pool upstream doesn't publish, or when
+the user's PSMDB branch pins `.bzl` at a different revision):
+
+1. Flip the pool's `container_image_sha: null` in `ondemand-pools.yaml`
+   and re-run `scripts/create-central.sh`. The pool is scaffolded but
+   **no** predeclared queue is emitted for it.
+2. Trigger `bazel build` against this pool's OS. With no predeclared
+   queue, Bazel hits `FAILED_PRECONDITION` and the error log reports
+   the real SHA the client sent:
+   ```
+   FAILED_PRECONDITION: No workers exist for instance name prefix
+   "hardlinking" platform {"properties":[...,{"name":"container-image",
+   "value":"docker://...@sha256:XYZ"}...]}
+   ```
+3. Paste that `XYZ` into `container_image_sha` for this pool.
+4. Re-run `scripts/create-central.sh`. Subsequent builds against that
+   pool queue cleanly and the scaler spawns workers on demand.
 
 ## What's *not* here yet
 

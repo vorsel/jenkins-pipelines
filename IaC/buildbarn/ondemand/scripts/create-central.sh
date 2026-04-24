@@ -219,56 +219,12 @@ preflight() {
     || die "compose/config/scheduler.jsonnet missing"
   ok "repo layout OK"
 
-  # Drift check: every pool's container-image SHA in ondemand-pools.yaml must
-  # appear in scheduler.jsonnet's predeclaredPlatformQueues, otherwise Bazel's
-  # first Execute call against that pool hits FAILED_PRECONDITION before a
-  # worker registers — the exact race predeclared queues are there to dodge.
-  #
-  # We do a plain substring match on the SHA (which is unique enough that a
-  # false match is essentially impossible). If it misses, the operator has
-  # one of two problems:
-  #   1. They bumped ondemand-pools.yaml without updating scheduler.jsonnet.
-  #   2. They added a whole new pool (YAML) without predeclaring it.
-  # Either way, loud warning + abort with actionable guidance beats a silent
-  # broken cold-start on first use.
-  _check_predeclared_sync() {
-    local pools="$COMPOSE_SRC/config/ondemand-pools.yaml"
-    local sched="$COMPOSE_SRC/config/scheduler.jsonnet"
-    local -a missing=()
-    local pool_name sha
-    # Walk the YAML one block at a time, capturing (pool_name, sha). We use
-    # awk instead of yq so there's no extra dependency on the laptop.
-    while IFS=$'\t' read -r pool_name sha; do
-      [[ -n "$sha" ]] || continue
-      if ! grep -q -F "$sha" "$sched"; then
-        missing+=("$pool_name ($sha)")
-      fi
-    done < <(awk '
-      /^[[:space:]]{2}[a-zA-Z0-9_-]+:[[:space:]]*$/ {
-        gsub(/^[[:space:]]+|:[[:space:]]*$/, "", $0); pool=$0; sha=""; next
-      }
-      /^[[:space:]]{4}container_image_sha:/ {
-        sha=$0
-        sub(/^[[:space:]]*container_image_sha:[[:space:]]*/, "", sha)
-        gsub(/^["'\''][[:space:]]*|[[:space:]]*["'\'']$/, "", sha)
-        print pool "\t" sha
-      }
-    ' "$pools")
-    if (( ${#missing[@]} > 0 )); then
-      warn "the following pools are NOT predeclared in scheduler.jsonnet:"
-      for m in "${missing[@]}"; do
-        warn "    - $m"
-      done
-      warn "first Bazel build against any of them will fail with"
-      warn "  FAILED_PRECONDITION: No workers exist for instance name prefix ..."
-      warn "because the scheduler will reject Execute before the scaler spawns"
-      warn "a worker. Add a corresponding predeclaredPlatformQueues entry with"
-      warn "the same SHA in $sched, then re-run this script."
-      die "predeclared queue drift — aborting"
-    fi
-    ok "ondemand-pools.yaml SHAs all present in scheduler.jsonnet"
-  }
-  _check_predeclared_sync
+  # NB: there used to be a preflight drift check here — it verified that
+  # every `container_image_sha` in ondemand-pools.yaml also appeared in
+  # scheduler.jsonnet's predeclaredPlatformQueues. That check was
+  # obsoleted by bake_predeclared() (see below), which GENERATES
+  # predeclared.libsonnet from the YAML at deploy time — the two are
+  # in sync by construction now, so there's nothing to drift.
 
   # HCLOUD_TOKEN is required by the scaler. Try sources in order so a
   # correctly-configured operator (hcloud CLI authenticated, or token in env)
@@ -466,9 +422,11 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 
 # rsync is required so we can push configs from the operator's laptop;
-# xfsprogs so wipe-attach can mkfs.xfs the volume; jq for operator convenience.
+# xfsprogs so wipe-attach can mkfs.xfs the volume; jq for operator
+# convenience; python3-yaml for bake_env()'s predeclared.libsonnet
+# generator (parses ondemand-pools.yaml → emits jsonnet-compatible JSON).
 apt-get update
-apt-get install -y rsync jq xfsprogs
+apt-get install -y rsync jq xfsprogs python3-yaml
 
 systemctl enable --now docker
 REMOTE
@@ -625,6 +583,125 @@ REMOTE
 # Create the storage dirs if missing, rsync configs, write .env, sed the
 # browserUrl placeholder.
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Generate (if missing) an SSH keypair on the central, register its pubkey
+# with Hetzner as a named SSH key, and install an `ssh-worker` wrapper on
+# the central for convenient debugging.
+#
+# Why: workers are spawned with `--ssh-key` tying a set of Hetzner key ids
+# into their authorized_keys at VM-create time — but Hetzner has NO API for
+# adding SSH keys to an existing VM. So unless the central's key was among
+# those keys when the worker was created, the central can never ssh into
+# that worker (not even over the private network). Long-term the public IPs
+# on workers will be removed, and from-laptop debug becomes impossible; the
+# central must be able to ssh into workers via the private network.
+#
+# Idempotency:
+#   * `/root/.ssh/id_ed25519` on central: generated only if missing. The
+#     keypair survives volume detach/reattach because /root lives on the
+#     boot disk, not on the XFS volume — but a fresh VM (ensure_server
+#     replaced the server) gets a new key, and the Hetzner-side named key
+#     is rotated to match.
+#   * Hetzner named SSH key `bb-psmdb-ondemand-central`: describe → create;
+#     if exists with different pubkey we delete + recreate. Existing
+#     workers that were spawned under the OLD key id do NOT inherit the
+#     rotated one — they'd need to be recycled (idle-reap suffices, or
+#     `hcloud server delete` them manually).
+#   * ssh-worker wrapper: re-written every deploy (tiny file, no risk).
+# -----------------------------------------------------------------------------
+ensure_central_ssh_key() {
+  step "Central SSH key for worker access"
+
+  # 1. Generate keypair on central (idempotent).
+  rssh 'bash -se' <<'REMOTE'
+set -euo pipefail
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+if [[ ! -f /root/.ssh/id_ed25519 ]]; then
+  # Empty passphrase — the key sits on root-owned 0600 file on a VM the
+  # operator already trusts as the Bazel control plane. Adding a passphrase
+  # here would just require hardcoding it somewhere even less safe.
+  ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519 -C 'bb-psmdb-ondemand-central' >/dev/null
+  echo "  generated new ed25519 keypair"
+else
+  echo "  keypair already present"
+fi
+chmod 600 /root/.ssh/id_ed25519
+chmod 644 /root/.ssh/id_ed25519.pub
+REMOTE
+  ok "central keypair present on $PUBLIC_IP"
+
+  # 2. Pull the pubkey back to the laptop so we can reconcile with Hetzner.
+  local central_pubkey
+  central_pubkey=$(rssh 'cat /root/.ssh/id_ed25519.pub')
+  [[ -n "$central_pubkey" ]] || die "could not read central's pubkey"
+
+  # 3. Reconcile with Hetzner named SSH key. Three cases:
+  #      absent   → create
+  #      present-match → noop
+  #      present-mismatch → delete + create (pubkey drift: rotating key)
+  local key_name="bb-psmdb-ondemand-central"
+  local existing_json existing_pub
+  if existing_json=$(hcloud ssh-key describe "$key_name" -o json 2>/dev/null); then
+    existing_pub=$(jq -r '.public_key' <<<"$existing_json")
+    # Hetzner stores pubkeys with a trailing newline; operator laptop `cat`
+    # may or may not carry one. Strip both sides before comparing.
+    if [[ "${existing_pub%$'\n'}" == "${central_pubkey%$'\n'}" ]]; then
+      ok "Hetzner SSH key '$key_name' already matches central's pubkey"
+    else
+      warn "Hetzner SSH key '$key_name' exists but pubkey differs — rotating"
+      hcloud ssh-key delete "$key_name" >/dev/null
+      hcloud ssh-key create --name "$key_name" --public-key "$central_pubkey" >/dev/null
+      ok "Hetzner SSH key '$key_name' rotated"
+    fi
+  else
+    log "creating Hetzner SSH key '$key_name' …"
+    hcloud ssh-key create --name "$key_name" --public-key "$central_pubkey" >/dev/null
+    ok "Hetzner SSH key '$key_name' created"
+  fi
+
+  # 4. Resolve numeric id so sync_configs() can inject it into the baked
+  #    ondemand-pools.yaml (scaler + spawn-worker.sh both read the list
+  #    from there — one source of truth for which keys land in workers).
+  CENTRAL_SSH_KEY_ID=$(hcloud ssh-key describe "$key_name" -o format='{{.ID}}')
+  [[ -n "$CENTRAL_SSH_KEY_ID" ]] || die "could not resolve SSH key id for '$key_name'"
+  ok "Hetzner SSH key id: $CENTRAL_SSH_KEY_ID"
+
+  # 5. Install the ssh-worker wrapper on central. Workers are ephemeral
+  #    (Hetzner aggressively recycles public IPv4s and we redeploy
+  #    private IPs constantly), so we pin StrictHostKeyChecking=no +
+  #    UserKnownHostsFile=/dev/null — recording host keys would cause
+  #    silent "host key changed" failures on IP-recycled spawns.
+  rssh 'bash -se' <<'REMOTE'
+set -euo pipefail
+cat > /usr/local/bin/ssh-worker <<'WRAP'
+#!/usr/bin/env bash
+# ssh-worker <ip-or-host> [cmd …]
+#
+# Central-side convenience wrapper for SSH into ondemand workers (spawned
+# by scaler.py via the Hetzner cloud API, or manually via spawn-worker.sh).
+# Workers trust /root/.ssh/id_ed25519.pub via the Hetzner-registered key
+# `bb-psmdb-ondemand-central`, which create-central.sh injects into every
+# newly-spawned worker's authorized_keys at VM-create time.
+#
+# Host keys are DISCARDED — workers are throwaway by design, and recording
+# them would cause "host key changed" failures on every IP recycle.
+set -euo pipefail
+target="${1:?usage: ssh-worker <ip-or-host> [cmd …]}"
+shift
+exec ssh \
+  -i /root/.ssh/id_ed25519 \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR \
+  "root@$target" "$@"
+WRAP
+chmod +x /usr/local/bin/ssh-worker
+echo "  ssh-worker wrapper installed at /usr/local/bin/ssh-worker"
+REMOTE
+  ok "ssh-worker wrapper installed — run e.g. 'ssh-worker 10.30.242.42 docker compose ps' on central"
+}
+
 sync_configs() {
   step "Sync configs"
 
@@ -690,12 +767,16 @@ REMOTE
   # 4) Write .env with current IPs + HCLOUD_TOKEN; sed the browserUrl
   #    placeholder in common.libsonnet; patch ondemand-pools.yaml with the
   #    central's own IPs (the YAML ships with `null` placeholders so a raw
-  #    `git checkout` doesn't accidentally carry someone else's IPs).
+  #    `git checkout` doesn't accidentally carry someone else's IPs) AND
+  #    inject the central's own Hetzner SSH key id (resolved by
+  #    ensure_central_ssh_key above) into global.hcloud_ssh_key_ids so
+  #    newly-spawned workers accept SSH from the central.
   rssh \
     "REMOTE_COMPOSE='$REMOTE_COMPOSE'" \
     "PRIVATE_IP='$PRIVATE_IP'" \
     "PUBLIC_IP='$PUBLIC_IP'" \
     "HCLOUD_TOKEN='$HCLOUD_TOKEN'" \
+    "CENTRAL_SSH_KEY_ID='$CENTRAL_SSH_KEY_ID'" \
     "bash -se" <<'REMOTE'
 set -euo pipefail
 
@@ -757,15 +838,123 @@ chmod 600 "$REMOTE_COMPOSE/.env"   # token inside; keep off `ls -l` casual reads
 sed -i "s|__BB_PUBLIC_URL__|http://$PUBLIC_IP:7984|g" \
   "$REMOTE_COMPOSE/config/common.libsonnet"
 
-# Patch ondemand-pools.yaml — the `null` placeholders must become the real
-# IPs before the scaler can render a usable cloud-init for workers.
-# We do a line-anchored sed (`^key:`) so we only touch the two lines and
-# never accidentally rewrite fields deeper in the YAML.
+# Patch ondemand-pools.yaml at bake time:
+#
+#   * scheduler_public_url / scheduler_private_ip — repo copy ships with
+#     `null` placeholders so a clean `git checkout` doesn't carry stale
+#     IPs; fill them with the current central's public+private now.
+#   * hcloud_ssh_key_ids — append the central's own SSH key id (resolved
+#     by ensure_central_ssh_key() earlier). Idempotent: if the id is
+#     already in the list (e.g. on a redeploy where it was injected by
+#     the previous run and then rsync'd back from repo — shouldn't
+#     happen because we rsync FROM repo, but belt-and-suspenders) we
+#     don't add a duplicate.
+#
+# We use yaml round-trip here instead of line-anchored sed because list
+# mutation is awkward in sed and we already need python3-yaml on this
+# host for the predeclared.libsonnet generator below. Comments in the
+# baked copy are lost by safe_dump — acceptable; the operator reads the
+# repo file for docs, the baked copy is an artifact consumed by the
+# scaler which only cares about structure.
 POOLS="$REMOTE_COMPOSE/config/ondemand-pools.yaml"
-sed -i "s|^\(  scheduler_public_url:\).*|\1 http://$PUBLIC_IP:7982|"  "$POOLS"
-sed -i "s|^\(  scheduler_private_ip:\).*|\1 $PRIVATE_IP|"              "$POOLS"
+python3 - "$POOLS" "http://$PUBLIC_IP:7982" "$PRIVATE_IP" "$CENTRAL_SSH_KEY_ID" <<'PY'
+import sys, yaml
+path, pub_url, priv_ip, key_id_str = sys.argv[1:5]
+key_id = int(key_id_str)
+with open(path) as fh:
+    doc = yaml.safe_load(fh) or {}
+g = doc.setdefault("global", {})
+g["scheduler_public_url"] = pub_url
+g["scheduler_private_ip"] = priv_ip
+keys = g.setdefault("hcloud_ssh_key_ids", [])
+if key_id not in keys:
+    keys.append(key_id)
+with open(path, "w") as fh:
+    yaml.safe_dump(doc, fh, default_flow_style=False, sort_keys=False)
+print(f"  ✓ ondemand-pools.yaml patched: public_url, private_ip, hcloud_ssh_key_ids (+{key_id})")
+PY
 
-echo "  ✓ .env, browserUrl, and ondemand-pools.yaml baked in"
+# Generate config/predeclared.libsonnet from ondemand-pools.yaml. This is
+# imported by scheduler.jsonnet and expands to `predeclaredPlatformQueues`
+# at scheduler boot. Keeping the generator here (at bake time) — rather
+# than inside scheduler.jsonnet via jsonnet's std.extVar / import — means
+# the scheduler container stays untouched (no jsonnet-level YAML parsing,
+# no extra libs) and the generated output is a plain human-readable JSON
+# array you can diff or grep.
+#
+# Pool → predeclared entry mapping:
+#   * `container_image_sha: null` — SKIPPED (pool scaffolded but not yet
+#     primed — see ondemand-pools.yaml priming flow at the top of that
+#     file). No predeclared queue is emitted; first Bazel build against
+#     such a pool will fail with FAILED_PRECONDITION, and the error log
+#     reports the real SHA to paste back into the YAML.
+#   * non-null SHA → one entry with platform.properties =
+#       [ Pool=<bazel_pool_value>, container-image=<url>, dockerNetwork=standard ]
+#     and sizeClasses=[0].
+#
+# Output is pretty-printed JSON — valid jsonnet since JSON ⊂ jsonnet.
+PREDECLARED_OUT="$REMOTE_COMPOSE/config/predeclared.libsonnet"
+python3 - "$POOLS" "$PREDECLARED_OUT" <<'PY'
+import json
+import sys
+import yaml
+
+pools_path, out_path = sys.argv[1], sys.argv[2]
+with open(pools_path) as fh:
+    doc = yaml.safe_load(fh) or {}
+
+entries = []
+for name, pool in (doc.get("pools") or {}).items():
+    sha = (pool or {}).get("container_image_sha")
+    if not sha:
+        # Skip unprimed pools — see priming flow in ondemand-pools.yaml.
+        continue
+    # `Pool` property mirrors what PSMDB's Bazel client sends; it's the
+    # architecture label, not the OS. Keep it explicit per-pool rather
+    # than computed from the pool name (the naming convention is not
+    # load-bearing anywhere else and we don't want to couple them).
+    bazel_pool = (pool or {}).get("bazel_pool_value")
+    if not bazel_pool:
+        print(
+            f"  ! pool '{name}' has container_image_sha but no "
+            f"bazel_pool_value — skipping (add bazel_pool_value: x86_64 "
+            f"or aarch64 to include it)",
+            file=sys.stderr,
+        )
+        continue
+    entries.append({
+        "instanceNamePrefix": "hardlinking",
+        "platform": {
+            "properties": [
+                {"name": "Pool", "value": bazel_pool},
+                {
+                    "name": "container-image",
+                    # Matches PSMDB's bazel/platforms/remote_execution_containers.bzl
+                    # URL shape — must be byte-identical to what Bazel sends.
+                    "value": f"docker://quay.io/mongodb/bazel-remote-execution@sha256:{sha}",
+                },
+                {"name": "dockerNetwork", "value": "standard"},
+            ],
+        },
+        # All our workers register with the default size_class (0); we
+        # don't use feedback-driven size classification.
+        "sizeClasses": [0],
+    })
+
+header = (
+    "// AUTO-GENERATED by scripts/create-central.sh bake_env() from\n"
+    "// config/ondemand-pools.yaml. DO NOT HAND-EDIT — edit the YAML and\n"
+    "// redeploy. Entries appear only for pools with a non-null\n"
+    "// container_image_sha (see the priming flow in ondemand-pools.yaml).\n"
+)
+with open(out_path, "w") as fh:
+    fh.write(header)
+    json.dump(entries, fh, indent=2)
+    fh.write("\n")
+print(f"  ✓ predeclared.libsonnet generated ({len(entries)} entries)")
+PY
+
+echo "  ✓ .env, browserUrl, ondemand-pools.yaml, and predeclared.libsonnet baked in"
 REMOTE
   ok "environment baked in"
 }
@@ -849,26 +1038,34 @@ smoke() {
     warn "scaler did NOT log 'loaded config' yet — check 'docker compose logs scaler'"
   fi
 
-  # predeclaredPlatformQueues check: scheduler must expose at least one
-  # platform queue BEFORE any worker registers. If this fails, Bazel's first
-  # Execute against a cold scheduler will hit FAILED_PRECONDITION and the
-  # build dies on action #1 — exactly the race we're trying to close.
+  # predeclaredPlatformQueues check: scheduler must expose one platform
+  # queue per PRIMED pool in ondemand-pools.yaml (i.e. pools with a
+  # non-null container_image_sha — see the priming flow at the top of
+  # that YAML). Pools scaffolded with SHA=null are expected to NOT have
+  # a predeclared queue yet, so they don't count here. If the observed
+  # count is short, Bazel's first Execute against an affected pool hits
+  # FAILED_PRECONDITION and the build dies on action #1 — the race this
+  # whole predeclared-queue plumbing is there to close.
   #
-  # Count is derived from ondemand-pools.yaml so the check scales as we add
-  # pools. The query runs inside the scaler container (ships grpcurl, has
-  # host networking → can reach :8984 on localhost) — avoids the laptop
+  # Query runs inside the scaler container (ships grpcurl, has host
+  # networking → can reach :8984 on localhost) — avoids the laptop
   # needing grpcurl at all.
   #
-  # Counting strategy: each PlatformQueueState includes a `sizeClassQueues`
-  # repeated field (JSON: "sizeClassQueues": [...]), which appears exactly
-  # once per queue and is absent from all nested fields (verified in
-  # bb-remote-execution buildqueuestate.proto: PlatformQueueState message).
-  # That makes `grep -c "sizeClassQueues"` a safe one-per-queue count even
-  # when a queue is brand-new with zero size classes.
+  # Counting strategy on the scheduler side: each PlatformQueueState has
+  # a `sizeClassQueues` repeated field (JSON: "sizeClassQueues": [...]),
+  # which appears exactly once per queue and is absent from all nested
+  # fields (verified in bb-remote-execution buildqueuestate.proto:
+  # PlatformQueueState message). That makes `grep -c "sizeClassQueues"` a
+  # safe one-per-queue count even when a queue is brand-new with zero
+  # size classes.
+  #
+  # Counting strategy on the YAML side: we look for lines matching
+  # `container_image_sha: "..."` (quoted = non-null). Both `null` and
+  # `~` YAML nulls are unquoted so they don't match. `awk` over `yq` is
+  # deliberate — we don't want the laptop to need yq just to run this.
   local expected_queues
   expected_queues=$(awk '
-    /^[[:space:]]{2}[a-zA-Z0-9_-]+:[[:space:]]*$/ { next_is_pool=1; next }
-    next_is_pool && /^[[:space:]]{4}container_image_sha:/ { count++; next_is_pool=0 }
+    /^[[:space:]]{4}container_image_sha:[[:space:]]*"[0-9a-f]+"/ { count++ }
     END { print count+0 }
   ' "$COMPOSE_SRC/config/ondemand-pools.yaml")
   local actual_queues
@@ -894,10 +1091,11 @@ smoke() {
 # Summary.
 # -----------------------------------------------------------------------------
 summary() {
+  # `printf` over `cat <<EOF` so the bold-green banner ANSI escape (\033[…])
+  # actually gets interpreted — heredoc would ship it as the literal 4-char
+  # sequence, making terminals print `\033[1;32m...` verbatim.
+  printf '\n\033[1;32mbb-psmdb-ondemand central node ready.\033[0m\n\n'
   cat <<EOF
-
-\033[1;32mbb-psmdb-ondemand central node ready.\033[0m
-
   Public:
     SSH              : ssh -i $SSH_PRIV_KEY root@$PUBLIC_IP
     Scheduler admin  : http://$PUBLIC_IP:7982/
@@ -917,6 +1115,14 @@ summary() {
     Logs             : ssh root@$PUBLIC_IP 'cd $REMOTE_COMPOSE && docker compose logs -f scaler'
     Go live          : edit $REMOTE_COMPOSE/.env → SCALER_DRY_RUN=false
                        then: ssh root@$PUBLIC_IP 'cd $REMOTE_COMPOSE && docker compose up -d scaler'
+
+  Debugging a worker (from this central host, over the private network):
+    ssh root@$PUBLIC_IP
+    ssh-worker <worker-private-ip>                    (wrapper at /usr/local/bin/ssh-worker)
+    ssh-worker <worker-private-ip> 'cd /opt/buildbarn && docker compose ps'
+    (requires the worker was spawned AFTER this deploy — workers created
+     under an older central key remain SSH-unreachable from here and need
+     idle-reap or explicit 'hcloud server delete' to recycle.)
 
   Next steps:
     * Manual worker  : scripts/spawn-worker.sh            (for debugging, always works)
@@ -956,6 +1162,7 @@ main() {
       ;;
   esac
 
+  ensure_central_ssh_key
   sync_configs
   compose_up
   smoke

@@ -61,6 +61,54 @@ set -euo pipefail
 : "${RUNNER_REGISTRY:=ghcr.io/vorsel/psmdb-buildbarn-runners}"
 : "${RUNNER_IMAGE:=${RUNNER_REGISTRY}/${POOL}:${PSMDB_VERSION}}"
 
+# -----------------------------------------------------------------------------
+# Worker platform tuple (Pool + container-image SHA).
+# -----------------------------------------------------------------------------
+# These are the routing keys the worker registers into the scheduler with.
+# They MUST match what Bazel puts in its Execute request for this pool or
+# actions silently queue forever. The scaler path reads them from
+# ondemand-pools.yaml via scaler/bootstrap.py; the manual path here does the
+# same YAML lookup, with env var overrides for the priming workflow:
+#
+#   * Normal spawn: leave CONTAINER_IMAGE_SHA/BAZEL_POOL_VALUE unset and
+#     take the values from ondemand-pools.yaml.
+#   * Priming a pool that has `container_image_sha: null` in the YAML: you
+#     can't query the ground-truth SHA until you've triggered a failed
+#     Bazel build, but you still need SOME SHA to boot a worker. Pass any
+#     64-hex string via CONTAINER_IMAGE_SHA=… — the worker will boot and
+#     register into a dead queue; the point is to have a VM up so you can
+#     tail its logs while the Bazel client surfaces the real SHA in its
+#     FAILED_PRECONDITION error.
+: "${POOLS_YAML:=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/compose/config/ondemand-pools.yaml}"
+if [[ -z "${CONTAINER_IMAGE_SHA:-}" || -z "${BAZEL_POOL_VALUE:-}" ]]; then
+  # Single python3 invocation returning a tab-separated pair so we survive
+  # either value being empty without needing a second subshell. Falls back
+  # to the empty string (not None) so the downstream check can trip cleanly.
+  _pool_props=$(POOL="$POOL" POOLS_YAML="$POOLS_YAML" python3 - <<'PY' || true
+import os, sys
+try:
+    import yaml
+except ImportError:
+    sys.exit("python3-yaml is required on the operator laptop (apt: python3-yaml, brew: python + pip install pyyaml)")
+pool = os.environ["POOL"]
+path = os.environ["POOLS_YAML"]
+with open(path) as f:
+    data = yaml.safe_load(f)
+pc = (data.get("pools") or {}).get(pool)
+if not pc:
+    sys.exit(f"pool '{pool}' not in {path}")
+# `or ""` keeps shell-side parsing simple when YAML has an explicit null.
+print(f"{pc.get('container_image_sha') or ''}\t{pc.get('bazel_pool_value') or ''}")
+PY
+  )
+  : "${CONTAINER_IMAGE_SHA:=${_pool_props%%$'\t'*}}"
+  : "${BAZEL_POOL_VALUE:=${_pool_props##*$'\t'}}"
+fi
+[[ -n "$CONTAINER_IMAGE_SHA" ]] \
+  || { echo "pool '$POOL' has container_image_sha=null in $POOLS_YAML — pass CONTAINER_IMAGE_SHA=<64hex> explicitly (priming flow)" >&2; exit 1; }
+[[ -n "$BAZEL_POOL_VALUE" ]] \
+  || { echo "pool '$POOL' missing bazel_pool_value in $POOLS_YAML" >&2; exit 1; }
+
 # Unique-ish server name. Hetzner validates this as an RFC 1123 hostname
 # (lowercase letters/digits/hyphens only — NO underscores, NO uppercase).
 # Our pool names contain underscores (`x86_64`), so sanitize before use.
@@ -171,11 +219,15 @@ render() {
     -e "s|__CENTRAL_PUBLIC_URL__|$CENTRAL_PUBLIC_URL|g" \
     "$STAGE_DIR/worker/config/common.libsonnet"
 
-  # worker.jsonnet: scheduler address + workerId metadata.
+  # worker.jsonnet: scheduler address + workerId metadata + platform tuple
+  # (Pool + container-image SHA). Platform tuple must be in lockstep with
+  # scaler/bootstrap.py:render_user_data(); see worker.jsonnet header.
   sed -i.bak \
     -e "s|__CENTRAL_PRIVATE_IP__|$CENTRAL_PRIVATE_IP|g" \
     -e "s|__POOL_NAME__|$POOL|g" \
     -e "s|__WORKER_HOSTNAME__|$WORKER_HOSTNAME|g" \
+    -e "s|__BAZEL_POOL_VALUE__|$BAZEL_POOL_VALUE|g" \
+    -e "s|__CONTAINER_IMAGE_SHA__|$CONTAINER_IMAGE_SHA|g" \
     "$STAGE_DIR/worker/config/worker.jsonnet"
 
   # Clean up BSD-sed leftovers (GNU sed would skip these, BSD sed always
@@ -357,10 +409,10 @@ REMOTE
 # means the scheduler dropped the connection and we'd otherwise miss it.
 # -----------------------------------------------------------------------------
 
-# The platform property string we look for in the scheduler page. It needs to
-# match exactly what's emitted in worker.jsonnet — keep in sync if you ever
-# change the platform properties there.
-SCHEDULER_POOL_MARKER='Pool="x86_64"'
+# The platform property string we look for in the scheduler page. Built from
+# $BAZEL_POOL_VALUE so aarch64 pools (future) find their own queue instead of
+# scraping a hardcoded "x86_64" that will never appear for them.
+SCHEDULER_POOL_MARKER="Pool=\"$BAZEL_POOL_VALUE\""
 
 verify_registered() {
   step "Verify registration"
@@ -413,6 +465,8 @@ summary() {
   Name              : $SERVER_NAME
   Type / location   : $SERVER_TYPE / $LOCATION ($OS_IMAGE)
   Pool              : $POOL   (PSMDB $PSMDB_VERSION)
+  Bazel Pool value  : $BAZEL_POOL_VALUE
+  Image SHA         : sha256:$CONTAINER_IMAGE_SHA
   Runner image      : $RUNNER_IMAGE
   Public IP         : $PUBLIC_IP
   Private IP        : $PRIVATE_IP

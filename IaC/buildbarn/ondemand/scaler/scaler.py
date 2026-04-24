@@ -126,7 +126,16 @@ class GlobalCfg:
 @dataclasses.dataclass
 class PoolCfg:
     name: str
-    container_image_sha: str
+    # container_image_sha is the routing key (scheduler.platform_queue
+    # matching). None means "pool scaffolded but not yet primed" — the
+    # YAML header documents the priming flow; the scaler refuses to spawn
+    # VMs for such pools because their worker.jsonnet would have no valid
+    # SHA to substitute.
+    container_image_sha: str | None
+    # bazel_pool_value is the architecture label Bazel stamps into the
+    # `Pool` platform property (x86_64 / aarch64). It's part of the
+    # routing-key tuple — wrong value → worker lands in an unused queue.
+    bazel_pool_value: str
     psmdb_version: str
     runner_image_base: str
     server_type: str
@@ -138,6 +147,14 @@ class PoolCfg:
     def runner_image(self) -> str:
         """Full image reference for `docker compose pull`."""
         return f"{self.runner_image_base}:{self.psmdb_version}"
+
+    @property
+    def is_primed(self) -> bool:
+        """True when the pool has enough config to spawn a working worker.
+        A non-primed pool (container_image_sha=null in ondemand-pools.yaml)
+        is deliberately skipped by scale-up; see the YAML header's priming
+        flow for how to activate one."""
+        return bool(self.container_image_sha)
 
 
 @dataclasses.dataclass
@@ -202,7 +219,12 @@ def load_config(path: Path) -> Cfg:
     for name, pc in raw.get("pools", {}).items():
         pools[name] = PoolCfg(
             name=name,
-            container_image_sha=pc["container_image_sha"],
+            # YAML `null` → Python None → PoolCfg flags pool as not-yet-primed.
+            # A scaffolded-but-unprimed pool still loads (so the scaler can
+            # publish pool metrics and report "waiting for SHA") but scale-up
+            # refuses to spawn until an operator pastes a real SHA.
+            container_image_sha=pc.get("container_image_sha"),
+            bazel_pool_value=str(pc["bazel_pool_value"]),
             psmdb_version=str(pc["psmdb_version"]),
             runner_image_base=pc["runner_image_base"],
             server_type=pc["server_type"],
@@ -237,8 +259,22 @@ def grpcurl(endpoint: str, method: str, body: str = "{}") -> dict[str, Any]:
     Call bb-scheduler's BuildQueueState via grpcurl reflection.
 
     Returns the parsed JSON response. Raises CalledProcessError with stderr
-    included on failure — the scaler caller should catch and log, never
-    silently swallow, so schema drift shows up in operator logs.
+    included on persistent failure — the scaler caller should catch and log,
+    never silently swallow, so schema drift shows up in operator logs.
+
+    Transient failures (scheduler restarting during a redeploy, brief gRPC
+    transport blip) are absorbed by a small retry-with-backoff: 3 attempts
+    at 0.5s / 1.0s / 2.0s. This is deliberately narrow — we retry the WHOLE
+    call with the same args, we don't inspect the error class, and we don't
+    retry forever. A real outage (scheduler process dead, schema mismatch,
+    network partition) still surfaces as an exception after ~3.5 s, which
+    the outer loop in main() catches and logs via `log.exception`.
+
+    Rationale for not classifying errors: grpcurl exits 1 for almost
+    everything (transport error, server error, reflection failure, JSON
+    decode failure). Parsing stderr to discriminate would be brittle and
+    version-specific. A uniform short retry is simpler and correct: the
+    transient cases heal, the persistent cases still fail fast enough.
     """
     cmd = [
         "grpcurl",
@@ -247,8 +283,24 @@ def grpcurl(endpoint: str, method: str, body: str = "{}") -> dict[str, Any]:
         endpoint,
         f"{BQS_SERVICE}/{method}",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return json.loads(result.stdout or "{}")
+    delays = (0.5, 1.0, 2.0)
+    last_err: subprocess.CalledProcessError | None = None
+    for attempt, delay in enumerate(delays, start=1):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return json.loads(result.stdout or "{}")
+        except subprocess.CalledProcessError as e:
+            last_err = e
+            if attempt == len(delays):
+                break
+            log.debug(
+                "grpcurl %s attempt %d/%d failed: %s — retrying in %ss",
+                method, attempt, len(delays),
+                (e.stderr or "").strip()[:120], delay,
+            )
+            time.sleep(delay)
+    assert last_err is not None
+    raise last_err
 
 
 def _sum_queued(qoc: Any) -> int:
@@ -452,6 +504,11 @@ def _handle_signal(_signum, _frame):
 
 
 def _match_pool(queues: list[PlatformQueue], pool: PoolCfg) -> PlatformQueue | None:
+    # Unprimed pools (container_image_sha=None) never match a queue — both
+    # sides would compare None==None and we'd claim a spurious match against
+    # any queue whose SHA we failed to parse. Cheaper to bail early.
+    if not pool.container_image_sha:
+        return None
     for q in queues:
         if q.container_image_sha() == pool.container_image_sha:
             return q
@@ -518,6 +575,22 @@ def iteration(cfg: Cfg, hz: HetznerOps, idle_tracker: dict[str, datetime]) -> No
             pool_name, queued, executing, idle, workers_total, current_pool_vms,
             pool.min_nodes, pool.max_nodes,
         )
+
+        # Unprimed pool (container_image_sha=null in ondemand-pools.yaml).
+        # We intentionally keep it in cfg so its queue still shows up in
+        # logs, but we refuse to spawn workers — they would register with
+        # an empty/invalid platform tuple and silently wedge the queue.
+        # Operator is expected to follow the priming flow in the YAML
+        # header (spawn one VM manually, scrape the real SHA from its
+        # action error, paste into ondemand-pools.yaml, redeploy).
+        if not pool.is_primed:
+            if queued > 0 or current_pool_vms > 0:
+                log.warning(
+                    "  pool=%s is UNPRIMED (container_image_sha=null) — "
+                    "refusing to spawn; run priming flow from ondemand-pools.yaml",
+                    pool_name,
+                )
+            continue
 
         # Decide whether queue pressure is high enough to justify spawning
         # on its own. A pool with `min_nodes > 0` spawns even when the queue
@@ -609,6 +682,14 @@ def iteration(cfg: Cfg, hz: HetznerOps, idle_tracker: dict[str, datetime]) -> No
                 central_public_url=cfg.global_.scheduler_public_url or "",
                 pool_name=pool.name,
                 runner_image=pool.runner_image,
+                # bootstrap.render_user_data() refuses to substitute a
+                # literal empty SHA (would produce an un-routable worker).
+                # The scale-up pre-check above (`pool.is_primed`) already
+                # filters such pools out; this `or ""` just keeps mypy
+                # happy for the `str` annotation in the presence of the
+                # `str | None` field type.
+                container_image_sha=pool.container_image_sha or "",
+                bazel_pool_value=pool.bazel_pool_value,
             )
             try:
                 hz.create_worker(
