@@ -219,7 +219,11 @@ control plane. Every `poll_interval_seconds` (default 30 s) it:
    `psmdb.managed-by=bb-ondemand-scaler`.
 3. For every pool in [`compose/config/ondemand-pools.yaml`](compose/config/ondemand-pools.yaml),
    decides:
-   - *scale up* — queue has work but no workers AND no VM is already booting
+   - *scale up* — sizes the fleet from live queue pressure
+     (`ceil((queued + executing) / concurrency)`, capped by `max_nodes` and
+     `global.max_total_nodes`), with a default throttle of **1 new VM per
+     pool per tick** so cold-starts proceed serially. Raise the throttle via
+     the `SPAWN_THROTTLE_PER_POOL` env var when you want faster warm-up.
    - *scale down* — a managed VM has been idle for more than
      `scale_down_idle_seconds` (default 600 s)
 4. Executes those decisions via `hcloud-python`, UNLESS `SCALER_DRY_RUN=true`
@@ -263,7 +267,7 @@ is the single knob you edit to add / remove / resize pools. Each pool:
 
 | Field | Purpose |
 | ----- | ------- |
-| `container_image_sha` | scheduler routing key — must match `bazel/platforms/remote_execution_containers.bzl` on the PSMDB side |
+| `container_image_sha` | scheduler routing key — must match `bazel/platforms/remote_execution_containers.bzl` on the PSMDB side **and** the `predeclaredPlatformQueues` entry in `compose/config/scheduler.jsonnet` (preflight check enforces the second) |
 | `psmdb_version` | appended to `runner_image_base` — `ubuntu-noble-x86_64:8.3`, etc. |
 | `server_type` | `cpx42` default; bump to `cpx52` when we trust the config |
 | `concurrency` | must match `worker.jsonnet`'s `runners[0].concurrency` |
@@ -284,11 +288,37 @@ docker compose restart scaler      # after editing ondemand-pools.yaml
 
 The scaler reloads config on restart (no SIGHUP handling in the MVP).
 
+### Cold-start race (`FAILED_PRECONDITION`) and `predeclaredPlatformQueues`
+
+Bazel's `GrpcRemoteExecutor` classifies `FAILED_PRECONDITION: No workers exist`
+as a permanent error and never retries. With a naive setup, the first
+`bazel build` against a cold scheduler dies on action #1 because the
+scaler's 30 s poll + ~2 min VM boot runs **slower** than Bazel's first
+`Execute` call.
+
+Our answer is `predeclaredPlatformQueues` in `compose/config/scheduler.jsonnet`:
+the scheduler creates each pool's queue at boot, independent of worker
+registration. Bazel's `Execute` succeeds (action queues), the scaler sees
+`queued > 0`, spawns a VM, and the action runs once the worker joins.
+Bazel's default 3600 s `--remote_timeout` absorbs the wait.
+
+**Keeping the files in sync.** Every `container_image_sha` in
+`compose/config/ondemand-pools.yaml` must appear verbatim in
+`compose/config/scheduler.jsonnet`. `scripts/create-central.sh` fails the
+preflight if it doesn't, so drift is caught before deploy.
+
+To add a new pool:
+
+1. Append the pool block to `ondemand-pools.yaml`.
+2. Append a matching `predeclaredPlatformQueues` entry to
+   `scheduler.jsonnet` (copy an existing entry, swap the SHA and `Pool`
+   property).
+3. Re-run `scripts/create-central.sh`.
+
 ## What's *not* here yet
 
 | Future component | Status | Lives in |
 | ---------------- | ------ | -------- |
-| Multi-VM scale-up per pool (fill `--jobs=96` with N workers) | post-MVP | `scaler/scaler.py` |
 | Pre-warm HTTP API (Jenkins hints before a release matrix) | post-MVP | `scaler/scaler.py` |
 | Snapshot-based fast boot (~40 s instead of ~120 s) | post-MVP | Hetzner snapshots |
 | FUSE-mode worker (more efficient than hardlinking, needs `privileged: true`) | post-MVP | `ondemand/worker/` |

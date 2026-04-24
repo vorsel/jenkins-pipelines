@@ -34,18 +34,63 @@ See [`../../buildbarn-ondemand-scaler.md`](../../buildbarn-ondemand-scaler.md)
 
 For each pool P in `ondemand-pools.yaml`:
 
-- Find the scheduler platform queue whose `container-image` SHA matches
-  `P.container_image_sha`.
-- If the queue has **queued operations ≥ scale_up_threshold** and **zero
-  workers** and **no VMs currently booting for P** and we're **under
-  P.max_nodes and global.max_total_nodes**: spawn one VM.
-- If the queue is **empty** and a VM labelled with P exists, track its
-  first-observed idle time. Once that exceeds `scale_down_idle_seconds`,
-  delete the VM.
+**Scale up.**  Spawn a VM for pool P if either:
 
-The MVP intentionally spawns **at most one VM per pool per tick**. Multi-VM
-burst scaling (needed to saturate `--jobs=96` on a release matrix) is the
-next follow-up — see "Not yet implemented".
+1. `current_pool_vms < P.min_nodes` — warm-node floor, applies regardless of
+   queue state (including when the scheduler has no matching platform queue
+   yet because no action has been submitted), OR
+2. `queued >= scale_up_threshold` — queue pressure exceeds the noise floor.
+
+When spawning, size the fleet from live queue pressure with the floor clamp:
+
+```
+total_in_flight    = queued + executing
+desired_from_queue = ceil(total_in_flight / P.concurrency)
+desired_vms        = max(P.min_nodes, desired_from_queue)
+desired_vms        = min(desired_vms, P.max_nodes, global.max_total_nodes)
+to_spawn           = min(desired_vms - current_pool_vms, SPAWN_THROTTLE_PER_POOL)
+```
+
+Including `executing` in the numerator stops the fleet from under-sizing
+during long actions (where the scheduler reports `queued=0 executing>0`).
+`SPAWN_THROTTLE_PER_POOL` defaults to **1**, so each tick spawns at most one
+new VM per pool — cold-starts proceed serially and a burst that evaporates
+during boot costs one unnecessary VM, not `N`. Raise via env var once the
+cold-start pipeline is trusted.
+
+**Scale down.**  If the queue is not busy (`queued == 0 and executing == 0`)
+and a VM labelled with P exists, track its first-observed idle time. Once
+that exceeds `scale_down_idle_seconds`, delete the VM — but never below
+`P.min_nodes` live VMs. Pools with `min_nodes: 1` (currently just
+`ubuntu-noble-x86_64`) always keep one warm worker.
+
+### Cold-start race and why we now use `predeclaredPlatformQueues`
+
+Bazel's `GrpcRemoteExecutor` classifies `FAILED_PRECONDITION: No workers exist`
+as a permanent failure and never retries it. Without mitigation, the first
+`bazel build` against a cold scheduler + empty pool races the scaler's 30 s
+poll + ~2 min VM boot and dies on action #1.
+
+The MVP used `min_nodes: 1` on `ubuntu-noble-x86_64` as a stopgap — one cpx42
+warm 24/7 (~€23/mo). That worked but does not scale to 11 release-matrix
+pools (~€250/mo).
+
+The current fix is **`predeclaredPlatformQueues`** in `scheduler.jsonnet`
+(see `compose/config/scheduler.jsonnet`). The scheduler creates each pool's
+queue at boot, independent of worker registration. Bazel's first `Execute`
+succeeds (action is queued), the scaler observes `queued > 0` on its next
+tick, spawns a VM, and the action runs once the worker registers — Bazel's
+default 3600 s `--remote_timeout` comfortably absorbs the ~2 min wait.
+
+`min_nodes: 0` is therefore sufficient for every pool once the predeclared
+queue is wired in. The YAML still supports `min_nodes` as an override for
+pools where warm capacity genuinely beats cold-start latency; we leave it
+at 0 by default.
+
+**Sync contract.** Every `container_image_sha` in `ondemand-pools.yaml` must
+appear verbatim in `scheduler.jsonnet`'s `predeclaredPlatformQueues`, or the
+first Bazel build against that pool still fails with `FAILED_PRECONDITION`.
+`scripts/create-central.sh` preflight checks this and aborts on drift.
 
 ## Why grpcurl and not compiled protos
 
@@ -98,8 +143,8 @@ to look identical to the live output minus the actual API call.
 
 | Feature | Why not MVP | Where it'll go |
 | ------- | ----------- | -------------- |
-| Multi-VM scale-up per pool (ceil(queued / concurrency)) | Needs testing with real release-matrix queue depth; risk is over-spawning | `iteration()` scale-up loop |
 | Region try-chain (hel1 → nbg1 → fsn1) for capacity errors | Current code tries each region but stops on first success — that's enough for `cpx42` in `hel1`; add per-region jitter later | `HetznerOps.create_worker()` |
+| Auto-generate `predeclaredPlatformQueues` from `ondemand-pools.yaml` | Today the two files are hand-synced (preflight check catches drift). Painful once we track 11 pools | small generator in `scripts/`, invoked from `create-central.sh` |
 | Pre-warm HTTP API (Jenkins hints) | External trigger; implement after the passive loop is trusted | new Flask endpoint on a random port, wire into compose |
 | Prometheus `/metrics` | Important for production dashboards; today we rely on `docker logs` | `prometheus_client` in requirements, expose on `:9090` |
 | SIGHUP reload of `ondemand-pools.yaml` | Restarting the scaler is 2 seconds, good enough for MVP | `signal.SIGHUP` handler in `run_loop()` |

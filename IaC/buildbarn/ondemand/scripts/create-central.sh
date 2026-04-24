@@ -75,12 +75,22 @@ VOLUME_DEV="/dev/disk/by-id/scsi-0HC_Volume_${VOLUME_ID}"
 
 # Hetzner Cloud API token for the scaler daemon. Must be scoped to the
 # psmdb-buildbarn project with read+write on servers / networks / SSH keys.
-# Inherited from the operator's shell env (same var hcloud CLI uses) — if
-# unset here, we prompt interactively rather than silently shipping a broken
-# scaler config. Pass HCLOUD_TOKEN_FILE to read from a file instead (keeps
-# the token out of bash history).
+#
+# Resolution order (first non-empty wins):
+#   1. $HCLOUD_TOKEN env var (same one hcloud CLI reads)
+#   2. $HCLOUD_TOKEN_FILE pointing at a file containing just the token
+#   3. $HCLOUD_CONFIG (cli.toml), context name = $HCLOUD_CONTEXT_NAME;
+#      fails loudly if the file has no such context
+#   4. interactive password prompt
+#
+# There is intentionally NO silent fallback to cli.toml's `active_context`:
+# operators with multiple contexts (personal, other projects, this project)
+# must pin HCLOUD_CONTEXT_NAME explicitly, otherwise a wrong active context
+# in the operator's shell would silently ship the wrong project's token.
 : "${HCLOUD_TOKEN:=}"
 : "${HCLOUD_TOKEN_FILE:=}"
+: "${HCLOUD_CONFIG:=${XDG_CONFIG_HOME:-$HOME/.config}/hcloud/cli.toml}"
+: "${HCLOUD_CONTEXT_NAME:=}"
 
 # -----------------------------------------------------------------------------
 # Pretty logging.
@@ -90,6 +100,83 @@ ok()    { printf '\033[32m  ✓\033[0m %s\n' "$*"; }
 warn()  { printf '\033[33m  ! %s\033[0m\n' "$*"; }
 die()   { printf '\033[31m  ✗ %s\033[0m\n' "$*" >&2; exit 1; }
 step()  { printf '\n\033[1;35m=== %s ===\033[0m\n' "$*"; }
+
+# -----------------------------------------------------------------------------
+# Extract a token from hcloud CLI's cli.toml by context name.
+#
+# File format (stable across recent hcloud CLI versions):
+#
+#     active_context = "my-ctx"
+#
+#     [[contexts]]
+#     name = "my-ctx"
+#     token = "xxxxx..."
+#
+#     [[contexts]]
+#     name = "other-ctx"
+#     token = "yyyy..."
+#
+# Usage: _hcloud_token_from_cli_config <context-name>
+#
+# Prints the token to stdout (empty string + exit 0 on miss or unreadable
+# file). We intentionally do NOT fall back to active_context if the named
+# context is absent — caller is expected to treat an empty result as fatal.
+# Using awk keeps the dependency footprint the same as the rest of this
+# script — no python/toml required.
+# -----------------------------------------------------------------------------
+# TOML strings come in both `"..."` (basic) and `'...'` (literal) forms —
+# hcloud CLI's current serializer emits literal strings, older versions emit
+# basic strings. Accept both so the parser survives across cli versions.
+_hcloud_token_from_cli_config() {
+  local cfg="$HCLOUD_CONFIG"
+  local want="${1:?context name required}"
+  [[ -r "$cfg" ]] || return 0
+  # NB: no apostrophes in the awk body — the whole program is wrapped in
+  # single quotes by the shell, and even inside an awk #-comment bash would
+  # still see a stray `'\''` and close the string. Keep comments apostrophe-free.
+  awk -v want="$want" '
+    BEGIN { in_ctx=0; name=""; token=""; printed=0 }
+    function unquote(v,    _) {
+      sub(/.*=[[:space:]]*/, "", v)
+      sub(/[[:space:]]*$/,   "", v)
+      if      (v ~ /^".*"$/)       { sub(/^"/,   "", v); sub(/"$/,   "", v) }
+      else if (v ~ /^'\''.*'\''$/) { sub(/^'\''/,"", v); sub(/'\''$/,"", v) }
+      return v
+    }
+    function flush() {
+      if (in_ctx && name == want && token != "") {
+        print token
+        printed = 1
+        exit
+      }
+      in_ctx=1; name=""; token=""
+    }
+    /^[[:space:]]*\[\[contexts\]\][[:space:]]*$/ { flush(); next }
+    in_ctx && /^[[:space:]]*name[[:space:]]*=/  { name  = unquote($0); next }
+    in_ctx && /^[[:space:]]*token[[:space:]]*=/ { token = unquote($0); next }
+    END {
+      if (!printed && in_ctx && name == want && token != "") print token
+    }
+  ' "$cfg"
+}
+
+# List all context names in cli.toml, one per line. Used for helpful error
+# messages when HCLOUD_CONTEXT_NAME doesnt match anything in the file.
+_hcloud_list_cli_contexts() {
+  local cfg="$HCLOUD_CONFIG"
+  [[ -r "$cfg" ]] || return 0
+  awk '
+    function unquote(v,    _) {
+      sub(/.*=[[:space:]]*/, "", v)
+      sub(/[[:space:]]*$/,   "", v)
+      if (v ~ /^".*"$/) { sub(/^"/,"",v); sub(/"$/,"",v) }
+      else if (v ~ /^'\''.*'\''$/) { sub(/^'\''/,"",v); sub(/'\''$/,"",v) }
+      return v
+    }
+    /^[[:space:]]*\[\[contexts\]\][[:space:]]*$/ { in_ctx=1; next }
+    in_ctx && /^[[:space:]]*name[[:space:]]*=/ { print unquote($0); in_ctx=0 }
+  ' "$cfg"
+}
 
 # -----------------------------------------------------------------------------
 # Preflight.
@@ -128,19 +215,95 @@ preflight() {
     || die "scaler/scaler.py missing"
   [[ -f "$COMPOSE_SRC/config/ondemand-pools.yaml" ]] \
     || die "compose/config/ondemand-pools.yaml missing"
+  [[ -f "$COMPOSE_SRC/config/scheduler.jsonnet" ]] \
+    || die "compose/config/scheduler.jsonnet missing"
   ok "repo layout OK"
 
-  # HCLOUD_TOKEN is required by the scaler. We prefer HCLOUD_TOKEN_FILE so
-  # the token never lands in argv / shell history; fall back to the env var
-  # (same one hcloud CLI already reads) and finally to an interactive
-  # prompt. Never bake a default or silently ship an empty token.
+  # Drift check: every pool's container-image SHA in ondemand-pools.yaml must
+  # appear in scheduler.jsonnet's predeclaredPlatformQueues, otherwise Bazel's
+  # first Execute call against that pool hits FAILED_PRECONDITION before a
+  # worker registers — the exact race predeclared queues are there to dodge.
+  #
+  # We do a plain substring match on the SHA (which is unique enough that a
+  # false match is essentially impossible). If it misses, the operator has
+  # one of two problems:
+  #   1. They bumped ondemand-pools.yaml without updating scheduler.jsonnet.
+  #   2. They added a whole new pool (YAML) without predeclaring it.
+  # Either way, loud warning + abort with actionable guidance beats a silent
+  # broken cold-start on first use.
+  _check_predeclared_sync() {
+    local pools="$COMPOSE_SRC/config/ondemand-pools.yaml"
+    local sched="$COMPOSE_SRC/config/scheduler.jsonnet"
+    local -a missing=()
+    local pool_name sha
+    # Walk the YAML one block at a time, capturing (pool_name, sha). We use
+    # awk instead of yq so there's no extra dependency on the laptop.
+    while IFS=$'\t' read -r pool_name sha; do
+      [[ -n "$sha" ]] || continue
+      if ! grep -q -F "$sha" "$sched"; then
+        missing+=("$pool_name ($sha)")
+      fi
+    done < <(awk '
+      /^[[:space:]]{2}[a-zA-Z0-9_-]+:[[:space:]]*$/ {
+        gsub(/^[[:space:]]+|:[[:space:]]*$/, "", $0); pool=$0; sha=""; next
+      }
+      /^[[:space:]]{4}container_image_sha:/ {
+        sha=$0
+        sub(/^[[:space:]]*container_image_sha:[[:space:]]*/, "", sha)
+        gsub(/^["'\''][[:space:]]*|[[:space:]]*["'\'']$/, "", sha)
+        print pool "\t" sha
+      }
+    ' "$pools")
+    if (( ${#missing[@]} > 0 )); then
+      warn "the following pools are NOT predeclared in scheduler.jsonnet:"
+      for m in "${missing[@]}"; do
+        warn "    - $m"
+      done
+      warn "first Bazel build against any of them will fail with"
+      warn "  FAILED_PRECONDITION: No workers exist for instance name prefix ..."
+      warn "because the scheduler will reject Execute before the scaler spawns"
+      warn "a worker. Add a corresponding predeclaredPlatformQueues entry with"
+      warn "the same SHA in $sched, then re-run this script."
+      die "predeclared queue drift — aborting"
+    fi
+    ok "ondemand-pools.yaml SHAs all present in scheduler.jsonnet"
+  }
+  _check_predeclared_sync
+
+  # HCLOUD_TOKEN is required by the scaler. Try sources in order so a
+  # correctly-configured operator (hcloud CLI authenticated, or token in env)
+  # is NEVER prompted. Only the very first-run laptop should hit the prompt.
+  local token_src=""
+  if [[ -n "$HCLOUD_TOKEN" ]]; then
+    token_src="env:HCLOUD_TOKEN"
+  fi
   if [[ -z "$HCLOUD_TOKEN" && -n "$HCLOUD_TOKEN_FILE" ]]; then
     [[ -r "$HCLOUD_TOKEN_FILE" ]] || die "HCLOUD_TOKEN_FILE not readable: $HCLOUD_TOKEN_FILE"
     HCLOUD_TOKEN=$(tr -d '\r\n' < "$HCLOUD_TOKEN_FILE")
+    token_src="file:$HCLOUD_TOKEN_FILE"
+  fi
+  # cli.toml lookup — only when HCLOUD_CONTEXT_NAME is explicitly set.
+  # No silent active_context fallback: the active context in the operator's
+  # shell is unrelated to this project and could belong to a different
+  # Hetzner project entirely — shipping that token would mis-scale somebody
+  # else's infra.
+  if [[ -z "$HCLOUD_TOKEN" && -n "$HCLOUD_CONTEXT_NAME" ]]; then
+    [[ -r "$HCLOUD_CONFIG" ]] \
+      || die "HCLOUD_CONTEXT_NAME=$HCLOUD_CONTEXT_NAME set but $HCLOUD_CONFIG is not readable"
+    HCLOUD_TOKEN=$(_hcloud_token_from_cli_config "$HCLOUD_CONTEXT_NAME" || true)
+    if [[ -z "$HCLOUD_TOKEN" ]]; then
+      warn "HCLOUD_CONTEXT_NAME=$HCLOUD_CONTEXT_NAME not found in $HCLOUD_CONFIG"
+      warn "known contexts in this file:"
+      _hcloud_list_cli_contexts | sed 's/^/    - /' >&2 || true
+      die  "no matching context — set HCLOUD_CONTEXT_NAME to one of the above"
+    fi
+    token_src="cli.toml:$HCLOUD_CONTEXT_NAME"
   fi
   if [[ -z "$HCLOUD_TOKEN" ]]; then
-    warn "HCLOUD_TOKEN not in environment — scaler needs it to call Hetzner API"
+    warn "no token from env/file/cli.toml — export HCLOUD_TOKEN, set HCLOUD_TOKEN_FILE,"
+    warn "or set HCLOUD_CONTEXT_NAME to a named context in $HCLOUD_CONFIG"
     read -rsp "Paste HCLOUD_TOKEN (input hidden): " HCLOUD_TOKEN; echo
+    token_src="prompt"
   fi
   [[ -n "$HCLOUD_TOKEN" ]] || die "HCLOUD_TOKEN is empty — aborting"
   # Loose sanity: Hetzner tokens are 64 chars of alphanumerics. Don't fail
@@ -148,7 +311,7 @@ preflight() {
   if ! [[ "$HCLOUD_TOKEN" =~ ^[A-Za-z0-9]{40,}$ ]]; then
     warn "HCLOUD_TOKEN doesn't look like a typical Hetzner token — proceeding anyway"
   fi
-  ok "HCLOUD_TOKEN captured (${#HCLOUD_TOKEN} chars)"
+  ok "HCLOUD_TOKEN captured (${#HCLOUD_TOKEN} chars, source=$token_src)"
 
   for key_id in $SSH_KEY_IDS; do
     hcloud ssh-key describe "$key_id" >/dev/null 2>&1 \
@@ -539,6 +702,32 @@ set -euo pipefail
 # The .env file is not rsync'd from the laptop (see --exclude=.env above),
 # so we write it from scratch here every run — the previous .env is
 # snapshotted into $REMOTE_BASE/_backups/ during step 2.
+#
+# Two classes of keys in this file:
+#   * Deploy-managed (image tags, PRIVATE_IP, HCLOUD_TOKEN) — always rewritten,
+#     they describe the current stack and must match what `create-central.sh`
+#     just built/uploaded.
+#   * Operator-controlled (SCALER_DRY_RUN, SPAWN_THROTTLE_PER_POOL) — these
+#     are runtime toggles SREs flip manually. Rewriting them on every run
+#     silently resets the operator's decisions (e.g. flipping SCALER_DRY_RUN
+#     back to `true` after the operator went live), which bit us on a
+#     redeploy that put the scaler back into dry-run mid-build. So: if the
+#     previous .env exists, pull those values forward; otherwise use the
+#     safe defaults below (true / 1).
+_prev=""
+if [[ -f "$REMOTE_COMPOSE/.env" ]]; then _prev="$REMOTE_COMPOSE/.env"; fi
+_env_get() {
+  # Print the value of key "$1" from $_prev, or empty string if missing.
+  # Intentionally simple: no quoting/escaping games — these are plain
+  # boolean/integer knobs, nothing exotic. Prints first match only.
+  [[ -n "$_prev" ]] || { echo ""; return; }
+  awk -F= -v k="$1" '$1==k { sub(/^[^=]+=/, ""); print; exit }' "$_prev"
+}
+PREV_SCALER_DRY_RUN=$(_env_get SCALER_DRY_RUN)
+PREV_SPAWN_THROTTLE=$(_env_get SPAWN_THROTTLE_PER_POOL)
+: "${PREV_SCALER_DRY_RUN:=true}"
+: "${PREV_SPAWN_THROTTLE:=1}"
+
 cat > "$REMOTE_COMPOSE/.env" <<EOF
 # Generated by create-central.sh — edit by hand if you know what you're doing.
 # Tags below mirror the currently-working barn-psmdb control plane.
@@ -548,10 +737,16 @@ BB_BROWSER_TAG=20260319T101727Z-1731858
 ENVOY_IMAGE_TAG=v1.31-latest
 PRIVATE_IP=$PRIVATE_IP
 HCLOUD_TOKEN=$HCLOUD_TOKEN
-# Safer default — scaler LOGS decisions instead of executing them. Operator
-# flips this to `false` once they've watched a full queue-up / queue-drain
-# cycle in the scaler logs without surprises.
-SCALER_DRY_RUN=true
+# Safer default on a fresh install — scaler LOGS decisions instead of
+# executing them. Operator flips this to \`false\` once they've watched a
+# full queue-up / queue-drain cycle in the scaler logs without surprises.
+# On re-runs this value is preserved from the previous .env above.
+SCALER_DRY_RUN=$PREV_SCALER_DRY_RUN
+# Cold-start throttle: max new VMs spawned per pool per tick. 1 = serial
+# cold-starts (observe each VM register before the next); bump to e.g. 5 to
+# warm up a full pool within one tick during a release matrix. Preserved
+# across re-runs.
+SPAWN_THROTTLE_PER_POOL=$PREV_SPAWN_THROTTLE
 EOF
 chmod 600 "$REMOTE_COMPOSE/.env"   # token inside; keep off `ls -l` casual reads.
 
@@ -588,6 +783,19 @@ cd "$REMOTE_COMPOSE"
 docker compose build reapi-proxy scaler
 docker compose pull --ignore-buildable
 docker compose up -d
+
+# Config-driven services (scheduler, scaler) bind-mount files from
+# ./config/*. `docker compose up -d` only compares the *compose definition*
+# (image tag, env, volumes), NOT the *content* of bind-mounted files — so
+# an edit to scheduler.jsonnet or ondemand-pools.yaml would silently fail
+# to take effect on a redeploy while the container reports "running". This
+# bit us on the predeclaredPlatformQueues rollout: two successive redeploys
+# appeared green but scheduler kept the previous (pre-predeclared) config
+# and the first cold-start Bazel build hit FAILED_PRECONDITION because the
+# predeclared queue was never actually registered. Explicit restart forces
+# the process to re-exec and re-read its config files. On a fresh deploy
+# this is a ~2s stop/start — acceptable overhead for correctness.
+docker compose restart scheduler scaler
 
 echo
 echo "  === docker compose ps ==="
@@ -634,9 +842,51 @@ smoke() {
   # listener in the MVP. grep -q returns non-zero when absent so we can
   # surface a clear warning pointing at the right logs.
   if rssh "REMOTE_COMPOSE='$REMOTE_COMPOSE' bash -c 'cd \$REMOTE_COMPOSE && docker compose logs --tail=60 scaler 2>/dev/null | grep -q \"loaded config\"'"; then
-    ok "scaler booted and loaded config (SCALER_DRY_RUN=true by default)"
+    # NB: actual SCALER_DRY_RUN value is preserved across redeploys — see
+    # bake_env. Fresh install defaults to true (logs-only) for safety.
+    ok "scaler booted and loaded config (mode shown in 'docker compose logs scaler')"
   else
     warn "scaler did NOT log 'loaded config' yet — check 'docker compose logs scaler'"
+  fi
+
+  # predeclaredPlatformQueues check: scheduler must expose at least one
+  # platform queue BEFORE any worker registers. If this fails, Bazel's first
+  # Execute against a cold scheduler will hit FAILED_PRECONDITION and the
+  # build dies on action #1 — exactly the race we're trying to close.
+  #
+  # Count is derived from ondemand-pools.yaml so the check scales as we add
+  # pools. The query runs inside the scaler container (ships grpcurl, has
+  # host networking → can reach :8984 on localhost) — avoids the laptop
+  # needing grpcurl at all.
+  #
+  # Counting strategy: each PlatformQueueState includes a `sizeClassQueues`
+  # repeated field (JSON: "sizeClassQueues": [...]), which appears exactly
+  # once per queue and is absent from all nested fields (verified in
+  # bb-remote-execution buildqueuestate.proto: PlatformQueueState message).
+  # That makes `grep -c "sizeClassQueues"` a safe one-per-queue count even
+  # when a queue is brand-new with zero size classes.
+  local expected_queues
+  expected_queues=$(awk '
+    /^[[:space:]]{2}[a-zA-Z0-9_-]+:[[:space:]]*$/ { next_is_pool=1; next }
+    next_is_pool && /^[[:space:]]{4}container_image_sha:/ { count++; next_is_pool=0 }
+    END { print count+0 }
+  ' "$COMPOSE_SRC/config/ondemand-pools.yaml")
+  local actual_queues
+  # `grep -c` exits 1 when there are zero matches — that would otherwise
+  # trigger the outer `|| echo 0` and concatenate "0\n0" → "00". The
+  # `|| true` inside the pipeline neutralises that without masking ssh or
+  # grpcurl failures (both are upstream of grep). After the rssh we still
+  # have the outer `|| echo 0` as a belt-and-braces fallback for the
+  # ssh/grpcurl failure case.
+  actual_queues=$(rssh "cd $REMOTE_COMPOSE && docker compose exec -T scaler grpcurl -plaintext localhost:8984 buildbarn.buildqueuestate.BuildQueueState/ListPlatformQueues 2>/dev/null | { grep -c sizeClassQueues || true; }" 2>/dev/null || echo 0)
+  actual_queues=${actual_queues//[^0-9]/}
+  : "${actual_queues:=0}"
+  if (( actual_queues >= expected_queues )); then
+    ok "scheduler exposes $actual_queues platform queue(s) (>= $expected_queues predeclared) — cold-start race closed"
+  else
+    warn "scheduler exposes only $actual_queues of $expected_queues expected predeclared queues"
+    warn "first Bazel build may still hit FAILED_PRECONDITION — check scheduler logs:"
+    warn "  docker compose logs scheduler | grep -i predeclared"
   fi
 }
 
@@ -661,7 +911,9 @@ summary() {
     BuildQueueState  : grpc://127.0.0.1:8984          (scaler consumes this)
 
   Scaler:
-    Mode             : SCALER_DRY_RUN=true            (logs decisions, no API calls)
+    Mode             : \$SCALER_DRY_RUN in $REMOTE_COMPOSE/.env
+                       (fresh install defaults to true = logs-only; redeploys
+                        preserve whatever was set before — see bake_env)
     Logs             : ssh root@$PUBLIC_IP 'cd $REMOTE_COMPOSE && docker compose logs -f scaler'
     Go live          : edit $REMOTE_COMPOSE/.env → SCALER_DRY_RUN=false
                        then: ssh root@$PUBLIC_IP 'cd $REMOTE_COMPOSE && docker compose up -d scaler'

@@ -29,13 +29,13 @@ global:
   region_try_chain: [hel1, nbg1, fsn1]
 
   # Safety rails. The scaler REFUSES any action that would exceed these.
-  max_total_nodes: 12                    # cap across all pools combined
+  max_total_nodes: 60                    # cap across all pools combined
   max_cost_per_hour_eur: 2.0             # sum of current VM hourly rates
 
   # Control loop timings.
   poll_interval_seconds: 30              # how often the scaler polls BuildQueueState
   scale_down_idle_seconds: 600           # 10 min — matches Hetzner per-hour billing granularity
-  scale_up_threshold: 1                  # minimum queued ops before we spawn (Phase 2 MVP: aggressive, revisit)
+  scale_up_threshold: 1                  # minimum queued ops before we spawn; desired-fleet math (ceil((queued+executing)/concurrency)) runs only once this floor is crossed
 
 # Pools. Each key becomes the Hetzner label `psmdb.pool=<key>` on spawned VMs.
 pools:
@@ -62,5 +62,12 @@ pools:
 
     # Per-pool caps. max_nodes sets the ceiling for THIS pool alone;
     # global.max_total_nodes is the hard ceiling across pools.
+    #
+    # min_nodes=0: no warm VM. The FAILED_PRECONDITION race that used to
+    # force a warm node here is now handled at the scheduler level via
+    # `predeclaredPlatformQueues` in compose/config/scheduler.jsonnet —
+    # the queue exists at scheduler boot, actions wait for a worker instead
+    # of failing. First-build latency is ~2 min (cold VM boot); subsequent
+    # builds reuse the warm VM until it ages out via scale_down_idle_seconds.
     min_nodes: 0
-    max_nodes: 2
+    max_nodes: 5

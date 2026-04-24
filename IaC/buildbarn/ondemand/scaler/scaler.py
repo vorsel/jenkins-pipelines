@@ -11,10 +11,11 @@ rest of the control plane. Every POLL_INTERVAL seconds it:
   2. Asks Hetzner for the current list of VMs it owns (labelled with
      `psmdb.managed-by=bb-ondemand-scaler`).
   3. For each pool in ondemand-pools.yaml, decides:
-       scale_up   — queue has work but no workers AND we haven't already
-                    spawned one that's still booting
+       scale_up   — (a) pool is below its `min_nodes` floor, OR
+                    (b) queue has work and more capacity is needed
        scale_down — a managed VM has been idle (no queued/active work for
-                    its pool) for more than scale_down_idle_seconds
+                    its pool) for more than scale_down_idle_seconds AND
+                    deleting it would not take the pool below `min_nodes`
   4. Executes those decisions by calling hcloud, UNLESS SCALER_DRY_RUN=true
      (the default until the operator switches it off).
 
@@ -26,9 +27,19 @@ Design notes:
     (compiling buildbarn/bb-remote-execution protos into Python) is more
     robust but adds 150 lines of build wiring; grpcurl via reflection costs
     ~50 ms per call and survives schema changes in the protos.
-  * Scale-up is intentionally NAIVE in this MVP — one VM per pool when a
-    queue appears, no attempt to fill --jobs=96 with multiple VMs. Multi-VM
-    scaling, pre-warm API, and region fallback come in Phase 3.
+  * Scale-up sizes the fleet from live queue pressure, with a `min_nodes`
+    floor that keeps at least N workers warm for the pool regardless of
+    queue state. This dodges Bazel's FAILED_PRECONDITION on empty platform
+    queues, at the cost of one always-on VM per `min_nodes>0` pool:
+        desired_vms = max(pool.min_nodes,
+                          ceil((queued + executing) / pool.concurrency))
+        desired_vms = min(desired_vms, pool.max_nodes, global_budget)
+        to_spawn    = min(desired_vms - current_pool_vms, SPAWN_THROTTLE)
+    SPAWN_THROTTLE=1 means at most one VM per tick per pool — cold-starts
+    proceed serially, so capacity errors surface one at a time and a burst
+    that evaporates during boot costs us 1 unnecessary VM, not N.
+  * Scale-down never reaps below `min_nodes`. A pool with min_nodes=1 will
+    always have one warm VM, even after 10 min of idle.
 
 See buildbarn-ondemand-scaler.md §5.2–5.8 for the full design.
 """
@@ -74,6 +85,13 @@ SCHEDULER_STATE_GRPC = os.environ.get("SCHEDULER_STATE_GRPC", "127.0.0.1:8984")
 # The BuildQueueState gRPC service fully-qualified name. From upstream:
 # https://github.com/buildbarn/bb-remote-execution/blob/master/pkg/proto/buildqueuestate/buildqueuestate.proto
 BQS_SERVICE = "buildbarn.buildqueuestate.BuildQueueState"
+
+# Maximum number of VMs the scale-up path will spawn for a single pool in
+# one iteration. Keep at 1 during the multi-VM rollout so cold-starts proceed
+# serially and we observe each VM register before committing to the next one.
+# Raise to `None` (or the pool's `max_nodes`) once we trust the cold-start
+# pipeline and want faster warm-up under large release-matrix bursts.
+SPAWN_THROTTLE_PER_POOL = int(os.environ.get("SPAWN_THROTTLE_PER_POOL", "1"))
 
 # Hetzner labels we attach to spawned VMs. The `managed-by` label is the
 # discriminator the scaler uses to re-discover state on restart — any VM
@@ -364,15 +382,21 @@ class HetznerOps:
         pool: PoolCfg,
         global_: GlobalCfg,
         user_data: str,
+        name_suffix: str = "",
     ) -> int:
-        """Create a VM with region fallback. Returns the new server ID."""
+        """Create a VM with region fallback. Returns the new server ID.
+
+        `name_suffix` is appended to the second-resolution timestamp and lets
+        the caller disambiguate VMs spawned back-to-back within the same
+        wall-clock second (relevant when SPAWN_THROTTLE_PER_POOL > 1).
+        """
         ts = int(time.time())
         # Hetzner names are RFC 1123 hostnames: lowercase, hyphens, no
         # underscores. Our pool names DO contain underscores (`x86_64`), so
         # translate them out at VM-name-creation time — matches the logic
         # in scripts/spawn-worker.sh.
         pool_slug = pool.name.replace("_", "-").lower()
-        name = f"bb-worker-{pool_slug}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime(ts))}"
+        name = f"bb-worker-{pool_slug}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime(ts))}{name_suffix}"
         labels = {
             LABEL_MANAGED: LABEL_MANAGED_VALUE,
             LABEL_POOL: pool.name,
@@ -482,6 +506,7 @@ def iteration(cfg: Cfg, hz: HetznerOps, idle_tracker: dict[str, datetime]) -> No
     for pool_name, pool in cfg.pools.items():
         q = _match_pool(queues, pool)
         pool_vms = vms_by_pool.get(pool_name, [])
+        current_pool_vms = len(pool_vms)
 
         queued = q.queued if q else 0
         executing = q.executing if q else 0
@@ -489,58 +514,122 @@ def iteration(cfg: Cfg, hz: HetznerOps, idle_tracker: dict[str, datetime]) -> No
         workers_total = q.workers_total if q else 0
 
         log.info(
-            "  pool=%s queued=%d executing=%d idle=%d workers=%d vms=%d",
-            pool_name, queued, executing, idle, workers_total, len(pool_vms),
+            "  pool=%s queued=%d executing=%d idle=%d workers=%d vms=%d min=%d max=%d",
+            pool_name, queued, executing, idle, workers_total, current_pool_vms,
+            pool.min_nodes, pool.max_nodes,
         )
 
-        # No matching scheduler queue at all → nothing to spawn for this pool
-        # in this tick. (Idle bookkeeping is owned by the scale-down loop
-        # below — keeping it in one place avoids the two halves stomping on
-        # each other's `idle_tracker` entries.)
-        if not q:
+        # Decide whether queue pressure is high enough to justify spawning
+        # on its own. A pool with `min_nodes > 0` spawns even when the queue
+        # is quiet — the floor always applies. A pool with no matching
+        # platform queue (cold scheduler, no action yet submitted) still
+        # spawns iff it has a min_nodes floor.
+        below_floor = current_pool_vms < pool.min_nodes
+        queue_hot = q is not None and queued >= cfg.global_.scale_up_threshold
+
+        if not below_floor and not queue_hot:
+            # Nothing to do this tick for this pool. Idle bookkeeping is
+            # owned by the scale-down loop below — keeping it in one place
+            # avoids the two halves stomping on each other's `idle_tracker`.
             continue
 
-        # Spawn decision: queue must exceed threshold AND there must be no
-        # existing capacity (registered workers OR a VM we already spawned
-        # that hasn't registered yet). This is the conservative MVP — Phase 3
-        # will compute ceil(queued/concurrency) for multi-VM bursts.
-        if queued < cfg.global_.scale_up_threshold:
-            continue
-        if q.has_workers or pool_vms:
-            continue
-        if len(pool_vms) >= pool.max_nodes:
-            log.info("  pool=%s at max_nodes=%d — not spawning", pool_name, pool.max_nodes)
-            continue
-        if total_vms >= cfg.global_.max_total_nodes:
-            log.warning("  global max_total_nodes=%d reached — not spawning", cfg.global_.max_total_nodes)
+        # Size the fleet.
+        #
+        # `desired_from_queue` = enough VMs to dispatch every in-flight action
+        # concurrently. "In-flight" = queued (waiting) + executing (already
+        # assigned to a worker). We divide by the pool's per-VM concurrency
+        # and round up.
+        #
+        # Why include executing in the numerator: during a long action the
+        # scheduler reports `executing > 0, queued = 0` even when total work
+        # is still high. If we only counted queued, we would undershoot the
+        # desired fleet and let the queue drain too slowly. Counting both
+        # self-regulates: as workers register and start processing, queued
+        # drops and executing rises, total stays ~constant.
+        #
+        # The `max(min_nodes, ...)` clamp is the warm-node floor that keeps
+        # Bazel from hitting FAILED_PRECONDITION on an empty platform queue.
+        total_in_flight = queued + executing
+        desired_from_queue = -(-total_in_flight // pool.concurrency)   # ceil div
+        desired_vms = max(pool.min_nodes, desired_from_queue)
+        desired_vms = min(desired_vms, pool.max_nodes)
+
+        remaining_global_budget = cfg.global_.max_total_nodes - total_vms
+        if remaining_global_budget <= 0:
+            log.warning(
+                "  global max_total_nodes=%d reached — not spawning",
+                cfg.global_.max_total_nodes,
+            )
             break
+        desired_vms = min(desired_vms, current_pool_vms + remaining_global_budget)
 
-        # Decided: spawn.
+        to_spawn = max(0, desired_vms - current_pool_vms)
+        if to_spawn == 0:
+            if current_pool_vms >= pool.max_nodes and total_in_flight > 0:
+                log.info(
+                    "  pool=%s at max_nodes=%d (desired=%d) — queue will drain via existing VMs",
+                    pool_name, pool.max_nodes, desired_vms,
+                )
+            continue
+
+        # Throttle cold-starts: default 1 VM per tick so we observe each VM
+        # register before committing to the next one. Raise via env for fast
+        # release-matrix warm-up.
+        to_spawn = min(to_spawn, SPAWN_THROTTLE_PER_POOL)
+
+        log.info(
+            "  pool=%s decision: desired=%d current=%d → spawning %d this tick (throttle=%d)",
+            pool_name, desired_vms, current_pool_vms, to_spawn, SPAWN_THROTTLE_PER_POOL,
+        )
+
         if DRY_RUN:
             log.warning(
-                "  [DRY_RUN] would spawn pool=%s queued=%d (set SCALER_DRY_RUN=false to enable)",
-                pool_name, queued,
+                "  [DRY_RUN] would spawn %d vm(s) for pool=%s queued=%d executing=%d desired=%d current=%d",
+                to_spawn, pool_name, queued, executing, desired_vms, current_pool_vms,
             )
             continue
 
-        hostname_ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        pool_slug = pool.name.replace("_", "-").lower()
-        hostname = f"bb-worker-{pool_slug}-{hostname_ts}"
-        user_data = render_user_data(
-            worker_src=WORKER_SRC,
-            worker_hostname=hostname,
-            central_private_ip=cfg.global_.scheduler_private_ip or "",
-            central_public_url=cfg.global_.scheduler_public_url or "",
-            pool_name=pool.name,
-            runner_image=pool.runner_image,
-        )
-        try:
-            hz.create_worker(pool=pool, global_=cfg.global_, user_data=user_data)
-            total_vms += 1
-        except Exception:  # noqa: BLE001
-            log.exception("spawn failed for pool=%s", pool_name)
+        for i in range(to_spawn):
+            if total_vms >= cfg.global_.max_total_nodes:
+                log.warning(
+                    "  global max_total_nodes=%d reached mid-spawn — stopping early",
+                    cfg.global_.max_total_nodes,
+                )
+                break
+            # Suffix only when bursting >1 VM in the same second, so single-VM
+            # spawns keep their compact existing name format.
+            suffix = f"-{i+1:02d}" if to_spawn > 1 else ""
+            hostname_ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            pool_slug = pool.name.replace("_", "-").lower()
+            hostname = f"bb-worker-{pool_slug}-{hostname_ts}{suffix}"
+            user_data = render_user_data(
+                worker_src=WORKER_SRC,
+                worker_hostname=hostname,
+                central_private_ip=cfg.global_.scheduler_private_ip or "",
+                central_public_url=cfg.global_.scheduler_public_url or "",
+                pool_name=pool.name,
+                runner_image=pool.runner_image,
+            )
+            try:
+                hz.create_worker(
+                    pool=pool,
+                    global_=cfg.global_,
+                    user_data=user_data,
+                    name_suffix=suffix,
+                )
+                total_vms += 1
+            except Exception:  # noqa: BLE001
+                log.exception("spawn failed for pool=%s", pool_name)
+                break  # stop this pool's spawn burst, try again next tick
 
     # --- scale-down path -------------------------------------------------
+    # Running count of live VMs per pool, decremented as we delete. Keeps
+    # us from reaping below `min_nodes` even when multiple VMs in the same
+    # pool cross their idle threshold in the same tick.
+    live_per_pool: dict[str, int] = {
+        pool_name: len(vms_by_pool.get(pool_name, []))
+        for pool_name in cfg.pools
+    }
     for vm in vms:
         pool = cfg.pools.get(vm.pool)
         if pool is None:
@@ -551,6 +640,20 @@ def iteration(cfg: Cfg, hz: HetznerOps, idle_tracker: dict[str, datetime]) -> No
         # We deliberately do NOT key off has_workers here: idle workers with
         # no queued/executing operations ARE the scale-down target.
         if q and q.is_busy:
+            idle_tracker.pop(vm.name, None)
+            continue
+
+        # Warm-node floor: never reap below min_nodes. The "oldest VMs first"
+        # ordering is implicit — we iterate `vms` which hcloud returns in
+        # creation order, so newer VMs hit the delete path last. For a
+        # min_nodes=1 pool that means the original warm VM is preserved and
+        # the burst VMs get reaped. Close enough for now; revisit if we want
+        # explicit "keep youngest" semantics.
+        if live_per_pool.get(vm.pool, 0) <= pool.min_nodes:
+            log.info(
+                "  vm=%s idle but pool=%s at min_nodes=%d — keeping",
+                vm.name, vm.pool, pool.min_nodes,
+            )
             idle_tracker.pop(vm.name, None)
             continue
 
@@ -574,6 +677,7 @@ def iteration(cfg: Cfg, hz: HetznerOps, idle_tracker: dict[str, datetime]) -> No
         try:
             hz.delete_worker(vm)
             idle_tracker.pop(vm.name, None)
+            live_per_pool[vm.pool] = max(0, live_per_pool.get(vm.pool, 0) - 1)
         except Exception:  # noqa: BLE001
             log.exception("delete failed for vm=%s", vm.name)
 

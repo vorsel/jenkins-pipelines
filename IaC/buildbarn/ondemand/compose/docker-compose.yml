@@ -199,6 +199,7 @@ services:
     environment:
       - HCLOUD_TOKEN=${HCLOUD_TOKEN}
       - SCALER_DRY_RUN=${SCALER_DRY_RUN:-true}
+      - SPAWN_THROTTLE_PER_POOL=${SPAWN_THROTTLE_PER_POOL:-1}
       - POOLS_CONFIG=/config/ondemand-pools.yaml
       - WORKER_SRC=/worker
       - SCHEDULER_STATE_GRPC=127.0.0.1:8984
