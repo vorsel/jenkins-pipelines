@@ -102,6 +102,28 @@ LABEL_POOL    = "psmdb.pool"
 LABEL_VERSION = "psmdb.version"
 LABEL_SPAWNED = "psmdb.spawned-at"   # unix ts at spawn time
 
+# Hetzner server names must satisfy RFC 1123: lowercase alphanumerics and
+# hyphens only, max 63 chars total. Our pool keys are up to ~46 chars
+# (e.g. "amazonlinux-2023-x86_64__vmaster__9873907c9659") and contain
+# underscores plus consecutive `__` separators that some validators reject.
+# After we glue the `bb-worker-` prefix (10 chars) and `-<TS>` suffix
+# (16 chars) we have 37 chars of budget for the pool slug. The full pool
+# name is preserved losslessly via the LABEL_POOL Hetzner label — the
+# server name is only for human-readable VM identification. Mirrors the
+# logic in scripts/spawn-worker.sh; both must agree byte-for-byte so VMs
+# spawned by either path are named consistently.
+_POOL_SLUG_BUDGET = 37
+
+
+def _sanitize_pool_slug(pool_name: str) -> str:
+    """Return an RFC-1123-safe ≤37-char slug derived from a pool key."""
+    slug = pool_name.lower().replace("_", "-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    slug = slug[:_POOL_SLUG_BUDGET].rstrip("-")
+    return slug
+
+
 log = logging.getLogger("scaler")
 
 # ---------------------------------------------------------------------------
@@ -449,11 +471,7 @@ class HetznerOps:
         wall-clock second (relevant when SPAWN_THROTTLE_PER_POOL > 1).
         """
         ts = int(time.time())
-        # Hetzner names are RFC 1123 hostnames: lowercase, hyphens, no
-        # underscores. Our pool names DO contain underscores (`x86_64`), so
-        # translate them out at VM-name-creation time — matches the logic
-        # in scripts/spawn-worker.sh.
-        pool_slug = pool.name.replace("_", "-").lower()
+        pool_slug = _sanitize_pool_slug(pool.name)
         name = f"bb-worker-{pool_slug}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime(ts))}{name_suffix}"
         labels = {
             LABEL_MANAGED: LABEL_MANAGED_VALUE,
@@ -668,7 +686,7 @@ def iteration(cfg: Cfg, hz: HetznerOps, idle_tracker: dict[str, datetime]) -> No
             # spawns keep their compact existing name format.
             suffix = f"-{i+1:02d}" if to_spawn > 1 else ""
             hostname_ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-            pool_slug = pool.name.replace("_", "-").lower()
+            pool_slug = _sanitize_pool_slug(pool.name)
             hostname = f"bb-worker-{pool_slug}-{hostname_ts}{suffix}"
             user_data = render_user_data(
                 worker_src=WORKER_SRC,
