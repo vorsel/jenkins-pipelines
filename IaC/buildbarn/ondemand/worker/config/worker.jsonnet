@@ -10,25 +10,32 @@
 // two paths MUST substitute the same set — otherwise manual and scaler-
 // spawned workers ship different configs.
 //   __CENTRAL_PRIVATE_IP__   — scheduler endpoint (workers talk to it on :8983)
-//   __POOL_NAME__            — e.g. "ubuntu-noble-x86_64" (for workerId.slot)
+//   __POOL_NAME__            — e.g. "ubuntu-noble-x86_64__v8_3__9873907c9659"
+//                              (for workerId.slot — used in scheduler UI to
+//                              identify which pool a worker belongs to)
 //   __WORKER_HOSTNAME__      — the Hetzner VM hostname (for workerId.hostname)
 //   __BAZEL_POOL_VALUE__     — pool.bazel_pool_value from ondemand-pools.yaml:
 //                              architecture label Bazel sends in platform
 //                              property `Pool` (x86_64 / aarch64). MUST match
 //                              what PSMDB's .bazelrc emits for this OS.
-//   __CONTAINER_IMAGE_SHA__  — pool.container_image_sha from
-//                              ondemand-pools.yaml: 64-hex sha256 digest of
-//                              the runner container the Bazel client tags
-//                              its actions with (from its
-//                              remote_execution_containers.bzl). This value
-//                              is THE routing key — if it doesn't match the
-//                              client's request byte-for-byte, the worker
-//                              registers into a different platform queue
-//                              than the one the client writes to, actions
-//                              queue forever, and Bazel eventually times
-//                              out with DEADLINE_EXCEEDED. See
-//                              ondemand-pools.yaml header for the priming
-//                              flow that captures a fresh SHA when needed.
+//   __CONTAINER_IMAGE__      — full `docker://...` routing key, derived from
+//                              pool.runner_image in ondemand-pools.yaml:
+//                                docker://ghcr.io/vorsel/psmdb-buildbarn-runners/<distro>-<arch>:<psmdb_version>-<git-sha>
+//                              This is THE routing key — if it doesn't
+//                              match the Bazel client's request byte-for-
+//                              byte, the worker registers into a different
+//                              platform queue than the one the client
+//                              writes to, actions queue forever, and Bazel
+//                              eventually times out with
+//                              DEADLINE_EXCEEDED. The exact-match contract
+//                              is enforced by bb-scheduler. The Bazel-side
+//                              value comes from PSMDB fork's
+//                              bazel/platforms/psmdb_rbe_containers.bzl;
+//                              the worker-side value comes from this
+//                              substitution; create-central.sh's
+//                              bake_predeclared bakes a third copy into
+//                              scheduler.jsonnet's predeclaredPlatformQueues.
+//                              All three MUST agree.
 local common = import 'common.libsonnet';
 
 {
@@ -60,7 +67,7 @@ local common = import 'common.libsonnet';
         // See header for the spawn-time substitution contract.
         properties: [
           { name: 'Pool', value: '__BAZEL_POOL_VALUE__' },
-          { name: 'container-image', value: 'docker://quay.io/mongodb/bazel-remote-execution@sha256:__CONTAINER_IMAGE_SHA__' },
+          { name: 'container-image', value: '__CONTAINER_IMAGE__' },
           { name: 'dockerNetwork', value: 'standard' },
         ],
       },

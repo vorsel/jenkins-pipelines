@@ -126,35 +126,35 @@ class GlobalCfg:
 @dataclasses.dataclass
 class PoolCfg:
     name: str
-    # container_image_sha is the routing key (scheduler.platform_queue
-    # matching). None means "pool scaffolded but not yet primed" — the
-    # YAML header documents the priming flow; the scaler refuses to spawn
-    # VMs for such pools because their worker.jsonnet would have no valid
-    # SHA to substitute.
-    container_image_sha: str | None
+    # runner_image is the SINGLE source of truth: full ghcr.io URL with
+    # immutable `:<psmdb-version>-<git-sha>` tag, e.g.
+    # `ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.0-<sha>`.
+    # Both the docker-compose `image:` field on the worker and the routing
+    # key emitted by the Bazel client are derived from this. See
+    # ondemand-pools.yaml header for the lifecycle (when to bump, when to
+    # add new pool entries, how cross-release coexistence works).
+    runner_image: str
     # bazel_pool_value is the architecture label Bazel stamps into the
     # `Pool` platform property (x86_64 / aarch64). It's part of the
     # routing-key tuple — wrong value → worker lands in an unused queue.
     bazel_pool_value: str
+    # psmdb_version is informational ("8.0" / "8.3" / "master") — used for
+    # the `psmdb.version` Hetzner label and for log readability. Routing
+    # does NOT key off this field; it keys off container_image which
+    # already encodes the version inside the immutable tag.
     psmdb_version: str
-    runner_image_base: str
     server_type: str
     concurrency: int
     min_nodes: int
     max_nodes: int
 
     @property
-    def runner_image(self) -> str:
-        """Full image reference for `docker compose pull`."""
-        return f"{self.runner_image_base}:{self.psmdb_version}"
-
-    @property
-    def is_primed(self) -> bool:
-        """True when the pool has enough config to spawn a working worker.
-        A non-primed pool (container_image_sha=null in ondemand-pools.yaml)
-        is deliberately skipped by scale-up; see the YAML header's priming
-        flow for how to activate one."""
-        return bool(self.container_image_sha)
+    def container_image(self) -> str:
+        """Routing key as it appears in the Bazel platform tuple and in
+        the scheduler's predeclared queues. `docker://` prefix is part of
+        the contract that PSMDB's psmdb_rbe_containers.bzl emits — strip
+        or alter it and matching breaks silently."""
+        return f"docker://{self.runner_image}"
 
 
 @dataclasses.dataclass
@@ -174,13 +174,13 @@ class PlatformQueue:
     idle: int                 # sum of idleWorkersCount — workers waiting for work
     workers_total: int        # sum of workersCount — every registered worker slot
 
-    def container_image_sha(self) -> str | None:
-        """Extract the SHA from the docker:// reference used in PSMDB platforms."""
-        ci = self.platform_props.get("container-image", "")
-        # docker://...@sha256:<hex>
-        marker = "@sha256:"
-        idx = ci.find(marker)
-        return ci[idx + len(marker):] if idx >= 0 else None
+    @property
+    def container_image(self) -> str:
+        """Full `docker://...` URL the scheduler stores for this queue's
+        `container-image` exec property. Empty string if the property is
+        missing (shouldn't happen in practice — every PSMDB-emitted
+        platform tuple carries it)."""
+        return self.platform_props.get("container-image", "")
 
     @property
     def has_workers(self) -> bool:
@@ -217,16 +217,22 @@ def load_config(path: Path) -> Cfg:
     g = raw["global"]
     pools: dict[str, PoolCfg] = {}
     for name, pc in raw.get("pools", {}).items():
+        # `runner_image` is mandatory — there's no scaffolded-but-unprimed
+        # state in the new model, every pool entry pins a real immutable
+        # ghcr tag. Reject loudly so config typos surface at startup, not
+        # 30 s later when the scaler tries to spawn against a malformed
+        # pool definition.
+        runner_image = pc.get("runner_image")
+        if not runner_image:
+            raise ValueError(
+                f"pool '{name}' missing required `runner_image` (full ghcr URL "
+                f"with immutable :<version>-<git-sha> tag — see ondemand-pools.yaml header)"
+            )
         pools[name] = PoolCfg(
             name=name,
-            # YAML `null` → Python None → PoolCfg flags pool as not-yet-primed.
-            # A scaffolded-but-unprimed pool still loads (so the scaler can
-            # publish pool metrics and report "waiting for SHA") but scale-up
-            # refuses to spawn until an operator pastes a real SHA.
-            container_image_sha=pc.get("container_image_sha"),
+            runner_image=str(runner_image),
             bazel_pool_value=str(pc["bazel_pool_value"]),
             psmdb_version=str(pc["psmdb_version"]),
-            runner_image_base=pc["runner_image_base"],
             server_type=pc["server_type"],
             concurrency=int(pc["concurrency"]),
             min_nodes=int(pc.get("min_nodes", 0)),
@@ -504,13 +510,18 @@ def _handle_signal(_signum, _frame):
 
 
 def _match_pool(queues: list[PlatformQueue], pool: PoolCfg) -> PlatformQueue | None:
-    # Unprimed pools (container_image_sha=None) never match a queue — both
-    # sides would compare None==None and we'd claim a spurious match against
-    # any queue whose SHA we failed to parse. Cheaper to bail early.
-    if not pool.container_image_sha:
-        return None
+    """Match a pool to its scheduler queue by EXACT (container-image, Pool)
+    tuple equality.
+
+    The scheduler does byte-exact platform-tuple matching internally — we
+    mirror that here so the scaler's view agrees with the scheduler's.
+    Matching on container-image alone would be ambiguous if we ever added
+    aarch64 pools that share an image (none today; cheap to be precise)."""
+    target_image = pool.container_image
+    target_pool = pool.bazel_pool_value
     for q in queues:
-        if q.container_image_sha() == pool.container_image_sha:
+        if (q.container_image == target_image
+                and q.platform_props.get("Pool", "") == target_pool):
             return q
     return None
 
@@ -575,22 +586,6 @@ def iteration(cfg: Cfg, hz: HetznerOps, idle_tracker: dict[str, datetime]) -> No
             pool_name, queued, executing, idle, workers_total, current_pool_vms,
             pool.min_nodes, pool.max_nodes,
         )
-
-        # Unprimed pool (container_image_sha=null in ondemand-pools.yaml).
-        # We intentionally keep it in cfg so its queue still shows up in
-        # logs, but we refuse to spawn workers — they would register with
-        # an empty/invalid platform tuple and silently wedge the queue.
-        # Operator is expected to follow the priming flow in the YAML
-        # header (spawn one VM manually, scrape the real SHA from its
-        # action error, paste into ondemand-pools.yaml, redeploy).
-        if not pool.is_primed:
-            if queued > 0 or current_pool_vms > 0:
-                log.warning(
-                    "  pool=%s is UNPRIMED (container_image_sha=null) — "
-                    "refusing to spawn; run priming flow from ondemand-pools.yaml",
-                    pool_name,
-                )
-            continue
 
         # Decide whether queue pressure is high enough to justify spawning
         # on its own. A pool with `min_nodes > 0` spawns even when the queue
@@ -682,13 +677,7 @@ def iteration(cfg: Cfg, hz: HetznerOps, idle_tracker: dict[str, datetime]) -> No
                 central_public_url=cfg.global_.scheduler_public_url or "",
                 pool_name=pool.name,
                 runner_image=pool.runner_image,
-                # bootstrap.render_user_data() refuses to substitute a
-                # literal empty SHA (would produce an un-routable worker).
-                # The scale-up pre-check above (`pool.is_primed`) already
-                # filters such pools out; this `or ""` just keeps mypy
-                # happy for the `str` annotation in the presence of the
-                # `str | None` field type.
-                container_image_sha=pool.container_image_sha or "",
+                container_image=pool.container_image,
                 bazel_pool_value=pool.bazel_pool_value,
             )
             try:

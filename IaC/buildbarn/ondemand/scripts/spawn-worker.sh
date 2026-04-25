@@ -30,7 +30,13 @@
 #      hcloud command to destroy the VM when done.
 #
 # Usage:
-#   POOL=ubuntu-noble-x86_64 PSMDB_VERSION=8.3 ./scripts/spawn-worker.sh
+#   POOL=ubuntu-noble-x86_64__v8_3__9873907c9659 ./scripts/spawn-worker.sh
+#
+#   POOL must be a YAML key that exists in
+#   IaC/buildbarn/ondemand/compose/config/ondemand-pools.yaml.
+#   Naming convention is documented in that file's header — short form
+#   `<runner-image-basename>__v<version>__<short-sha>`, e.g.
+#   `oraclelinux-8-x86_64__v8_0__9873907c9659`.
 #
 # The script is NOT idempotent against a duplicate name. If you rerun with
 # the same SERVER_NAME, it will complain; each spawn gets a unique timestamp
@@ -41,8 +47,7 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Required inputs.
 # -----------------------------------------------------------------------------
-: "${POOL:?set POOL (e.g. ubuntu-noble-x86_64)}"
-: "${PSMDB_VERSION:?set PSMDB_VERSION (e.g. 8.3)}"
+: "${POOL:?set POOL (must match a key in ondemand-pools.yaml — see header)}"
 
 # -----------------------------------------------------------------------------
 # Optional inputs — defaults chosen for first-test conditions.
@@ -55,36 +60,20 @@ set -euo pipefail
 : "${SSH_KEY_IDS:=24333399 111196538}"    # htz.cd.key + htz.cd.bb-psmdb-ondemand
 : "${SSH_PRIV_KEY:=$HOME/.ssh/htz.cd.bb-psmdb-ondemand.key}"
 
-# Runner image. Anonymous pull from ghcr.io — the psmdb-buildbarn-runners
-# packages in the vorsel org are public. If that changes, we'll need to
-# provision a GHCR read token into cloud-init.
-: "${RUNNER_REGISTRY:=ghcr.io/vorsel/psmdb-buildbarn-runners}"
-: "${RUNNER_IMAGE:=${RUNNER_REGISTRY}/${POOL}:${PSMDB_VERSION}}"
-
 # -----------------------------------------------------------------------------
-# Worker platform tuple (Pool + container-image SHA).
+# Resolve pool config from ondemand-pools.yaml.
 # -----------------------------------------------------------------------------
-# These are the routing keys the worker registers into the scheduler with.
-# They MUST match what Bazel puts in its Execute request for this pool or
-# actions silently queue forever. The scaler path reads them from
-# ondemand-pools.yaml via scaler/bootstrap.py; the manual path here does the
-# same YAML lookup, with env var overrides for the priming workflow:
-#
-#   * Normal spawn: leave CONTAINER_IMAGE_SHA/BAZEL_POOL_VALUE unset and
-#     take the values from ondemand-pools.yaml.
-#   * Priming a pool that has `container_image_sha: null` in the YAML: you
-#     can't query the ground-truth SHA until you've triggered a failed
-#     Bazel build, but you still need SOME SHA to boot a worker. Pass any
-#     64-hex string via CONTAINER_IMAGE_SHA=… — the worker will boot and
-#     register into a dead queue; the point is to have a VM up so you can
-#     tail its logs while the Bazel client surfaces the real SHA in its
-#     FAILED_PRECONDITION error.
+# The YAML is the single source of truth for routing keys. We read three
+# fields here:
+#   * runner_image        → docker pull URL (immutable :<version>-<sha> tag)
+#   * bazel_pool_value    → architecture label (x86_64 / aarch64)
+#   * psmdb_version       → informational; used for the Hetzner label
+#                            psmdb.version=<value> so ops can filter VMs
+#                            by release line.
+# The full container-image routing key is derived as `docker://${runner_image}`
+# (matches PSMDB fork's psmdb_rbe_containers.bzl emission contract).
 : "${POOLS_YAML:=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/compose/config/ondemand-pools.yaml}"
-if [[ -z "${CONTAINER_IMAGE_SHA:-}" || -z "${BAZEL_POOL_VALUE:-}" ]]; then
-  # Single python3 invocation returning a tab-separated pair so we survive
-  # either value being empty without needing a second subshell. Falls back
-  # to the empty string (not None) so the downstream check can trip cleanly.
-  _pool_props=$(POOL="$POOL" POOLS_YAML="$POOLS_YAML" python3 - <<'PY' || true
+_pool_props=$(POOL="$POOL" POOLS_YAML="$POOLS_YAML" python3 - <<'PY'
 import os, sys
 try:
     import yaml
@@ -97,17 +86,32 @@ with open(path) as f:
 pc = (data.get("pools") or {}).get(pool)
 if not pc:
     sys.exit(f"pool '{pool}' not in {path}")
-# `or ""` keeps shell-side parsing simple when YAML has an explicit null.
-print(f"{pc.get('container_image_sha') or ''}\t{pc.get('bazel_pool_value') or ''}")
+ri = pc.get("runner_image") or ""
+bp = pc.get("bazel_pool_value") or ""
+pv = pc.get("psmdb_version") or ""
+if not ri:
+    sys.exit(f"pool '{pool}' has empty runner_image in {path}")
+if not bp:
+    sys.exit(f"pool '{pool}' has empty bazel_pool_value in {path}")
+print(f"{ri}\t{bp}\t{pv}")
 PY
-  )
-  : "${CONTAINER_IMAGE_SHA:=${_pool_props%%$'\t'*}}"
-  : "${BAZEL_POOL_VALUE:=${_pool_props##*$'\t'}}"
-fi
-[[ -n "$CONTAINER_IMAGE_SHA" ]] \
-  || { echo "pool '$POOL' has container_image_sha=null in $POOLS_YAML — pass CONTAINER_IMAGE_SHA=<64hex> explicitly (priming flow)" >&2; exit 1; }
-[[ -n "$BAZEL_POOL_VALUE" ]] \
-  || { echo "pool '$POOL' missing bazel_pool_value in $POOLS_YAML" >&2; exit 1; }
+)
+# Bash command-substitution failure does NOT propagate through errexit in
+# the absence of `shopt -s inherit_errexit`. Validate the resolution
+# explicitly so a typo in $POOL or a missing runner_image doesn't silently
+# yield empty placeholders downstream.
+[[ -n "$_pool_props" ]] \
+  || { echo "  ✗ failed to resolve pool '$POOL' from $POOLS_YAML — re-run with python errors visible" >&2; exit 1; }
+RUNNER_IMAGE=${_pool_props%%$'\t'*}
+_rest=${_pool_props#*$'\t'}
+BAZEL_POOL_VALUE=${_rest%%$'\t'*}
+PSMDB_VERSION=${_rest#*$'\t'}
+[[ -n "$RUNNER_IMAGE" && -n "$BAZEL_POOL_VALUE" && -n "$PSMDB_VERSION" ]] \
+  || { echo "  ✗ pool '$POOL' resolved with empty fields: runner_image='$RUNNER_IMAGE' bazel_pool_value='$BAZEL_POOL_VALUE' psmdb_version='$PSMDB_VERSION'" >&2; exit 1; }
+# `docker://` prefix is what Bazel sends, what the scheduler stores in its
+# predeclared queue, and what the worker must register with. ALL THREE must
+# agree byte-for-byte.
+CONTAINER_IMAGE="docker://${RUNNER_IMAGE}"
 
 # Unique-ish server name. Hetzner validates this as an RFC 1123 hostname
 # (lowercase letters/digits/hyphens only — NO underscores, NO uppercase).
@@ -220,14 +224,16 @@ render() {
     "$STAGE_DIR/worker/config/common.libsonnet"
 
   # worker.jsonnet: scheduler address + workerId metadata + platform tuple
-  # (Pool + container-image SHA). Platform tuple must be in lockstep with
-  # scaler/bootstrap.py:render_user_data(); see worker.jsonnet header.
+  # (Pool + full container-image URL). Platform tuple must be in lockstep
+  # with scaler/bootstrap.py:render_user_data(); see worker.jsonnet header.
+  # The `|` sed delimiter is deliberate — CONTAINER_IMAGE contains `/` and
+  # `:`, which would clash with the default `s/.../...` form.
   sed -i.bak \
     -e "s|__CENTRAL_PRIVATE_IP__|$CENTRAL_PRIVATE_IP|g" \
     -e "s|__POOL_NAME__|$POOL|g" \
     -e "s|__WORKER_HOSTNAME__|$WORKER_HOSTNAME|g" \
     -e "s|__BAZEL_POOL_VALUE__|$BAZEL_POOL_VALUE|g" \
-    -e "s|__CONTAINER_IMAGE_SHA__|$CONTAINER_IMAGE_SHA|g" \
+    -e "s|__CONTAINER_IMAGE__|$CONTAINER_IMAGE|g" \
     "$STAGE_DIR/worker/config/worker.jsonnet"
 
   # Clean up BSD-sed leftovers (GNU sed would skip these, BSD sed always
@@ -466,7 +472,7 @@ summary() {
   Type / location   : $SERVER_TYPE / $LOCATION ($OS_IMAGE)
   Pool              : $POOL   (PSMDB $PSMDB_VERSION)
   Bazel Pool value  : $BAZEL_POOL_VALUE
-  Image SHA         : sha256:$CONTAINER_IMAGE_SHA
+  Routing key       : $CONTAINER_IMAGE
   Runner image      : $RUNNER_IMAGE
   Public IP         : $PUBLIC_IP
   Private IP        : $PRIVATE_IP

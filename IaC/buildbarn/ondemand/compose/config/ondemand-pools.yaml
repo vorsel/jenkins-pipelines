@@ -1,48 +1,94 @@
 # Declarative pool config consumed by the scaler daemon and by
 # create-central.sh (which generates config/predeclared.libsonnet from this
-# file at bake time — see bake_predeclared() in scripts/create-central.sh).
+# file at bake time — see bake_env() in scripts/create-central.sh).
 #
-# Every pool is matched to a scheduler platform queue by its
-# `container_image_sha`, which MUST equal what PSMDB's Bazel client sets in
-# bazel/platforms/remote_execution_containers.bzl for that OS. When the
-# scheduler reports that queue has queued operations but no workers, the
-# scaler spawns a Hetzner VM from this pool's template.
+# Architecture (single-source-of-truth model):
+# ===========================================================================
+# Each pool pins ONE immutable Percona BuildBarn runner image — full URL,
+# immutable `:<psmdb-version>-<git-sha>` tag — pushed by GHA workflow
+# .github/workflows/build-psmdb-buildbarn-runners.yml. That URL serves THREE
+# distinct purposes simultaneously:
 #
-# Source of truth for SHAs:
-# -------------------------
-# We mirror the upstream PSMDB master branch's
-# `bazel/platforms/remote_execution_containers.bzl` as of Apr 2026.
-# Mapping from our pool name → bzl entry:
+#   1. ROUTING KEY (for bb-scheduler)
+#      The Bazel client emits this URL (prefixed with `docker://`) as the
+#      `container-image` exec property, sourced from PSMDB fork's
+#      bazel/platforms/psmdb_rbe_containers.bzl. The scheduler does an
+#      exact-match on the platform JSON against worker queues. Predeclared
+#      queues materialised from THIS file have the same string baked in,
+#      so the match is byte-for-byte stable.
 #
-#   ubuntu-noble-x86_64      → ubuntu24
-#   ubuntu-jammy-x86_64      → ubuntu22
-#   debian-bookworm-x86_64   → debian12
-#   oraclelinux-8-x86_64     → rhel8  (OL8 is binary-compatible with RHEL8)
-#   oraclelinux-9-x86_64     → rhel9  (OL9 is binary-compatible with RHEL9)
-#   amazonlinux-2023-x86_64  → amazon_linux_2023
+#   2. CACHE INVALIDATION
+#      The container-image string is part of the action digest. When ops
+#      bumps the image (new GHA push) and updates BOTH ondemand-pools.yaml
+#      AND PSMDB fork's psmdb_rbe_containers.bzl in lockstep, every action
+#      gets a new digest → fresh remote execution, no stale cache hits.
+#      Old cached entries remain valid for anyone still building from a
+#      PSMDB checkout that pins the older URL.
 #
-# Re-sync whenever PSMDB rebases to a fresher master: paste the new
-# `.bzl` into a scratch file and run
-#     awk -F'"' '/sha256:/{gsub(/.*sha256:/,"");gsub(/".*/,""); print}' \
-#         scratch.bzl
-# to get the list of SHAs, then update the pools below that changed.
+#   3. RUNTIME IMAGE
+#      docker compose on the worker VM literally pulls THIS URL via the
+#      `image:` field — no shadow registry mapping. What the routing key
+#      says is what the worker runs.
 #
-# Priming a pool that upstream has NOT yet added (or one we got wrong):
-#   1. Set `container_image_sha: null` below and redeploy — scaffolds the
-#      pool but NO predeclared queue is emitted (null is skipped by the
-#      auto-gen in create-central.sh).
-#   2. Trigger a Bazel build against that OS. Because no predeclared queue
-#      exists yet and the scaler can't route a pool without a SHA, Bazel
-#      will fail with `FAILED_PRECONDITION: No workers exist ... platform
-#      {"properties":[...,{"name":"container-image","value":"docker://...
-#      @sha256:XYZ"}...]}`. That SHA is ground truth — paste it into
-#      `container_image_sha` for this pool.
-#   3. Redeploy. Predeclared queue now exists; subsequent builds route
-#      normally and the scaler spawns workers on demand.
+# Cross-release coexistence:
+# ===========================================================================
+# Multiple PSMDB release tags can be in active dev simultaneously
+# (e.g. release-8.0.20-8 from image-sha A, release-8.0.21-9 from image-sha B).
+# Each release's checkout has its own copy of psmdb_rbe_containers.bzl
+# pinning a specific tag. We declare a separate pool per (distro, version,
+# image-sha) tuple here and KEEP old entries until the corresponding PSMDB
+# release goes EOL — only then is the pool removed and its scheduler queue
+# disappears on the next deploy.
 #
-# All pool-level placeholders in worker/config/{common,worker,runner}.jsonnet
-# and worker/docker-compose.yml are substituted by the scaler at spawn time —
-# see scaler/bootstrap.py:render_user_data() for the exact mapping.
+# Pool naming convention:
+# ===========================================================================
+# Pool keys (YAML map keys) follow `<runner-image-basename>__v<version>__<short-sha>`,
+# where:
+#   * runner-image-basename: the trailing component of the GHCR repo path,
+#     e.g. ubuntu-noble-x86_64. Underscores survive (Hetzner labels allow
+#     [a-zA-Z0-9._-]; the hostname slug logic in scaler.py / spawn-worker.sh
+#     already replaces _ with - for VM names).
+#   * v<version>: literal `v` prefix + psmdb_version with `.` → `_` to keep
+#     the pool key free of FQDN-shaped dots. So 8.0 → v8_0, master → vmaster.
+#   * short-sha: first 12 hex chars of the GHA <git-sha> suffix from the
+#     immutable image tag. 12 chars is plenty for our scale (uniqueness
+#     across <O(100) image generations) and keeps pool keys legible.
+# The full git-sha lives only in `runner_image`. The pool key short-sha is
+# for human readability and Hetzner label matching; it never feeds the
+# scheduler routing path.
+#
+# Maintenance procedures:
+# ===========================================================================
+# A) New image generation (GHA push, before any release):
+#    1. Ops verifies the GHA run pushed all 6×3 expected immutable tags
+#       (ghcr query: `:<version>-<github.sha>` per runner).
+#    2. Ops appends 18 new pool entries to this file (or however many are
+#       in scope — only one (version,distro) needs adding when supporting
+#       a single release at a time).
+#    3. Ops PRs the matching value into PSMDB fork's
+#       bazel/platforms/psmdb_rbe_containers.bzl on the relevant release
+#       branch (release-8.0 / release-8.3 / master).
+#    4. Redeploy via scripts/create-central.sh; new predeclared queues
+#       appear; new builds route to fresh pools; old pools continue to
+#       serve in-flight release branches that haven't been bumped yet.
+#
+# B) PSMDB release EOL:
+#    1. Confirm no active branch / tag references the old image URL:
+#         git -C percona-server-mongodb grep -F "<image-sha>" \
+#           release-8.0 release-8.3 master release-8.0.20-8 ...
+#    2. Remove the matching pool entry below + redeploy. Predeclared queue
+#       disappears; pool's CAS entries are still valid for the lifetime of
+#       BuildBarn's CAS-side LRU.
+#
+# Pool → Bazel distro_or_os mapping (Percona pool name → what PSMDB's
+# bzl emits for `distro_or_os-arch`):
+# ===========================================================================
+#   ubuntu-noble-x86_64       → ubuntu24-amd64           → bzl key "ubuntu24"
+#   ubuntu-jammy-x86_64       → ubuntu22-amd64           → bzl key "ubuntu22"
+#   debian-bookworm-x86_64    → debian12-amd64           → bzl key "debian12"
+#   oraclelinux-8-x86_64      → rhel8-amd64              → bzl key "rhel8"   (OL8 ≡ RHEL8)
+#   oraclelinux-9-x86_64      → rhel9-amd64              → bzl key "rhel9"   (OL9 ≡ RHEL9)
+#   amazonlinux-2023-x86_64   → amazon_linux_2023-amd64  → bzl key "amazon_linux_2023"
 
 global:
   # Scheduler endpoints the scaler itself talks to.
@@ -77,8 +123,11 @@ global:
   region_try_chain: [hel1, nbg1, fsn1]
 
   # Safety rails. The scaler REFUSES any action that would exceed these.
-  # 60 = 6 x86_64 pools × 5 max nodes each + headroom. Revisit if we move
-  # to bigger machines or add aarch64 pools (adds 5 more × 5 = 25 more).
+  # 60 = 6 distros × 5 max nodes each (with up to ~3 active versions sharing
+  # capacity). In steady state at most ~6 pools burst to max simultaneously
+  # because Bazel clients usually target one (version, distro) per build.
+  # Revisit if we keep multiple release-tag pools warm at once or add aarch64
+  # pools.
   max_total_nodes: 60                    # cap across all pools combined
   max_cost_per_hour_eur: 2.0             # sum of current VM hourly rates
 
@@ -89,129 +138,192 @@ global:
 
 # Pools. Each key becomes the Hetzner label `psmdb.pool=<key>` on spawned VMs.
 #
-# Current coverage: 6 x86_64 variants. aarch64 pools (amazonlinux-2023,
-# oraclelinux-{8,9}, ubuntu-{jammy,noble}) are NOT scaffolded here yet —
-# they need Hetzner CAX server types, arm64 runner images verified against
-# our cloud-init, and arm64 host Debian image. Tracked as follow-up;
-# structure here is intentionally arch-symmetric so adding them is a
-# straight copy/paste with s/cpx42/cax41/ and s/x86_64/aarch64/ per pool.
+# Current image generation: 8.0/8.3/master @ git-sha 9873907c9659eb73f84e6d63571bca6667861f80
+# (jenkins-pipelines tip at GHA build time; tag suffix in every runner_image
+# below). The pool key short-sha is the first 12 chars of that git-sha.
+#
+# Coverage: 6 x86_64 distros × 3 PSMDB versions = 18 pools. aarch64 pools
+# are NOT scaffolded yet (would need Hetzner CAX server types, arm64 GHA
+# runners verified, arm64 host Debian image). The structure here is
+# arch-symmetric — adding aarch64 is a copy/paste with s/cpx42/cax41/,
+# s/x86_64/aarch64/, s/amd64/arm64/ once the runner images land.
 pools:
 
-  # --------------------------------------------------------------------------
-  # ubuntu24 (bzl key) → ubuntu-noble-x86_64.
-  # Historical note: SHA f1bd9610…c10002 was captured from a real Bazel
-  # FAILED_PRECONDITION error log against a week-old PSMDB master tree
-  # during Phase-2 cold-start testing — all recorded cold-start smokes
-  # (see ../../README.md §Cold-start race) were run against that SHA.
-  # The live value below tracks today's upstream master and will NOT
-  # match a Bazel client still pointing at the week-old tree.
-  # --------------------------------------------------------------------------
-  ubuntu-noble-x86_64:
-    container_image_sha: "11c4f6d4848e0b1f44ab1d16f1c1b08555cbbad658579367e53b22b9540b987a"
-
-    # Bazel platform property `Pool`. In PSMDB's .bazelrc this is set to the
-    # architecture (not the OS) — all x86_64 variants share Pool=x86_64 and
-    # are disambiguated at the scheduler by `container-image`. Keep this
-    # explicit per-pool so an operator adding an aarch64 pool doesn't
-    # inherit the wrong value.
+  # ==========================================================================
+  # ubuntu-noble (Ubuntu 24.04) — distro_or_os "ubuntu24"
+  # ==========================================================================
+  ubuntu-noble-x86_64__v8_0__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.0-9873907c9659eb73f84e6d63571bca6667861f80"
     bazel_pool_value: x86_64
-
-    # PSMDB release line this pool's runner image is built for. Tag
-    # suffix on runner_image_base. 8.3 is the actively tested line in
-    # Phase 2; 8.0 and master can be added by spinning up a second pool
-    # with a different runner_image_base tag once their runner images
-    # go through the same smoke.
-    psmdb_version: "8.3"
-
-    # Runner image reference — anonymous pull from ghcr.io as long as the
-    # package visibility stays public (see worker/docker-compose.yml).
-    runner_image_base: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64"
-
-    # Hetzner VM geometry. cpx42 matches the central (8c/16GB/320GB) —
-    # plenty of headroom for concurrency=12 and ~100 GB hardlinking cache.
-    # Upgrade to cpx52 (12c/24GB) once we trust the setup and want more
-    # throughput.
-    server_type: cpx42
-    concurrency: 12                      # must match worker.jsonnet's runners[0].concurrency
-
-    # Per-pool caps. max_nodes sets the ceiling for THIS pool alone;
-    # global.max_total_nodes is the hard ceiling across pools.
-    #
-    # min_nodes=0: no warm VM. The FAILED_PRECONDITION race that used to
-    # force a warm node here is now handled at the scheduler level via
-    # `predeclaredPlatformQueues` in compose/config/scheduler.jsonnet —
-    # the queue exists at scheduler boot, actions wait for a worker instead
-    # of failing. First-build latency is ~2 min (cold VM boot); subsequent
-    # builds reuse the warm VM until it ages out via scale_down_idle_seconds.
-    min_nodes: 0
-    max_nodes: 5
-
-  # --------------------------------------------------------------------------
-  # Pools below inherit SHAs straight from upstream PSMDB master's
-  # remote_execution_containers.bzl. First-time activation doesn't need
-  # the priming-flow dance — the predeclared queue comes up on the next
-  # redeploy. If a build still hits FAILED_PRECONDITION it means either:
-  #
-  #   (a) upstream bumped the image since we last synced (re-paste the
-  #       new SHA here, redeploy);
-  #   (b) the user is on a branch where PSMDB pinned the `.bzl` at a
-  #       different revision — in which case flip this pool to
-  #       `container_image_sha: null` and use the priming flow to capture
-  #       the branch-specific SHA; file a TODO to reconcile.
-  # --------------------------------------------------------------------------
-
-  # ubuntu22 (bzl) → ubuntu-jammy-x86_64.
-  ubuntu-jammy-x86_64:
-    container_image_sha: "e9ef6a7caea4cf5c4858ebe54fc743163aaa58b1a6e55e970851abf85841424e"
-    bazel_pool_value: x86_64
-    psmdb_version: "8.3"
-    runner_image_base: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy-x86_64"
+    psmdb_version: "8.0"
     server_type: cpx42
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
 
-  # debian12 (bzl) → debian-bookworm-x86_64.
-  debian-bookworm-x86_64:
-    container_image_sha: "24d21b038c38fa4bea9cef8913f62756b7df1faa8a893306f42fcb934b957504"
+  ubuntu-noble-x86_64__v8_3__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.3-9873907c9659eb73f84e6d63571bca6667861f80"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
-    runner_image_base: "ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm-x86_64"
     server_type: cpx42
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
 
-  # rhel8 (bzl) → oraclelinux-8-x86_64. OL8 is binary-compatible with
-  # RHEL8, so the RHEL8 container image is the one Bazel tags actions
-  # with when building for OL8.
-  oraclelinux-8-x86_64:
-    container_image_sha: "a628a8b69f286232dd94b3646055b31a4afb29876af075c1cbf078f0b36cf882"
+  ubuntu-noble-x86_64__vmaster__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
     bazel_pool_value: x86_64
-    psmdb_version: "8.3"
-    runner_image_base: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8-x86_64"
+    psmdb_version: "master"
     server_type: cpx42
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
 
-  # rhel9 (bzl) → oraclelinux-9-x86_64 (same rationale as OL8/RHEL8).
-  oraclelinux-9-x86_64:
-    container_image_sha: "94db357316d2d3ea32751a197378c7dbbf825f5afd470e46ba27fdd107a5427f"
+  # ==========================================================================
+  # ubuntu-jammy (Ubuntu 22.04) — distro_or_os "ubuntu22"
+  # ==========================================================================
+  ubuntu-jammy-x86_64__v8_0__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy-x86_64:8.0-9873907c9659eb73f84e6d63571bca6667861f80"
     bazel_pool_value: x86_64
-    psmdb_version: "8.3"
-    runner_image_base: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9-x86_64"
+    psmdb_version: "8.0"
     server_type: cpx42
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
 
-  # amazon_linux_2023 (bzl) → amazonlinux-2023-x86_64.
-  amazonlinux-2023-x86_64:
-    container_image_sha: "e6080195e7c253f8013317c51ad5ae0fa3e593c77a8cf30390d7c4f4cf8395f3"
+  ubuntu-jammy-x86_64__v8_3__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy-x86_64:8.3-9873907c9659eb73f84e6d63571bca6667861f80"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
-    runner_image_base: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023-x86_64"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-jammy-x86_64__vmaster__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "master"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  # ==========================================================================
+  # debian-bookworm (Debian 12) — distro_or_os "debian12"
+  # ==========================================================================
+  debian-bookworm-x86_64__v8_0__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm-x86_64:8.0-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-bookworm-x86_64__v8_3__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm-x86_64:8.3-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-bookworm-x86_64__vmaster__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "master"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  # ==========================================================================
+  # oraclelinux-8 (RHEL8-compatible) — distro_or_os "rhel8"
+  # ==========================================================================
+  oraclelinux-8-x86_64__v8_0__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8-x86_64:8.0-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-8-x86_64__v8_3__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8-x86_64:8.3-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-8-x86_64__vmaster__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "master"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  # ==========================================================================
+  # oraclelinux-9 (RHEL9-compatible) — distro_or_os "rhel9"
+  # ==========================================================================
+  oraclelinux-9-x86_64__v8_0__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9-x86_64:8.0-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-9-x86_64__v8_3__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9-x86_64:8.3-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-9-x86_64__vmaster__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "master"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  # ==========================================================================
+  # amazonlinux-2023 — distro_or_os "amazon_linux_2023"
+  # ==========================================================================
+  amazonlinux-2023-x86_64__v8_0__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023-x86_64:8.0-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  amazonlinux-2023-x86_64__v8_3__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023-x86_64:8.3-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  amazonlinux-2023-x86_64__vmaster__9873907c9659:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+    bazel_pool_value: x86_64
+    psmdb_version: "master"
     server_type: cpx42
     concurrency: 12
     min_nodes: 0

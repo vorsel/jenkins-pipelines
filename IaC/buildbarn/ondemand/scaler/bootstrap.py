@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 # with the sed invocations in scripts/spawn-worker.sh:render() — a divergence
 # means manual and automatic spawns ship different configs.
 #
-# __CONTAINER_IMAGE_SHA__ and __BAZEL_POOL_VALUE__ are the routing keys for
+# __CONTAINER_IMAGE__ and __BAZEL_POOL_VALUE__ are the routing keys for
 # scheduler platform queue matching (see worker.jsonnet header). If either
 # is wrong the worker registers into a queue no client writes to, actions
 # hang until `platformQueueWithNoWorkersTimeout` drops them — that's the
@@ -49,7 +49,7 @@ _PLACEHOLDERS = [
     "__WORKER_HOSTNAME__",
     "__RUNNER_IMAGE__",
     "__BAZEL_POOL_VALUE__",
-    "__CONTAINER_IMAGE_SHA__",
+    "__CONTAINER_IMAGE__",
 ]
 
 _PLACEHOLDER_RE = re.compile(r"__[A-Z_]+__")
@@ -84,7 +84,7 @@ def render_user_data(
     pool_name: str,
     runner_image: str,
     bazel_pool_value: str,
-    container_image_sha: str,
+    container_image: str,
 ) -> str:
     """
     Produce a #cloud-config document as a string, ready to pass straight into
@@ -107,15 +107,21 @@ def render_user_data(
           - ... docker install, sysctl, swap ...
           - cd /opt/buildbarn && docker compose up -d
     """
-    # Empty-string SHA here would produce a worker registered with a
-    # literal `sha256:` platform property — that would match nothing.
-    # Refuse loudly; the scaler's caller is expected to skip pools
-    # with container_image_sha=null rather than let bootstrap cover up
-    # a config hole.
-    if not container_image_sha:
+    # Empty container_image would render `container-image: ''` into the
+    # worker's platform tuple — registers into a queue no client writes to,
+    # and Bazel's first action against this pool eventually times out with
+    # DEADLINE_EXCEEDED. Refuse loudly so the failure surfaces here, where
+    # the caller can attribute it to a misconfigured pool, rather than
+    # 4 minutes later in a silent VM.
+    if not container_image:
         raise ValueError(
-            f"pool '{pool_name}' has no container_image_sha — cannot render "
+            f"pool '{pool_name}' has empty container_image — cannot render "
             f"worker config (would register into an unmatched platform queue)"
+        )
+    if not runner_image:
+        raise ValueError(
+            f"pool '{pool_name}' has empty runner_image — cannot render "
+            f"worker config (docker compose has nothing to pull)"
         )
     if not bazel_pool_value:
         raise ValueError(
@@ -130,7 +136,7 @@ def render_user_data(
         "__WORKER_HOSTNAME__": worker_hostname,
         "__RUNNER_IMAGE__": runner_image,
         "__BAZEL_POOL_VALUE__": bazel_pool_value,
-        "__CONTAINER_IMAGE_SHA__": container_image_sha,
+        "__CONTAINER_IMAGE__": container_image,
     }
 
     # Render each file upfront so we bail on a missing/bad placeholder BEFORE
@@ -265,14 +271,18 @@ if __name__ == "__main__":
         print(f"WORKER_SRC={src} does not exist", file=sys.stderr)
         sys.exit(1)
 
+    sample_runner = (
+        "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:"
+        "8.3-9873907c9659eb73f84e6d63571bca6667861f80"
+    )
     rendered = render_user_data(
         worker_src=src,
         worker_hostname="bb-worker-dryrun-00000000-000000",
         central_private_ip="10.30.242.7",
         central_public_url="http://CENTRAL_PUB:7984",
-        pool_name="ubuntu-noble-x86_64",
-        runner_image="ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.3",
+        pool_name="ubuntu-noble-x86_64__v8_3__9873907c9659",
+        runner_image=sample_runner,
         bazel_pool_value="x86_64",
-        container_image_sha="0" * 64,
+        container_image=f"docker://{sample_runner}",
     )
     print(rendered)

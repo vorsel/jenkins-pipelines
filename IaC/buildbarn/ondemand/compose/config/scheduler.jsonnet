@@ -9,10 +9,11 @@
 // NOT here.
 local common = import 'common.libsonnet';
 // Generated at deploy time by create-central.sh's bake_predeclared() step
-// from compose/config/ondemand-pools.yaml. See that file for the priming
-// flow and the MAINTENANCE CONTRACT below. Ships as a small JSON array of
-// PredeclaredPlatformQueueConfiguration entries, one per pool with a
-// non-null container_image_sha.
+// from compose/config/ondemand-pools.yaml. See that file for the
+// MAINTENANCE CONTRACT and the cross-release coexistence model. Ships as
+// a small JSON array of PredeclaredPlatformQueueConfiguration entries —
+// one per pool, with `container-image` property set to
+// `docker://<runner_image>` taken verbatim from the YAML.
 local predeclared = import 'predeclared.libsonnet';
 
 {
@@ -87,9 +88,9 @@ local predeclared = import 'predeclared.libsonnet';
   // MAINTENANCE CONTRACT: the list below is AUTO-GENERATED from
   // compose/config/ondemand-pools.yaml by create-central.sh's
   // bake_predeclared() step. Do NOT hand-edit predeclared.libsonnet —
-  // edit the YAML and redeploy. One entry is emitted per pool whose
-  // `container_image_sha` is non-null (null scaffolds an inactive pool
-  // that awaits priming — see ondemand-pools.yaml for the priming flow).
+  // edit the YAML and redeploy. One entry is emitted per pool, with
+  // `container-image` property = `docker://<runner_image>` (verbatim
+  // from the YAML's runner_image field).
   //
   // `sizeClasses: [0]` is applied uniformly: our workers register with the
   // default size_class=0, and we don't use feedback-driven size

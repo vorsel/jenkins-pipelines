@@ -189,9 +189,16 @@ Two caveats:
 Once the central is up, you can bring up a single worker VM with:
 
 ```bash
-POOL=ubuntu-noble-x86_64 PSMDB_VERSION=8.3 \
+POOL=ubuntu-noble-x86_64__v8_3__9873907c9659 \
   ./scripts/spawn-worker.sh
 ```
+
+`POOL` must be a YAML key from
+[`compose/config/ondemand-pools.yaml`](compose/config/ondemand-pools.yaml)
+(naming convention is documented in that file's header). All other inputs —
+`runner_image`, `bazel_pool_value`, `psmdb_version` — come from the YAML;
+`spawn-worker.sh` reads them on startup and refuses to proceed if the
+pool key isn't there.
 
 Defaults (all overridable via env):
 
@@ -202,10 +209,8 @@ Defaults (all overridable via env):
 | `OS_IMAGE` | `debian-13` | matches the central's host OS |
 | `NETWORK_ID` | `11374636` | `psmdb.cd.percona.com` private net |
 | `SSH_KEY_IDS` | `24333399 111196538` | both ops keys injected, same as central |
-| `RUNNER_REGISTRY` | `ghcr.io/vorsel/psmdb-buildbarn-runners` | anonymous pull |
-| `RUNNER_IMAGE` | `${RUNNER_REGISTRY}/${POOL}:${PSMDB_VERSION}` | what the runner container runs |
 | `CENTRAL_NAME` | `bb-psmdb-ondemand` | discovered via `hcloud server describe` |
-| `SERVER_NAME` | `bb-worker-${POOL}-${TS}` | must be unique per run |
+| `SERVER_NAME` | `bb-worker-<pool-slug>-${TS}` | underscores in pool name → hyphens, RFC 1123-safe |
 
 Phase 1 VMs get a **public IPv4** so the operator can SSH in for debugging.
 Phase 2 will drop that for workers spawned programmatically by the scaler.
@@ -219,8 +224,10 @@ What the script does:
    `__WORKER_HOSTNAME__` / `__RUNNER_IMAGE__` placeholders. Refuses to
    proceed if any placeholder remains — that would ship broken configs.
 3. **Create server.** `hcloud server create` with the rendered cloud-init
-   as user-data and both SSH keys + the private network attached. Labels
-   `role=bb-worker project=psmdb-buildbarn pool=$POOL psmdb-version=$PSMDB_VERSION`.
+   as user-data and both SSH keys + the private network attached. Labels:
+   `role=bb-worker project=psmdb-buildbarn pool=$POOL psmdb-version=<from-yaml>`
+   (the `psmdb-version` value is read from the matched pool's
+   `psmdb_version` field — `8.0` / `8.3` / `master`).
 4. **Wait for SSH**, then `cloud-init status --wait`. If cloud-init fails,
    the tail of `/var/log/cloud-init-output.log` is printed and the script
    exits — the VM is left running for the operator to investigate.
@@ -296,13 +303,16 @@ EOF
 ### Pool configuration
 
 [`compose/config/ondemand-pools.yaml`](compose/config/ondemand-pools.yaml)
-is the single knob you edit to add / remove / resize pools. Each pool:
+is the single knob you edit to add / remove / resize pools. The header in
+that file documents the architecture, the pool naming convention, the
+cross-release coexistence model, and the maintenance procedures (image
+rebuild, PSMDB release EOL). Per-pool fields:
 
 | Field | Purpose |
 | ----- | ------- |
-| `container_image_sha` | scheduler routing key — must equal whatever the PSMDB Bazel client sends for this OS (ultimately from `bazel/platforms/remote_execution_containers.bzl` on the PSMDB side). `null` scaffolds a not-yet-primed pool; `scripts/create-central.sh` auto-generates the matching `predeclaredPlatformQueues` entry in `compose/config/predeclared.libsonnet` at bake time, so YAML and scheduler config stay in sync by construction. See the priming flow in the YAML header for how to activate a new pool |
+| `runner_image` | full ghcr.io URL with immutable `:<psmdb_version>-<git-sha>` tag, e.g. `ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:8.0-9873907c…`. Single source of truth: docker compose pulls this, the routing key is `docker://<runner_image>`, and PSMDB fork's `bazel/platforms/psmdb_rbe_containers.bzl` must emit the same URL for handshake to work. `scripts/create-central.sh` auto-generates the matching `predeclaredPlatformQueues` entry at bake time |
 | `bazel_pool_value` | value of Bazel's `Pool` platform property — `x86_64` or `aarch64`. Explicit per-pool rather than inferred from the pool name |
-| `psmdb_version` | appended to `runner_image_base` — `ubuntu-noble-x86_64:8.3`, etc. |
+| `psmdb_version` | informational ("8.0" / "8.3" / "master") — used for the `psmdb.version` Hetzner label and log readability. Routing does NOT key off this field; routing keys off `runner_image` which encodes the version inside the immutable tag |
 | `server_type` | `cpx42` default; bump to `cpx52` when we trust the config |
 | `concurrency` | must match `worker.jsonnet`'s `runners[0].concurrency` |
 | `min_nodes` / `max_nodes` | per-pool caps; a global cap lives under `global.max_total_nodes` |
@@ -340,38 +350,32 @@ Bazel's default 3600 s `--remote_timeout` absorbs the wait.
 file you edit. At deploy time, `scripts/create-central.sh` runs
 `bake_predeclared()` which reads the YAML and generates
 `compose/config/predeclared.libsonnet` — a small JSON array of
-`PredeclaredPlatformQueueConfiguration` entries, one per pool with a
-non-null `container_image_sha`. `scheduler.jsonnet` imports that file.
-YAML and scheduler config stay in sync **by construction** — there is
-nothing to drift. Hand-editing `predeclared.libsonnet` is not
-supported; the file carries a `// AUTO-GENERATED` header and is
-overwritten on every deploy.
+`PredeclaredPlatformQueueConfiguration` entries, one per pool. Each
+entry's `container-image` property is `docker://<runner_image>` (taken
+verbatim from the YAML's `runner_image` field). `scheduler.jsonnet`
+imports that file. YAML and scheduler config stay in sync **by
+construction** — there is nothing to drift. Hand-editing
+`predeclared.libsonnet` is not supported; the file carries a
+`// AUTO-GENERATED` header and is overwritten on every deploy.
 
-**Where SHAs come from.** `container_image_sha` for each pool mirrors
-upstream PSMDB master's
-`bazel/platforms/remote_execution_containers.bzl`. The YAML header
-documents the exact `bzl key → pool name` mapping. When PSMDB rebases
-master and regenerates that file, re-sync the SHAs below: paste the
-new `.bzl` and diff. That's the happy path — no FAILED_PRECONDITION
-needed.
+**Where routing keys come from.** Each pool's `runner_image` is a Percona-
+controlled immutable ghcr.io tag built by
+`.github/workflows/build-psmdb-buildbarn-runners.yml`. The PSMDB-side
+companion to this YAML is
+[`bazel/platforms/psmdb_rbe_containers.bzl`](https://github.com/vorsel/percona-server-mongodb/blob/PSMDB-2034_psmdb_rbe_containers/bazel/platforms/psmdb_rbe_containers.bzl)
+in the PSMDB fork: it pins the same image URLs (per release branch) and
+overrides upstream MongoDB's `quay.io` map for distros Percona supports.
+For a successful handshake the URLs must match byte-for-byte across
+both files; a single git-sha bump in lockstep on both sides is the only
+moving part.
 
-**Priming an unknown SHA** (for a pool upstream doesn't publish, or when
-the user's PSMDB branch pins `.bzl` at a different revision):
-
-1. Flip the pool's `container_image_sha: null` in `ondemand-pools.yaml`
-   and re-run `scripts/create-central.sh`. The pool is scaffolded but
-   **no** predeclared queue is emitted for it.
-2. Trigger `bazel build` against this pool's OS. With no predeclared
-   queue, Bazel hits `FAILED_PRECONDITION` and the error log reports
-   the real SHA the client sent:
-   ```
-   FAILED_PRECONDITION: No workers exist for instance name prefix
-   "hardlinking" platform {"properties":[...,{"name":"container-image",
-   "value":"docker://...@sha256:XYZ"}...]}
-   ```
-3. Paste that `XYZ` into `container_image_sha` for this pool.
-4. Re-run `scripts/create-central.sh`. Subsequent builds against that
-   pool queue cleanly and the scaler spawns workers on demand.
+**Maintenance** — see the procedures in the
+[ondemand-pools.yaml header](compose/config/ondemand-pools.yaml). In
+short: when GHA pushes a new immutable image generation, ops PRs the
+new tags into both files and redeploys; old pool entries stay in this
+YAML until the corresponding PSMDB release goes EOL, so multiple active
+release tags (e.g. `release-8.0.20-8` and `release-8.0.21-9`) coexist
+without cache-poisoning each other.
 
 ## What's *not* here yet
 

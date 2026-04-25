@@ -92,10 +92,14 @@ at 0 by default.
 **Sync is by construction.** `create-central.sh`'s `bake_predeclared()`
 step reads `ondemand-pools.yaml` and generates
 `compose/config/predeclared.libsonnet` (imported by `scheduler.jsonnet`),
-emitting one entry per pool with a non-null `container_image_sha`. YAML
-is the only knob to turn; there is nothing to drift. A pool with
-`container_image_sha: null` is scaffolded but skipped — the YAML header
-documents the priming flow to activate it.
+emitting one entry per pool — `container-image` property is
+`docker://<runner_image>`, taken verbatim from the YAML. YAML is the
+only knob to turn; there is nothing to drift. Routing keys originate
+in Percona-controlled immutable ghcr.io tags (built by
+`.github/workflows/build-psmdb-buildbarn-runners.yml`) and are pinned
+on both this YAML and the PSMDB fork's
+`bazel/platforms/psmdb_rbe_containers.bzl`; ops bumps both in
+lockstep when a new image generation should become the routing target.
 
 ## Why grpcurl and not compiled protos
 
@@ -150,7 +154,7 @@ to look identical to the live output minus the actual API call.
 | ------- | ----------- | -------------- |
 | Region try-chain (hel1 → nbg1 → fsn1) for capacity errors | Current code tries each region but stops on first success — that's enough for `cpx42` in `hel1`; add per-region jitter later | `HetznerOps.create_worker()` |
 | aarch64 pools (CAX server types, arm64 runner images) | x86_64 is the proven path; aarch64 needs image verification + cloud-init check on arm64 host | new pool entries in `ondemand-pools.yaml` with `bazel_pool_value: aarch64` and `server_type: cax*` |
-| Multi-branch SHAs per pool (master + 8.0 + 8.3 + future 9.0) | Today one pool = one SHA, mirroring one branch's `remote_execution_containers.bzl`. Clients on other branches hit `FAILED_PRECONDITION` because SHA doesn't match the predeclared queue. Open question: declare N queues per pool (one per active branch) vs pull SHAs live from each branch's `.bzl` vs relax the SHA match | likely a new `container_image_shas:` list field in `ondemand-pools.yaml` + extended `bake_predeclared()` emitting one entry per SHA, or a lightweight syncer that fetches `.bzl` per tracked branch |
+| GHA-bot auto-bumping `psmdb_rbe_containers.bzl` after image rebuilds | Manual PRs work fine for the rollout cadence we're at; automation goes in once the rebuild flow is exercised in production a few times | new GHA workflow in PSMDB fork that watches `build-psmdb-buildbarn-runners.yml` runs and opens a follow-up PR per release branch |
 | Pre-warm HTTP API (Jenkins hints) | External trigger; implement after the passive loop is trusted | new Flask endpoint on a random port, wire into compose |
 | Prometheus `/metrics` | Important for production dashboards; today we rely on `docker logs` | `prometheus_client` in requirements, expose on `:9090` |
 | SIGHUP reload of `ondemand-pools.yaml` | Restarting the scaler is 2 seconds, good enough for MVP | `signal.SIGHUP` handler in `run_loop()` |
