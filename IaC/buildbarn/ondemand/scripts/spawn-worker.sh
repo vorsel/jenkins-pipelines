@@ -113,12 +113,21 @@ PSMDB_VERSION=${_rest#*$'\t'}
 # agree byte-for-byte.
 CONTAINER_IMAGE="docker://${RUNNER_IMAGE}"
 
-# Unique-ish server name. Hetzner validates this as an RFC 1123 hostname
-# (lowercase letters/digits/hyphens only — NO underscores, NO uppercase).
-# Our pool names contain underscores (`x86_64`), so sanitize before use.
-# Timestamp uses hyphen separators for the same reason.
+# Unique-ish server name. Hetzner validates this as an RFC 1123 hostname:
+# lowercase letters/digits/hyphens only (NO underscores, NO uppercase) AND
+# total length ≤ 63 chars. Our YAML pool keys can be up to ~46 chars
+# (e.g. `amazonlinux-2023-x86_64__vmaster__9873907c9659`) and double `__`
+# gets converted to `--` which some validators reject — so we (a) lowercase
+# + replace `_` with `-`, (b) collapse runs of consecutive hyphens to one,
+# (c) bound the slug so the full name stays ≤ 63 chars after we glue the
+# `bb-worker-` prefix (10 chars) and `-<TS>` suffix (16 chars: 26 total
+# overhead, leaving 37 chars for the slug). The full pool key is preserved
+# losslessly in the `pool=<POOL>` Hetzner label below — server name is
+# only for human-readable VM identification.
 : "${TS:=$(date -u +%Y%m%d-%H%M%S)}"
-POOL_SLUG=$(printf '%s' "$POOL" | tr '_[:upper:]' '-[:lower:]')
+POOL_SLUG=$(printf '%s' "$POOL" | tr '_[:upper:]' '-[:lower:]' | tr -s '-')
+POOL_SLUG=${POOL_SLUG:0:37}
+POOL_SLUG=${POOL_SLUG%-}              # strip trailing hyphen left by truncate
 : "${SERVER_NAME:=bb-worker-${POOL_SLUG}-${TS}}"
 : "${WORKER_HOSTNAME:=$SERVER_NAME}"
 
@@ -330,8 +339,9 @@ wait_for_ssh() {
   die "SSH didn't come up within ~4.5 minutes"
 }
 
-rssh()   { ssh $SSH_OPTS "root@$PUBLIC_IP" "$@"; }
-rrsync() { rsync -a --delete -e "ssh $SSH_OPTS" "$@"; }
+rssh()        { ssh $SSH_OPTS "root@$PUBLIC_IP" "$@"; }
+central_ssh() { ssh $SSH_OPTS "root@$CENTRAL_PUBLIC_IP" "$@"; }
+rrsync()      { rsync -a --delete -e "ssh $SSH_OPTS" "$@"; }
 
 wait_for_cloud_init() {
   step "cloud-init"
@@ -394,70 +404,83 @@ REMOTE
 }
 
 # -----------------------------------------------------------------------------
-# Confirm the worker registered. Two independent signals are checked because
-# either alone gave us false positives/negatives during Phase 1 bring-up:
+# Confirm the worker registered.
 #
-#   1. Worker-side "no recent fatal":
-#      bb-worker spams "Fatal error: ... readiness check ... no such file or
-#      directory" while it's waiting for the runner unix socket to appear at
-#      startup, which is normal. Once it connects, it goes silent. So if the
-#      last 30 s of `docker compose logs` are EMPTY (no fatals, no panics),
-#      the worker is healthy and idle. This is the strongest signal.
+# The authoritative source of truth is the scheduler's
+# BuildQueueState/ListPlatformQueues gRPC: it reports `workersCount` against
+# the queue keyed by our exact `container-image` routing key. Once it goes to
+# >= 1, the worker is registered, plain and simple.
 #
-#   2. Scheduler-side "platform queue exists":
-#      The scheduler admin root page (:7982) lists each platform queue with
-#      its container-image SHA. If our worker registered, our pool's queue
-#      will appear there. Hostnames are NOT shown at this level (they live
-#      on a drill-down sub-page that we don't try to scrape).
+# Earlier versions of this function tried to scrape the scheduler admin HTML
+# page (`curl :7982 | grep 'Pool="x86_64"'`). That was unreliable because
+# the page HTML-encodes the quotes (`Pool=&#34;x86_64&#34;`) and because as
+# soon as we have predeclared queues, every queue contains `Pool="x86_64"`,
+# so the marker was either always-true or always-false depending on URL
+# encoding. The gRPC path is exact and matches one queue only — the one
+# we're actually trying to fill.
 #
-# A worker is declared "registered" only if both signals agree — accidental
-# silence on the worker side without scheduler-side queue creation usually
-# means the scheduler dropped the connection and we'd otherwise miss it.
+# The worker-side "no Fatal error in the last 15 s" probe was also dropped:
+# the bb-worker image is distroless and defaults to logging only WARN+, so
+# `docker logs` is permanently empty in healthy operation. That made the
+# probe a useless (and misleading) tautology.
 # -----------------------------------------------------------------------------
-
-# The platform property string we look for in the scheduler page. Built from
-# $BAZEL_POOL_VALUE so aarch64 pools (future) find their own queue instead of
-# scraping a hardcoded "x86_64" that will never appear for them.
-SCHEDULER_POOL_MARKER="Pool=\"$BAZEL_POOL_VALUE\""
 
 verify_registered() {
   step "Verify registration"
 
-  log "waiting up to ~3 min for worker '$WORKER_HOSTNAME' to settle …"
+  log "waiting up to ~3 min for worker '$WORKER_HOSTNAME' to register against \
+queue container-image=$CONTAINER_IMAGE …"
 
-  local i worker_quiet=0 scheduler_sees_pool=0
+  local i workers_count=0 last_state="(not yet checked)"
   for i in {1..36}; do
     sleep 5
-    [[ $((i % 6)) -eq 0 ]] && log "  still waiting ($((i * 5)) s elapsed) …"
+    [[ $((i % 6)) -eq 0 ]] && log "  still waiting ($((i * 5)) s elapsed; $last_state) …"
 
-    # Signal 1 — worker side. `docker compose logs --since 15s worker` returns
-    # only the last 15 s. Empty (or no Fatal) means worker is healthy.
-    local recent_fatal
-    recent_fatal=$(rssh "cd $REMOTE_BASE && docker compose logs --no-color --since 15s worker 2>/dev/null | grep -c 'Fatal error' || true")
-    if [[ "$recent_fatal" =~ ^0+$ ]] || [[ -z "$recent_fatal" ]]; then
-      worker_quiet=1
-    else
-      worker_quiet=0
+    # Pull the full BuildQueueState JSON over SSH→docker-exec to the central's
+    # `scaler` container (which already has grpcurl bundled and is on the
+    # right Docker network for localhost:8984). Filter locally with jq so we
+    # don't have to escape it through ssh quotes.
+    local queue_json
+    queue_json=$(central_ssh \
+      "cd /var/lib/buildbarn/compose && docker compose exec -T scaler \
+       grpcurl -plaintext localhost:8984 \
+         buildbarn.buildqueuestate.BuildQueueState/ListPlatformQueues \
+       2>/dev/null" || true)
+
+    if [[ -z "$queue_json" ]]; then
+      last_state="scheduler unreachable"
+      continue
     fi
 
-    # Signal 2 — scheduler side. Just check that our pool is listed at all.
-    if curl -sS -m 5 "http://$CENTRAL_PUBLIC_IP:7982/" \
-         | grep -qF "$SCHEDULER_POOL_MARKER"; then
-      scheduler_sees_pool=1
-    fi
+    # Sum workersCount across every sizeClassQueue of every platformQueue
+    # whose `container-image` property matches our routing key exactly.
+    # `// 0` keeps jq happy when the field is absent on cold queues.
+    workers_count=$(printf '%s' "$queue_json" \
+      | jq -r --arg img "$CONTAINER_IMAGE" '
+          [ .platformQueues[]
+            | select(.name.platform.properties[]?
+                | select(.name == "container-image") | .value == $img)
+            | .sizeClassQueues[]?.workersCount // 0
+          ] | add // 0' 2>/dev/null \
+      || echo 0)
 
-    if [[ "$worker_quiet" -eq 1 && "$scheduler_sees_pool" -eq 1 ]]; then
-      ok "worker is quiet (no recent fatals) and pool is registered on scheduler"
+    last_state="workers=$workers_count"
+
+    if [[ "${workers_count:-0}" =~ ^[0-9]+$ ]] && (( workers_count >= 1 )); then
+      ok "worker is registered ($workers_count slot(s) on the scheduler)"
       ok "scheduler admin: http://$CENTRAL_PUBLIC_IP:7982/"
       return
     fi
   done
 
-  warn "worker did NOT pass both readiness signals after ~3 min."
-  warn "  worker_quiet=$worker_quiet  scheduler_sees_pool=$scheduler_sees_pool"
+  warn "worker did NOT show up in scheduler queue after ~3 min ($last_state)."
   warn "The VM is up — investigate with:"
   warn "  ssh -i $SSH_PRIV_KEY root@$PUBLIC_IP 'cd $REMOTE_BASE && docker compose logs --tail=100 worker runner'"
-  warn "  curl -s http://$CENTRAL_PUBLIC_IP:7982/ | grep -A1 hardlinking"
+  warn "  ssh -i $SSH_PRIV_KEY root@$CENTRAL_PUBLIC_IP \\"
+  warn "    'cd /var/lib/buildbarn/compose && docker compose exec -T scaler \\"
+  warn "       grpcurl -plaintext localhost:8984 \\"
+  warn "         buildbarn.buildqueuestate.BuildQueueState/ListPlatformQueues' | \\"
+  warn "    jq '.platformQueues[] | select(.sizeClassQueues[]?.workersCount // 0 > 0)'"
 }
 
 # -----------------------------------------------------------------------------
