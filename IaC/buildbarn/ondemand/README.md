@@ -377,6 +377,104 @@ YAML until the corresponding PSMDB release goes EOL, so multiple active
 release tags (e.g. `release-8.0.20-8` and `release-8.0.21-9`) coexist
 without cache-poisoning each other.
 
+## Onboarding a PSMDB branch to RBE
+
+Routing PSMDB Bazel actions to this RBE cluster requires changes in the
+**`percona-server-mongodb` fork** (not in this repo). Per-branch state
+diverges between `v8.0`, `v8.3`, and `master`, so each branch is patched
+**individually** in agent mode rather than via a shared patch set — code in
+`bazel/platforms/` and `bazel/wrapper_hook/` evolves between PSMDB releases
+and not every change applies to every branch.
+
+### Files modified per branch
+
+| File | v8.0 | v8.3 | master | Purpose |
+| ---- | ---- | ---- | ------ | ------- |
+| `.bazelrc.psmdb` | yes | yes | yes | adds the `psmdb_buildfarm` config group (RBE endpoint, instance name, gRPC keepalive, spawn strategy). v8.3 and master also include `common:psmdb_buildfarm --//bazel/config:build_enterprise=False` defensively (see wrapper_hook row) — the file-wide `build --build_enterprise=False` line covers the legacy bool flag, but the Starlark flag wired through `--//bazel/config:` needs explicit pinning when the wrapper hook stops auto-injecting it |
+| `bazel/platforms/psmdb_rbe_containers.bzl` (new) | yes | yes | yes | maps each supported `distro_or_os` to a `ghcr.io/vorsel/psmdb-buildbarn-runners` immutable tag. Per-branch `<version-prefix>-<git-sha>` ensures action-cache isolation between branches |
+| `bazel/platforms/platform_util.bzl` | yes | yes | yes | overlays `PSMDB_REMOTE_EXECUTION_CONTAINERS` over upstream `REMOTE_EXECUTION_CONTAINERS` for explicit `//bazel/platforms:<distro>_<arch>` targets. v8.3/master variant is structurally different from v8.0 (no kernel-constraint logic) — patch is hand-adapted per branch |
+| `bazel/platforms/local_config_platform.bzl` | yes | yes | yes | same overlay for the auto-generated host platform, so `bazel build` without `--platforms=` routes to the correct `ghcr.io` worker queue |
+| `bazel/wrapper_hook/wrapper_hook.py` | **n/a** | yes | yes | the hook is a minimal passthrough on v8.0 (no `--config=local` auto-injection logic), but on v8.3 and master upstream extended it to auto-inject `--config=local` whenever `src/mongo/db/modules/enterprise` is missing — which is *always* true for PSMDB. That injection silently resets `--remote_executor` and `--remote_cache` to empty and forces a fully local build. Patch skips the auto-injection when `--config=psmdb_buildfarm` is on the command line. v8.0 needs no patch. **Verify before assuming**: `head -1 bazel/wrapper_hook/wrapper_hook.py` — if it starts with `import os` (v8.0-style), no patch needed; if it starts with `#!/usr/bin/env python3` and has an `enterprise_mod` check, patch is needed |
+
+### Cache isolation between branches
+
+The routing key Bazel sends is the full `docker://ghcr.io/...:<version-prefix>-<sha>`
+URL. v8.0 builds emit `:8.0-<sha>`, v8.3 → `:8.3-<sha>`, master → `:master-<sha>`.
+The version prefix is part of the platform property hashed into the action
+digest, so **action-cache hits do not cross PSMDB release branches by
+design**. First build on a freshly-onboarded branch is always 0% remote
+cache hit; cache hits start showing on subsequent builds of the *same*
+branch (and across release patches if the immutable tag's git-sha is held
+constant — bumping the sha invalidates the cache deliberately).
+
+### Closing PSMDB-2034: PRs to open
+
+Once all three branches build green via `--config=psmdb_buildfarm`, open one
+PR per branch against `vorsel/percona-server-mongodb`:
+
+- [ ] `PSMDB-2034_psmdb_rbe_containers` → **`v8.0`**
+- [ ] `PSMDB-2034_psmdb_rbe_containers__v8.3` → **`v8.3`**
+- [ ] `PSMDB-2034_psmdb_rbe_containers__master` → **`master`**
+
+Each PR body should link back to this README's "Onboarding a PSMDB branch
+to RBE" section and to the corresponding successful Jenkins build summary
+(actions ran, remote / local / internal split, wall time vs critical path).
+
+## aarch64 worker support
+
+Status: **gated on multi-arch image refactor**. The PSMDB-side `Pool`
+exec property was already moved from upstream's `"default"` (an
+EngFlow-specific ARM64 pool name) to `"aarch64"` so the routing key
+will match once arm64 worker pools come online — see the `Pool` line
+in PSMDB v8.0's `bazel/platforms/{platform_util,local_config_platform}.bzl`.
+The remaining work to enable arm64 builds:
+
+1. **Refactor the GHA workflow**
+   `.github/workflows/build-psmdb-buildbarn-runners.yml` — collapse
+   the current `-x86_64` / `-aarch64` single-arch tag pair into a
+   single multi-arch manifest list per `(distro, version, sha)`.
+   Two viable shapes:
+   - matrix split per arch + `docker manifest create / docker buildx
+     imagetools create` merge step (faster, native runners per arch)
+   - single `docker buildx build --platform linux/amd64,linux/arm64`
+     job (simpler, but cross-arch via QEMU is ~10× slower for arm64)
+2. **Bump immutable tags in `psmdb_rbe_containers.bzl`** for v8.0
+   (and later v8.3 / master) to drop the `-x86_64` suffix from each
+   `container-url`. Same git-sha bump pattern as before — this
+   invalidates the existing 18-pool action cache because the routing
+   key changes byte-for-byte. Acceptable cost: ~3,200 cache hits on
+   v8.0 will be re-executed once.
+3. **Add 5 aarch64 pool entries** to
+   `compose/config/ondemand-pools.yaml`, one per supported distro
+   (no `debian-bookworm-aarch64` — that distro has no `-aarch64` row
+   in the GHA matrix). All 5 share `server_type: cax31` (Hetzner ARM
+   Neoverse, 8c/16GB, €0.0256/h, fsn1/hel1/nbg1) and reference the
+   SAME `runner_image` URL as their x86_64 sibling — the manifest
+   list resolves to the right layer per worker arch automatically.
+4. **Spawn a Hetzner cax31 build host** running PSMDB on the
+   `PSMDB-2034_psmdb_rbe_containers` branch and confirm the RBE
+   build dispatches to arm64 workers (`Pool=aarch64` matches; image
+   pull resolves arm64 layer; `bazel build install-dist-test`
+   completes with `remote=` >> `local=`).
+
+### Why multi-arch over per-arch tags
+
+A single multi-arch manifest list keeps the routing key string
+identical across arches; only the `Pool` exec property differs. That
+keeps `psmdb_rbe_containers.bzl` simple (flat string per distro) and
+lets the same `runner_image` URL be reused by both x86_64 and aarch64
+pool entries — no nested-dict structure, no arch-aware lookup logic,
+no debian-bookworm fallback edge case to model in Starlark.
+
+### Follow-ups still open
+
+- [ ] If GHA capacity for `cax31` becomes a bottleneck, generalise the
+  scaler's region round-robin to a `(server_type, region)` round-robin
+  so a stuck `cax31` order can fall back to `cax21` / `cax41`.
+- [ ] If we ever need debian-bookworm on arm64, add the
+  `debian-bookworm-aarch64` row to the GHA matrix first (or
+  multi-arch the existing `debian-bookworm` row).
+
 ## What's *not* here yet
 
 | Future component | Status | Lives in |

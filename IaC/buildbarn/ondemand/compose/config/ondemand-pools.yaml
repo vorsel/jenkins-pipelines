@@ -143,10 +143,21 @@ global:
 # below). The pool key short-sha is the first 12 chars of that git-sha.
 #
 # Coverage: 6 x86_64 distros × 3 PSMDB versions = 18 pools. aarch64 pools
-# are NOT scaffolded yet (would need Hetzner CAX server types, arm64 GHA
-# runners verified, arm64 host Debian image). The structure here is
-# arch-symmetric — adding aarch64 is a copy/paste with s/cpx42/cax41/,
-# s/x86_64/aarch64/, s/amd64/arm64/ once the runner images land.
+# are NOT scaffolded yet (gated on the GHA workflow
+# .github/workflows/build-psmdb-buildbarn-runners.yml being refactored to
+# emit multi-arch manifest lists per (distro, version, sha) — currently it
+# publishes single-arch tags with `-x86_64` / `-aarch64` suffixes). Once
+# multi-arch tags land:
+#   * drop the `-x86_64` suffix from existing pool entries' `runner_image`
+#     (a fresh git-sha bump in the PSMDB-side psmdb_rbe_containers.bzl
+#     does the cache invalidation in lockstep)
+#   * add a sibling `<distro>-aarch64__v<ver>__<short-sha>` pool entry per
+#     existing x86_64 pool, with the SAME `runner_image` URL (the manifest
+#     list is shared) but `bazel_pool_value: aarch64` and
+#     `server_type: cax31` (Hetzner ARM Neoverse, 8c/16GB, €0.0256/h —
+#     same hel1/fsn1/nbg1 availability as cpx42).
+# debian-bookworm has no `-aarch64` row in the current GHA matrix; adding
+# arm64 coverage there is a prerequisite for a 6th aarch64 distro.
 pools:
 
   # ==========================================================================

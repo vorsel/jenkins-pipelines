@@ -1,33 +1,53 @@
 name: build-psmdb-buildbarn-runners
 
-# Builds the PSMDB BuildBarn runner images across three dimensions:
-#   - 11 (distro, arch) pairs defined by IaC/buildbarn/runners/<name>/Dockerfile,
-#     taken 1:1 from the parallel stages of
-#     psmdb/jenkins/percona-server-for-mongodb-8.3.groovy (see
-#     IaC/buildbarn/buildbarn-ondemand-scaler.md §3.1)
-#   - 3 PSMDB release lines: 8.0, 8.3, master — each with its own
-#     psmdb_builder_<version>.sh copy in IaC/buildbarn/runners/
+# Builds the PSMDB RBE runner images on GHCR as multi-arch manifest lists.
 #
-# Total matrix: 11 × 3 = 33 jobs. Each pushes to
-#   ghcr.io/<owner>/psmdb-buildbarn-runners/<runner>:<version>-<sha>   (immutable)
-#   ghcr.io/<owner>/psmdb-buildbarn-runners/<runner>:<version>          (moving)
+# Shape (Docker docs "distribute build across multiple runners"
+# https://docs.docker.com/build/ci/github-actions/multi-platform/):
 #
-# Version tagging lets a single runner repo (e.g. ubuntu-noble-x86_64) carry
-# one tag per PSMDB release line, so BuildBarn worker configs pin images by
-# `container-image=ghcr.io/.../<runner>:<version>-<sha>` and we can route
-# different PSMDB client builds to the right deps without duplicating repos.
+#   1. `build` matrix → 33 jobs: psmdb_version × distro × platform, with one
+#      exclude for debian-bookworm/linux-arm64. Each job builds its single-arch
+#      image, pushes it to GHCR by-digest only (no tag yet) and uploads the
+#      sha256 digest as a workflow artifact.
+#   2. `merge` matrix → 18 jobs: psmdb_version × distro. Downloads the per-arch
+#      digest artifacts for one (version, distro) pair and stitches them into a
+#      single multi-arch tag with `docker buildx imagetools create`.
+#   3. `report` aggregates build + merge into one status check suitable for
+#      branch protection.
 #
-# aarch64 images build natively on GitHub-hosted ARM runners
-# (`ubuntu-24.04-arm`, free for public repos), avoiding 10-20x QEMU
-# emulation overhead. If ARM runners become unavailable, swap
-# runs_on: ubuntu-24.04-arm -> ubuntu-24.04 and add `docker/setup-qemu-action`
-# — the Dockerfiles themselves are identical for both archs.
+# Image naming on GHCR (lowercased owner; one image per distro, no arch suffix):
+#   ghcr.io/<owner>/psmdb-buildbarn-runners/<distro>:<version>-<sha>   (immutable)
+#   ghcr.io/<owner>/psmdb-buildbarn-runners/<distro>:<version>          (moving)
+#
+# debian-bookworm is amd64-only (no aarch64 source dir on this branch). Its
+# manifest list will contain a single linux/amd64 entry — that's a valid
+# manifest list and intentional; the PSMDB Bazel side never schedules an
+# arm64 worker for the debian-bookworm pool.
+#
+# Per-arch Dockerfiles still live under
+#   IaC/buildbarn/runners/<distro>-x86_64/Dockerfile
+#   IaC/buildbarn/runners/<distro>-aarch64/Dockerfile
+# (they only differ in LABEL metadata; the build body is identical). Keeping
+# both dirs as-is gives a clean checkout-and-build per arch with no Dockerfile
+# munging — deduplicating is out of scope for this PR.
+#
+# Routing-key implication on the PSMDB Bazel side: each distro now resolves to
+# ONE multi-arch URL in psmdb_rbe_containers.bzl. The arch dimension is no
+# longer carried in the image name; it lives only in the `Pool` exec property
+# (see PSMDB v8.0 bazel/platforms/{platform_util,local_config_platform}.bzl),
+# which is what routes a worker request to the matching native-arch BuildBarn
+# worker pool.
+#
+# Native ARM is preserved: linux/arm64 build matrix entries pin
+# runs_on: ubuntu-24.04-arm to avoid 10–20× QEMU emulation overhead. If those
+# runners ever become unavailable, swap to ubuntu-24.04 + docker/setup-qemu
+# at the build job level only (merge stays unchanged).
 
 on:
   workflow_dispatch:
     inputs:
-      variants:
-        description: "Subset of runners to build (space-separated; empty = all 11)"
+      distros:
+        description: "Subset of distros to build (space-separated; empty = all)"
         required: false
         default: ""
       versions:
@@ -60,7 +80,7 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.runner }} (psmdb-${{ matrix.psmdb_version }})
+    name: build ${{ matrix.distro }}/${{ matrix.platform_pair }} (psmdb-${{ matrix.psmdb_version }})
     runs-on: ${{ matrix.runs_on }}
     permissions:
       contents: read
@@ -70,85 +90,62 @@ jobs:
       fail-fast: false
       max-parallel: 10
       matrix:
-        # Cartesian product of psmdb_version × runner (3 × 11 = 33 combinations).
-        # The `include` entries below add `platform` and `runs_on` fields to
-        # each (version, runner) cell based on the runner name — they do NOT
-        # introduce new combinations.
+        # Cartesian product of psmdb_version × distro × platform, minus the
+        # debian-bookworm/arm64 cell (no aarch64 source dir). 6×3×2 − 1×3 = 33.
+        # The `include` entries below add per-platform attributes
+        # (arch_suffix, runs_on, platform_pair); they do NOT introduce new
+        # combinations.
         psmdb_version:
           - "8.0"
           - "8.3"
           - "master"
-        runner:
-          - oraclelinux-8-x86_64
-          - oraclelinux-8-aarch64
-          - oraclelinux-9-x86_64
-          - oraclelinux-9-aarch64
-          - amazonlinux-2023-x86_64
-          - amazonlinux-2023-aarch64
-          - ubuntu-jammy-x86_64
-          - ubuntu-jammy-aarch64
-          - ubuntu-noble-x86_64
-          - ubuntu-noble-aarch64
-          - debian-bookworm-x86_64
+        distro:
+          - oraclelinux-8
+          - oraclelinux-9
+          - amazonlinux-2023
+          - ubuntu-jammy
+          - ubuntu-noble
+          - debian-bookworm
+        platform:
+          - linux/amd64
+          - linux/arm64
+        exclude:
+          - distro: debian-bookworm
+            platform: linux/arm64
         include:
-          - runner: oraclelinux-8-x86_64
-            platform: linux/amd64
+          - platform: linux/amd64
+            arch_suffix: x86_64
             runs_on: ubuntu-24.04
-          - runner: oraclelinux-8-aarch64
-            platform: linux/arm64
+            platform_pair: linux-amd64
+          - platform: linux/arm64
+            arch_suffix: aarch64
             runs_on: ubuntu-24.04-arm
-          - runner: oraclelinux-9-x86_64
-            platform: linux/amd64
-            runs_on: ubuntu-24.04
-          - runner: oraclelinux-9-aarch64
-            platform: linux/arm64
-            runs_on: ubuntu-24.04-arm
-          - runner: amazonlinux-2023-x86_64
-            platform: linux/amd64
-            runs_on: ubuntu-24.04
-          - runner: amazonlinux-2023-aarch64
-            platform: linux/arm64
-            runs_on: ubuntu-24.04-arm
-          - runner: ubuntu-jammy-x86_64
-            platform: linux/amd64
-            runs_on: ubuntu-24.04
-          - runner: ubuntu-jammy-aarch64
-            platform: linux/arm64
-            runs_on: ubuntu-24.04-arm
-          - runner: ubuntu-noble-x86_64
-            platform: linux/amd64
-            runs_on: ubuntu-24.04
-          - runner: ubuntu-noble-aarch64
-            platform: linux/arm64
-            runs_on: ubuntu-24.04-arm
-          - runner: debian-bookworm-x86_64
-            platform: linux/amd64
-            runs_on: ubuntu-24.04
+            platform_pair: linux-arm64
 
     steps:
-      - name: Skip if variant or version filtered out
+      - name: Skip if distro or version filtered out
         id: filter
         shell: bash
         env:
-          VARIANTS_FILTER: ${{ github.event.inputs.variants }}
+          DISTROS_FILTER: ${{ github.event.inputs.distros }}
           VERSIONS_FILTER: ${{ github.event.inputs.versions }}
-          THIS_RUNNER: ${{ matrix.runner }}
+          THIS_DISTRO: ${{ matrix.distro }}
           THIS_VERSION: ${{ matrix.psmdb_version }}
         run: |
-          # Variant filter (runner name)
-          if [[ -n "${VARIANTS_FILTER}" ]]; then
+          # Distro filter
+          if [[ -n "${DISTROS_FILTER}" ]]; then
             hit="false"
-            for v in ${VARIANTS_FILTER}; do
-              if [[ "${v}" == "${THIS_RUNNER}" ]]; then hit="true"; break; fi
+            for v in ${DISTROS_FILTER}; do
+              if [[ "${v}" == "${THIS_DISTRO}" ]]; then hit="true"; break; fi
             done
             if [[ "${hit}" == "false" ]]; then
-              echo "runner ${THIS_RUNNER} not in variants filter [${VARIANTS_FILTER}], skipping"
+              echo "distro ${THIS_DISTRO} not in distros filter [${DISTROS_FILTER}], skipping"
               echo "run=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           fi
 
-          # Version filter (psmdb_version)
+          # Version filter
           if [[ -n "${VERSIONS_FILTER}" ]]; then
             hit="false"
             for v in ${VERSIONS_FILTER}; do
@@ -189,7 +186,7 @@ jobs:
           # GHCR paths must be lowercase; repo owners like "Percona" would
           # otherwise cause 400 at push time.
           OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          IMAGE="${REGISTRY}/${OWNER}/${IMAGE_NAMESPACE}/${{ matrix.runner }}"
+          IMAGE="${REGISTRY}/${OWNER}/${IMAGE_NAMESPACE}/${{ matrix.distro }}"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "cache_bust=$(date +%s)" >> "$GITHUB_OUTPUT"
 
@@ -201,33 +198,17 @@ jobs:
           SCRIPT_PATH="IaC/buildbarn/runners/psmdb_builder_${SLUG}.sh"
           echo "script_path=${SCRIPT_PATH}" >> "$GITHUB_OUTPUT"
 
-          # Tag set:
-          #   :<version>-<sha> — immutable, for production worker pinning
-          #   :<version>       — moving alias, for dev iteration (default on)
-          # Disable the moving tag with push_moving=false for isolated branch
-          # experiments that must not overwrite the current :<version> pointer.
-          TAGS="${IMAGE}:${PSMDB_VERSION}-${{ github.sha }}"
-          PUSH_MOVING="${{ github.event.inputs.push_moving }}"
-          if [[ -z "${PUSH_MOVING}" || "${PUSH_MOVING}" == "true" ]]; then
-            TAGS="${TAGS}"$'\n'"${IMAGE}:${PSMDB_VERSION}"
-          fi
-          {
-            echo "tags<<EOF"
-            echo "${TAGS}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Build and push ${{ matrix.runner }} (psmdb-${{ matrix.psmdb_version }})
+      - name: Build and push by digest
         if: steps.filter.outputs.run == 'true'
+        id: build
         uses: docker/build-push-action@v6
         with:
-          context: IaC/buildbarn/runners/${{ matrix.runner }}
-          file: IaC/buildbarn/runners/${{ matrix.runner }}/Dockerfile
+          context: IaC/buildbarn/runners/${{ matrix.distro }}-${{ matrix.arch_suffix }}
+          file: IaC/buildbarn/runners/${{ matrix.distro }}-${{ matrix.arch_suffix }}/Dockerfile
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
           provenance: false
           sbom: false
-          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           build-args: |
             JENKINS_PIPELINES_REPO=https://github.com/${{ github.repository }}.git
             JENKINS_PIPELINES_BRANCH=${{ github.ref_name }}
@@ -240,41 +221,231 @@ jobs:
             org.opencontainers.image.created=${{ github.event.repository.updated_at }}
             org.percona.psmdb.version=${{ matrix.psmdb_version }}
 
-      - name: Summarize
-        if: steps.filter.outputs.run == 'true'
+      - name: Export digest
+        if: steps.filter.outputs.run == 'true' && github.event_name != 'pull_request'
         shell: bash
         run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          if [[ -z "${digest}" ]]; then
+            echo "build-push-action produced no digest" >&2
+            exit 1
+          fi
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: steps.filter.outputs.run == 'true' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.distro }}-${{ matrix.psmdb_version }}-${{ matrix.platform_pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge ${{ matrix.distro }} (psmdb-${{ matrix.psmdb_version }})
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        psmdb_version:
+          - "8.0"
+          - "8.3"
+          - "master"
+        distro:
+          - oraclelinux-8
+          - oraclelinux-9
+          - amazonlinux-2023
+          - ubuntu-jammy
+          - ubuntu-noble
+          - debian-bookworm
+
+    steps:
+      - name: Skip if distro or version filtered out
+        id: filter
+        shell: bash
+        env:
+          DISTROS_FILTER: ${{ github.event.inputs.distros }}
+          VERSIONS_FILTER: ${{ github.event.inputs.versions }}
+          THIS_DISTRO: ${{ matrix.distro }}
+          THIS_VERSION: ${{ matrix.psmdb_version }}
+        run: |
+          if [[ -n "${DISTROS_FILTER}" ]]; then
+            hit="false"
+            for v in ${DISTROS_FILTER}; do
+              if [[ "${v}" == "${THIS_DISTRO}" ]]; then hit="true"; break; fi
+            done
+            if [[ "${hit}" == "false" ]]; then
+              echo "distro ${THIS_DISTRO} not in distros filter [${DISTROS_FILTER}], skipping"
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if [[ -n "${VERSIONS_FILTER}" ]]; then
+            hit="false"
+            for v in ${VERSIONS_FILTER}; do
+              if [[ "${v}" == "${THIS_VERSION}" ]]; then hit="true"; break; fi
+            done
+            if [[ "${hit}" == "false" ]]; then
+              echo "version ${THIS_VERSION} not in versions filter [${VERSIONS_FILTER}], skipping"
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        if: steps.filter.outputs.run == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.distro }}-${{ matrix.psmdb_version }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        if: steps.filter.outputs.run == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.filter.outputs.run == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        if: steps.filter.outputs.run == 'true'
+        id: meta
+        shell: bash
+        env:
+          PSMDB_VERSION: ${{ matrix.psmdb_version }}
+        run: |
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${REGISTRY}/${OWNER}/${IMAGE_NAMESPACE}/${{ matrix.distro }}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+          # Tag set:
+          #   :<version>-<sha> — immutable, for production worker pinning
+          #   :<version>       — moving alias, for dev iteration (default on)
+          # Disable the moving tag with push_moving=false for isolated branch
+          # experiments that must not overwrite the current :<version> pointer.
+          IMMUTABLE="${IMAGE}:${PSMDB_VERSION}-${{ github.sha }}"
+          MOVING="${IMAGE}:${PSMDB_VERSION}"
+          TAGS="${IMMUTABLE}"
+          PUSH_MOVING="${{ github.event.inputs.push_moving }}"
+          if [[ -z "${PUSH_MOVING}" || "${PUSH_MOVING}" == "true" ]]; then
+            TAGS="${TAGS}"$'\n'"${MOVING}"
+          fi
+          echo "immutable=${IMMUTABLE}" >> "$GITHUB_OUTPUT"
           {
-            echo "### ${{ matrix.runner }} — psmdb-${{ matrix.psmdb_version }} (${{ matrix.platform }})"
-            echo ""
-            echo "Script: \`${{ steps.meta.outputs.script_path }}\`"
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create manifest list and push
+        if: steps.filter.outputs.run == 'true'
+        working-directory: ${{ runner.temp }}/digests
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          shopt -s nullglob
+          digest_files=( * )
+          if [[ ${#digest_files[@]} -eq 0 ]]; then
+            echo "no digest files found under ${PWD}; build matrix produced nothing to merge" >&2
+            exit 1
+          fi
+
+          tag_args=()
+          while IFS= read -r tag; do
+            [[ -n "${tag}" ]] && tag_args+=( -t "${tag}" )
+          done <<< "${TAGS}"
+
+          digest_args=()
+          for f in "${digest_files[@]}"; do
+            digest_args+=( "${IMAGE}@sha256:${f}" )
+          done
+
+          echo "Creating manifest list:"
+          printf '  %s\n' "${tag_args[@]}"
+          echo "From digests:"
+          printf '  %s\n' "${digest_args[@]}"
+
+          docker buildx imagetools create "${tag_args[@]}" "${digest_args[@]}"
+
+      - name: Inspect image and summarize
+        if: steps.filter.outputs.run == 'true'
+        shell: bash
+        env:
+          IMMUTABLE: ${{ steps.meta.outputs.immutable }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          inspect_out="$(docker buildx imagetools inspect "${IMMUTABLE}")"
+          echo "${inspect_out}"
+
+          # Pull architectures out of the inspect output; format is e.g.
+          #   Platform:    linux/amd64
+          archs="$(echo "${inspect_out}" \
+            | awk '/^[[:space:]]*Platform:/ {print $2}' \
+            | sort -u \
+            | paste -sd ', ' -)"
+
+          {
+            echo "### ${{ matrix.distro }} — psmdb-${{ matrix.psmdb_version }}"
             echo ""
             echo "Pushed tags:"
             echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
+            echo "${TAGS}"
             echo '```'
+            echo ""
+            echo "Architectures in manifest list: \`${archs:-unknown}\`"
             echo ""
             echo "Pull:"
             echo '```bash'
-            echo "docker pull ${{ steps.meta.outputs.image }}:${{ matrix.psmdb_version }}-${{ github.sha }}"
+            echo "docker pull ${IMMUTABLE}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Aggregate job surfaces a single "all green" status check suitable for
-  # branch protection; avoids requiring 33 separate checks to stay in sync.
+  # branch protection; avoids requiring 33 build + 18 merge separate checks
+  # to stay in sync.
   report:
     name: report
-    needs: build
+    needs: [build, merge]
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - name: Check matrix result
+      - name: Check matrix results
         shell: bash
         env:
-          RESULT: ${{ needs.build.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          MERGE_RESULT: ${{ needs.merge.result }}
         run: |
-          echo "build matrix result: ${RESULT}"
-          if [[ "${RESULT}" != "success" ]]; then
-            echo "one or more variant/version combinations failed"
-            exit 1
+          echo "build matrix result: ${BUILD_RESULT}"
+          echo "merge matrix result: ${MERGE_RESULT}"
+
+          # `merge` is skipped on pull_request events (push=false there); treat
+          # skipped as success so PR runs that only validate `build` still go
+          # green. Any actual failure or cancellation in either job fails the
+          # aggregate.
+          fail=0
+          if [[ "${BUILD_RESULT}" != "success" ]]; then
+            echo "build matrix did not succeed"
+            fail=1
           fi
+          if [[ "${MERGE_RESULT}" != "success" && "${MERGE_RESULT}" != "skipped" ]]; then
+            echo "merge matrix did not succeed"
+            fail=1
+          fi
+          exit "${fail}"
