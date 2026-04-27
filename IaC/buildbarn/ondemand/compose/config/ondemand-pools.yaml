@@ -84,16 +84,16 @@
 # bzl emits for `distro_or_os-arch`):
 # ===========================================================================
 #   ubuntu-noble-x86_64       → ubuntu24-amd64           → bzl key "ubuntu24"
-#   ubuntu-noble-aarch64      → ubuntu24-arm64           → bzl key "ubuntu24"           (v8.0 + v8.3)
+#   ubuntu-noble-aarch64      → ubuntu24-arm64           → bzl key "ubuntu24"           (all versions)
 #   ubuntu-jammy-x86_64       → ubuntu22-amd64           → bzl key "ubuntu22"
-#   ubuntu-jammy-aarch64      → ubuntu22-arm64           → bzl key "ubuntu22"           (v8.0 + v8.3)
+#   ubuntu-jammy-aarch64      → ubuntu22-arm64           → bzl key "ubuntu22"           (all versions)
 #   debian-bookworm-x86_64    → debian12-amd64           → bzl key "debian12"           (no aarch64 sibling)
 #   oraclelinux-8-x86_64      → rhel8-amd64              → bzl key "rhel8"              (OL8 ≡ RHEL8)
-#   oraclelinux-8-aarch64     → rhel8-arm64              → bzl key "rhel8"              (OL8 ≡ RHEL8, v8.0 + v8.3)
+#   oraclelinux-8-aarch64     → rhel8-arm64              → bzl key "rhel8"              (OL8 ≡ RHEL8, all versions)
 #   oraclelinux-9-x86_64      → rhel9-amd64              → bzl key "rhel9"              (OL9 ≡ RHEL9)
-#   oraclelinux-9-aarch64     → rhel9-arm64              → bzl key "rhel9"              (OL9 ≡ RHEL9, v8.0 + v8.3)
+#   oraclelinux-9-aarch64     → rhel9-arm64              → bzl key "rhel9"              (OL9 ≡ RHEL9, all versions)
 #   amazonlinux-2023-x86_64   → amazon_linux_2023-amd64  → bzl key "amazon_linux_2023"
-#   amazonlinux-2023-aarch64  → amazon_linux_2023-arm64  → bzl key "amazon_linux_2023"  (v8.0 + v8.3)
+#   amazonlinux-2023-aarch64  → amazon_linux_2023-arm64  → bzl key "amazon_linux_2023"  (all versions)
 
 global:
   # Scheduler endpoints the scaler itself talks to.
@@ -128,11 +128,11 @@ global:
   region_try_chain: [hel1, nbg1, fsn1]
 
   # Safety rails. The scaler REFUSES any action that would exceed these.
-  # 60 = 6 distros × 5 max nodes each (with up to ~3 active versions sharing
-  # capacity). In steady state at most ~6 pools burst to max simultaneously
-  # because Bazel clients usually target one (version, distro) per build.
-  # Revisit if we keep multiple release-tag pools warm at once or add aarch64
-  # pools.
+  # 60 = headroom for ~6 sibling pools bursting to max_nodes=5 simultaneously
+  # across the 33 declared pools (3 versions × {6 x86_64, 5 aarch64}). In
+  # steady state Bazel clients target one (version, distro, arch) per build,
+  # so one pool burst (≤5 nodes). Revisit if we keep multiple release-tag
+  # pools warm at once or raise per-pool max_nodes.
   max_total_nodes: 60                    # cap across all pools combined
   max_cost_per_hour_eur: 2.0             # sum of current VM hourly rates
 
@@ -143,31 +143,18 @@ global:
 
 # Pools. Each key becomes the Hetzner label `psmdb.pool=<key>` on spawned VMs.
 #
-# Current image generations (jenkins-pipelines tip at the matching GHA
-# build time; tag suffix in every runner_image below; pool key short-sha
-# is the first 12 chars):
-#   * v8.0 + v8.3: 9b28c6ee49dc0118fe6bab8b7e28a87f8979be81 (multi-arch)
-#   * master:      9873907c9659eb73f84e6d63571bca6667861f80 (single-arch, x86_64 only)
+# Current image generation: v8.0 / v8.3 / master all on multi-arch GHA
+# sha 9b28c6ee49dc0118fe6bab8b7e28a87f8979be81 (jenkins-pipelines tip
+# at GHA build time; tag suffix in every runner_image below; pool key
+# short-sha is the first 12 chars).
 #
 # Coverage:
-#   * v8.0 + v8.3 (multi-arch, GHA sha 9b28c6ee49dc):
-#       - 6 x86_64 pools per version (12 total)
-#       - 5 aarch64 sibling pools per version, no debian-bookworm
-#         (GHA matrix excludes debian-bookworm/arm64, so its manifest
-#         list is amd64-only) (10 total)
-#       Subtotal: 22 pools
-#   * master (still on the older single-arch GHA sha 9873907c9659):
-#       - 6 x86_64 pools, no aarch64 yet
-#       Subtotal: 6 pools
-#   * Total: 28 pools
-#
-# master will migrate to multi-arch + aarch64 in a follow-up, in lockstep
-# with its PSMDB-side `psmdb_rbe_containers.bzl` URL bumps:
-#   1. Repoint master `psmdb_rbe_containers.bzl` `container-url` values
-#      to the multi-arch tag `<distro>:master-<sha>` (drop `-x86_64`
-#      suffix, bump sha to a fresh GHA run).
-#   2. In this file: bump vmaster pool-key shas, drop `-x86_64` from
-#      `runner_image`, and add 5 aarch64 siblings.
+#   * 11 pools per psmdb_version (3 versions: v8.0, v8.3, master):
+#       - 6 x86_64 pools (one per distro)
+#       - 5 aarch64 sibling pools (no debian-bookworm: GHA matrix
+#         excludes debian-bookworm/arm64, so its manifest list is
+#         amd64-only)
+#   * Total: 33 pools
 #
 # Why aarch64 siblings can share `runner_image` with their x86_64 sibling:
 # the URL points to a multi-arch manifest list (one per (distro, version,
@@ -221,11 +208,20 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-noble-x86_64__vmaster__9873907c9659:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+  ubuntu-noble-x86_64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-noble-aarch64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+    bazel_pool_value: aarch64
+    psmdb_version: "master"
+    server_type: cax31
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
@@ -269,11 +265,20 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-jammy-x86_64__vmaster__9873907c9659:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+  ubuntu-jammy-x86_64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-jammy-aarch64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+    bazel_pool_value: aarch64
+    psmdb_version: "master"
+    server_type: cax31
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
@@ -303,8 +308,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-bookworm-x86_64__vmaster__9873907c9659:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+  debian-bookworm-x86_64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
@@ -351,11 +356,20 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-8-x86_64__vmaster__9873907c9659:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+  oraclelinux-8-x86_64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-8-aarch64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+    bazel_pool_value: aarch64
+    psmdb_version: "master"
+    server_type: cax31
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
@@ -399,11 +413,20 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-9-x86_64__vmaster__9873907c9659:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+  oraclelinux-9-x86_64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-9-aarch64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+    bazel_pool_value: aarch64
+    psmdb_version: "master"
+    server_type: cax31
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
@@ -447,11 +470,20 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  amazonlinux-2023-x86_64__vmaster__9873907c9659:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023-x86_64:master-9873907c9659eb73f84e6d63571bca6667861f80"
+  amazonlinux-2023-x86_64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  amazonlinux-2023-aarch64__vmaster__9b28c6ee49dc:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+    bazel_pool_value: aarch64
+    psmdb_version: "master"
+    server_type: cax31
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
