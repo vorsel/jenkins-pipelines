@@ -471,6 +471,114 @@ Server type for aarch64 pools is `cax31` (8-core ARM Neoverse,
 `cpx42`. Identical region availability (fsn1 / hel1 / nbg1) and
 hourly cost.
 
+### CppLink strategy: keep `local` (measured)
+
+Default and only supported strategy for PSMDB Jenkins jobs:
+
+```
+--strategy=CppCompile=remote,local \
+--strategy=CppLink=local \
+--strategy=CppArchive=local
+```
+
+Measured on the ubuntu-noble aarch64 v8.0 pool (`cax31`, 8-core ARM
+Neoverse, GHA sha `9b28c6ee49dc`, `--jobs=130`, `install-dist-test`):
+
+| Strategy | Warm cache | Cold cache | Δ critical path |
+| -------- | ---------- | ---------- | --------------- |
+| `CppLink=local` | **13–14 min** (788–838 s, CP 746–763 s) | **~34 min** (2031 s, CP 1497 s) | baseline |
+| `CppLink=remote` | ~21 min (1274 s, CP 1231 s) | ~49 min (2943 s, CP 2276 s) | **+60–65% warm, +52% cold** |
+
+Warm-cache row averages **two** consecutive runs (different
+`GIT_COMMIT_HASH`, same input set, fully populated remote cache);
+cold-cache row is **one** `bazel clean` + full build with the action
+cache pre-warmed. `CP` = Bazel-reported critical path; the
+wall-clock range on warm captures the natural run-to-run variance
+on `cax31`. Numbers will move when the runner image bumps to a new
+GHA sha (compiler / sysroot bytes change → action digests change →
+remote cache miss until that sha re-warms).
+
+Why remote linking is *slower* here:
+
+- Link actions are short (~1–3 s locally on `cax31`); remote overhead
+  per action (input `.o`/`.a` upload, queue wait, output `.so`
+  download) is 5–20 s. With ~1325 link actions, that overhead
+  dominates wall time even at `--jobs=130` parallelism.
+- `CppArchive` is unconditional `local` (1315 actions; same fixed
+  cost in both columns). Remote-linking only moves the *other*
+  ~1325 link actions off-host, so the win is bounded by half the
+  archive/link total at best — and gets fully consumed by per-action
+  network overhead.
+- Bazel's link-phase action graph is heavily serialised by library
+  dependency chains (low-level libs → high-level libs → final
+  binaries). Local link keeps the gap between waves at 1–3 s; remote
+  link blows it up to 5–20 s, which compounds across the chain.
+
+#### Known limitation: `coefficient` exec_property breaks `CppLink=remote`
+
+Upstream MongoDB's `bazel/mongo_src_rules.bzl` injects a
+`cpp_link.coefficient` exec_property on every link action (e.g. `"18.0"`
+when `compress_debug_compile=True` — our default; `"3.0"` otherwise),
+and a `cpp_link.cpus` exec_property when `thin_lto` or `bolt` is
+enabled (currently neither is in `psmdb_buildfarm`). Bazel strips the
+`cpp_link.` prefix and ships the bare `coefficient` / `cpus` properties
+to the RBE scheduler. EngFlow uses these for resource accounting;
+**bb-scheduler does not** — its
+[`PlatformKeyExtractorConfiguration`](https://github.com/buildbarn/bb-remote-execution/blob/master/pkg/proto/configuration/scheduler/scheduler.proto)
+does only EXACT match against `predeclaredPlatformQueues`, so the
+extra property turns the routing key into something that has no
+matching queue, and `Execute` fails:
+
+```
+FAILED_PRECONDITION: No workers exist for instance name prefix "hardlinking" platform
+  {"properties":[{"name":"Pool","value":"aarch64"},
+                 {"name":"coefficient","value":"18.0"},
+                 {"name":"container-image","value":"docker://..."},
+                 {"name":"dockerNetwork","value":"standard"}]}
+```
+
+If you see this error in any future re-evaluation of remote linking,
+the platform JSON in the message will tell you which extra property
+landed in the routing key. Three documented workarounds, in order of
+preference if/when remote linking ever stops being a measured loss
+(see table above):
+
+1. **Patch upstream MongoDB rules** (`bazel/mongo_src_rules.bzl`) in
+   the PSMDB fork to drop the `cpp_link.coefficient` /
+   `cpp_link.cpus` exec_properties under `--config=psmdb_buildfarm`.
+   Smallest blast radius — single file, single repo, scheduler
+   config stays untouched.
+2. **Demultiplexing actionRouter** in `scheduler.jsonnet` —
+   `DemultiplexingActionRouter` with one backend per
+   `(pool, coefficient, cpus)` combination, each forwarding to a
+   sub-router whose `static` `PlatformKeyExtractor` rewrites the
+   routing key back to the canonical 3-property tuple. **Caveat**:
+   bb-scheduler's `platform.Trie` is `map[platform_json_string]→…`,
+   so backend matching is EXACT on the platform's canonical JSON,
+   not subset / longest-prefix on properties. To cover all 23 pools
+   you'd need 23 × N backends (N = number of distinct
+   `coefficient` × `cpus` combinations the build emits).
+   `bake_predeclared()` would have to learn to enumerate them.
+   Adds a 3rd source-of-truth for the immutable image SHA on top of
+   `psmdb_rbe_containers.bzl` and `ondemand-pools.yaml`.
+3. **Fork `bb-remote-execution`** to add a property-filter
+   `PlatformKeyExtractor` (drop a configurable allowlist of
+   exec_properties before forming the routing key). Cleanest from
+   an architecture standpoint, highest maintenance burden — we'd
+   ship a forked scheduler image.
+
+We tried (2) for the `ubuntu-noble-aarch64__v8_0` pool as a
+spike — it works, but contains `--strategy=CppLink=remote` to one
+pool out of 23 (others still hit the same `FAILED_PRECONDITION`)
+and requires keeping the image SHA in lockstep across three files.
+Combined with the measurement above (remote linking is *slower*),
+the cost-benefit didn't justify keeping it. If link=remote ever
+becomes a net win (e.g. `mold` / `lld` with the sysroot prebaked
+into the runner image, or 16-core build hosts shifting the local
+linker bottleneck), revisit option (1) first — it's an order of
+magnitude smaller change than (2) and removes the `coefficient`
+issue at the source instead of routing around it.
+
 ### Follow-ups still open
 
 - [ ] Migrate v8.3 + master to multi-arch tags + add aarch64 sibling
