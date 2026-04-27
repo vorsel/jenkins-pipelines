@@ -422,47 +422,46 @@ to RBE" section and to the corresponding successful Jenkins build summary
 
 ## aarch64 worker support
 
-Status: **enabled on v8.0; v8.3 / master pending follow-up**.
+Status: **enabled on v8.0 + v8.3; master pending follow-up**.
 
 The GHA workflow `.github/workflows/build-psmdb-buildbarn-runners.yml`
 publishes a multi-arch manifest list per `(distro, version, sha)`
 (see "PSMDB-2034: refactor RBE runner workflow to multi-arch manifest
 lists"), so each distro carries one tag that resolves to either the
-amd64 or arm64 layer based on the worker's host arch. v8.0's PSMDB-side
-`bazel/platforms/psmdb_rbe_containers.bzl` was bumped to point at
-those multi-arch tags (`<distro>:8.0-9b28c6ee49dc...`, no
-`-x86_64` suffix), and `compose/config/ondemand-pools.yaml` got 5
-aarch64 sibling pool entries (one per distro except debian-bookworm —
-the GHA matrix excludes `debian-bookworm-aarch64`, so its manifest
-list is amd64-only).
+amd64 or arm64 layer based on the worker's host arch. v8.0 and v8.3
+PSMDB-side `bazel/platforms/psmdb_rbe_containers.bzl` are pinned to
+those multi-arch tags (`<distro>:<version>-9b28c6ee49dc...`, no
+`-x86_64` suffix), and `compose/config/ondemand-pools.yaml` carries
+5 aarch64 sibling pool entries per version (one per distro except
+debian-bookworm — the GHA matrix excludes `debian-bookworm-aarch64`,
+so its manifest list is amd64-only).
 
-### Routing key on v8.0
+### Routing key on v8.0 / v8.3
 
 For both x86_64 and aarch64 sibling pools the
 `container-image` routing key is byte-identical (same multi-arch URL).
 The discriminator that picks between sibling pools is the `Pool` exec
 property (`x86_64` vs `aarch64`), which both PSMDB Bazel and the
-worker registration emit in lockstep. PSMDB v8.0's
-`bazel/platforms/{platform_util,local_config_platform}.bzl` sets
+worker registration emit in lockstep. PSMDB v8.0 and v8.3
+`bazel/platforms/{platform_util,local_config_platform}.bzl` set
 `Pool=aarch64` for arm64 hosts (upstream's default of `"default"` was
 EngFlow-specific and would not match our worker queues).
 
-### Next: extend to v8.3 + master
+### Next: extend to master
 
 In a follow-up, in lockstep across the two repos:
 
-1. **`vorsel/percona-server-mongodb`** v8.3 and master branches —
+1. **`vorsel/percona-server-mongodb`** master branch —
    bump `bazel/platforms/psmdb_rbe_containers.bzl` `container-url`
    values to drop the `-x86_64` suffix and pin to the matching
-   multi-arch GHA sha (the same workflow run also publishes 8.3 and
-   master tags, so a single sha covers all three versions). Apply
-   the same `Pool=aarch64` patch that v8.0 already has on
+   multi-arch GHA sha (the same workflow run also publishes a master
+   tag, so a single sha covers all three versions). Apply the same
+   `Pool=aarch64` patch that v8.0 / v8.3 already have on
    `platform_util.bzl` and `local_config_platform.bzl`.
 2. **`Percona-Lab/jenkins-pipelines`** — in
-   `compose/config/ondemand-pools.yaml`: bump v8.3 / vmaster
-   pool-key shas and `runner_image` URLs to the new multi-arch tag
-   pattern, and add 5 aarch64 sibling pool entries per version
-   (10 total).
+   `compose/config/ondemand-pools.yaml`: bump vmaster pool-key shas
+   and `runner_image` URLs to the new multi-arch tag pattern, and
+   add 5 aarch64 sibling pool entries (5 total).
 
 ### Hetzner CAX
 
@@ -581,8 +580,8 @@ issue at the source instead of routing around it.
 
 ### Follow-ups still open
 
-- [ ] Migrate v8.3 + master to multi-arch tags + add aarch64 sibling
-  pool entries (see "Next" above).
+- [ ] Migrate master to multi-arch tags + add aarch64 sibling pool
+  entries (see "Next" above).
 - [ ] If GHA capacity for `cax31` becomes a bottleneck, generalise
   the scaler's region round-robin to a `(server_type, region)`
   round-robin so a stuck `cax31` order can fall back to
