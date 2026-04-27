@@ -422,58 +422,67 @@ to RBE" section and to the corresponding successful Jenkins build summary
 
 ## aarch64 worker support
 
-Status: **gated on multi-arch image refactor**. The PSMDB-side `Pool`
-exec property was already moved from upstream's `"default"` (an
-EngFlow-specific ARM64 pool name) to `"aarch64"` so the routing key
-will match once arm64 worker pools come online — see the `Pool` line
-in PSMDB v8.0's `bazel/platforms/{platform_util,local_config_platform}.bzl`.
-The remaining work to enable arm64 builds:
+Status: **enabled on v8.0; v8.3 / master pending follow-up**.
 
-1. **Refactor the GHA workflow**
-   `.github/workflows/build-psmdb-buildbarn-runners.yml` — collapse
-   the current `-x86_64` / `-aarch64` single-arch tag pair into a
-   single multi-arch manifest list per `(distro, version, sha)`.
-   Two viable shapes:
-   - matrix split per arch + `docker manifest create / docker buildx
-     imagetools create` merge step (faster, native runners per arch)
-   - single `docker buildx build --platform linux/amd64,linux/arm64`
-     job (simpler, but cross-arch via QEMU is ~10× slower for arm64)
-2. **Bump immutable tags in `psmdb_rbe_containers.bzl`** for v8.0
-   (and later v8.3 / master) to drop the `-x86_64` suffix from each
-   `container-url`. Same git-sha bump pattern as before — this
-   invalidates the existing 18-pool action cache because the routing
-   key changes byte-for-byte. Acceptable cost: ~3,200 cache hits on
-   v8.0 will be re-executed once.
-3. **Add 5 aarch64 pool entries** to
-   `compose/config/ondemand-pools.yaml`, one per supported distro
-   (no `debian-bookworm-aarch64` — that distro has no `-aarch64` row
-   in the GHA matrix). All 5 share `server_type: cax31` (Hetzner ARM
-   Neoverse, 8c/16GB, €0.0256/h, fsn1/hel1/nbg1) and reference the
-   SAME `runner_image` URL as their x86_64 sibling — the manifest
-   list resolves to the right layer per worker arch automatically.
-4. **Spawn a Hetzner cax31 build host** running PSMDB on the
-   `PSMDB-2034_psmdb_rbe_containers` branch and confirm the RBE
-   build dispatches to arm64 workers (`Pool=aarch64` matches; image
-   pull resolves arm64 layer; `bazel build install-dist-test`
-   completes with `remote=` >> `local=`).
+The GHA workflow `.github/workflows/build-psmdb-buildbarn-runners.yml`
+publishes a multi-arch manifest list per `(distro, version, sha)`
+(see "PSMDB-2034: refactor RBE runner workflow to multi-arch manifest
+lists"), so each distro carries one tag that resolves to either the
+amd64 or arm64 layer based on the worker's host arch. v8.0's PSMDB-side
+`bazel/platforms/psmdb_rbe_containers.bzl` was bumped to point at
+those multi-arch tags (`<distro>:8.0-9b28c6ee49dc...`, no
+`-x86_64` suffix), and `compose/config/ondemand-pools.yaml` got 5
+aarch64 sibling pool entries (one per distro except debian-bookworm —
+the GHA matrix excludes `debian-bookworm-aarch64`, so its manifest
+list is amd64-only).
 
-### Why multi-arch over per-arch tags
+### Routing key on v8.0
 
-A single multi-arch manifest list keeps the routing key string
-identical across arches; only the `Pool` exec property differs. That
-keeps `psmdb_rbe_containers.bzl` simple (flat string per distro) and
-lets the same `runner_image` URL be reused by both x86_64 and aarch64
-pool entries — no nested-dict structure, no arch-aware lookup logic,
-no debian-bookworm fallback edge case to model in Starlark.
+For both x86_64 and aarch64 sibling pools the
+`container-image` routing key is byte-identical (same multi-arch URL).
+The discriminator that picks between sibling pools is the `Pool` exec
+property (`x86_64` vs `aarch64`), which both PSMDB Bazel and the
+worker registration emit in lockstep. PSMDB v8.0's
+`bazel/platforms/{platform_util,local_config_platform}.bzl` sets
+`Pool=aarch64` for arm64 hosts (upstream's default of `"default"` was
+EngFlow-specific and would not match our worker queues).
+
+### Next: extend to v8.3 + master
+
+In a follow-up, in lockstep across the two repos:
+
+1. **`vorsel/percona-server-mongodb`** v8.3 and master branches —
+   bump `bazel/platforms/psmdb_rbe_containers.bzl` `container-url`
+   values to drop the `-x86_64` suffix and pin to the matching
+   multi-arch GHA sha (the same workflow run also publishes 8.3 and
+   master tags, so a single sha covers all three versions). Apply
+   the same `Pool=aarch64` patch that v8.0 already has on
+   `platform_util.bzl` and `local_config_platform.bzl`.
+2. **`Percona-Lab/jenkins-pipelines`** — in
+   `compose/config/ondemand-pools.yaml`: bump v8.3 / vmaster
+   pool-key shas and `runner_image` URLs to the new multi-arch tag
+   pattern, and add 5 aarch64 sibling pool entries per version
+   (10 total).
+
+### Hetzner CAX
+
+Server type for aarch64 pools is `cax31` (8-core ARM Neoverse,
+16 GB, 160 GB local, €0.0256/h) — Hetzner's ARM equivalent of
+`cpx42`. Identical region availability (fsn1 / hel1 / nbg1) and
+hourly cost.
 
 ### Follow-ups still open
 
-- [ ] If GHA capacity for `cax31` becomes a bottleneck, generalise the
-  scaler's region round-robin to a `(server_type, region)` round-robin
-  so a stuck `cax31` order can fall back to `cax21` / `cax41`.
-- [ ] If we ever need debian-bookworm on arm64, add the
-  `debian-bookworm-aarch64` row to the GHA matrix first (or
-  multi-arch the existing `debian-bookworm` row).
+- [ ] Migrate v8.3 + master to multi-arch tags + add aarch64 sibling
+  pool entries (see "Next" above).
+- [ ] If GHA capacity for `cax31` becomes a bottleneck, generalise
+  the scaler's region round-robin to a `(server_type, region)`
+  round-robin so a stuck `cax31` order can fall back to
+  `cax21` / `cax41`.
+- [ ] If we ever need debian-bookworm on arm64, add a
+  `debian-bookworm-aarch64` source dir + matrix entry in the GHA
+  workflow first; the manifest list will then carry both arches and
+  a sibling pool can be added without further Bazel-side changes.
 
 ## What's *not* here yet
 
