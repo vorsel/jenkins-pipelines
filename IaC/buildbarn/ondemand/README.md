@@ -454,6 +454,44 @@ Server type for aarch64 pools is `cax31` (8-core ARM Neoverse,
 `cpx42`. Identical region availability (fsn1 / hel1 / nbg1) and
 hourly cost.
 
+### Wall-clock vs arch (default `CppLink=local`)
+
+End-to-end `install-dist-test` builds against a freshly seeded
+remote action cache (`bazel clean` + same `GIT_COMMIT_HASH`, no
+local re-runs), GHA sha `9b28c6ee49dc`, `--jobs=130`. All numbers
+captured with the default strategy
+(`CppCompile=remote,local`, `CppLink=local`, `CppArchive=local`).
+
+| PSMDB | Pool | Server | Cache | Wall | Critical path | Total / remote actions |
+| ----- | ---- | ------ | ----- | ---- | ------------- | ---------------------- |
+| `master` | `ubuntu-noble-x86_64` | `cpx42` | cold | **25:49** (1549 s) | 264 s | 18 209 / 10 439 |
+| `master` | `ubuntu-noble-aarch64` | `cax31` | cold | **1:07:12** (3983 s) | 621 s | 18 202 / 10 432 |
+| `v8.3` | `ubuntu-noble-aarch64` | `cax31` | cold | **1:03:24** (3804 s) | 567 s | 17 849 / 10 217 |
+| `v8.3` | `ubuntu-noble-aarch64` | `cax31` | warm | **4:04** (244 s) | 72 s | 17 849 / 10 217 (cache hits) |
+
+Take-aways:
+
+- **arch is the dominant cold-cache factor**, not PSMDB version:
+  master aarch64 is +5 % over v8.3 aarch64 (matches the +2 % action
+  count delta + 9 % longer CP), while master x86_64 is **2.6×
+  faster** than master aarch64 on identical action shape and same
+  `cax31` ↔ `cpx42` price point. This is per-core CPU performance
+  (Ampere Altra Neoverse-N1 vs AMD EPYC Zen 3 on a template-heavy
+  C++ workload) — not a parallelism or scheduler issue.
+- **Warm cache flattens the gap**: 17 849/17 849 actions resolve as
+  cache hits, and the build becomes I/O+network bound. Expect master
+  aarch64 warm to land within ±20 s of the v8.3 aarch64 warm row;
+  warm runs are mostly downloading and unpacking remote outputs,
+  where ARM and AMD perform similarly.
+- **For the same wall-time goal on aarch64**, two knobs exist
+  (neither configured today):
+  1. `cax41` (16-core ARM, 32 GB) instead of `cax31` — same
+     ~€0.0512/h, doubles the per-worker concurrency.
+  2. More `cax31` pool slots — same `--jobs=130` from the client,
+     more workers absorb the action graph.
+  Both shorten wall time on cold cache; neither changes warm cache
+  numbers, which are already network/IO bound.
+
 ### CppLink strategy: keep `local` (measured)
 
 Default and only supported strategy for PSMDB Jenkins jobs:
