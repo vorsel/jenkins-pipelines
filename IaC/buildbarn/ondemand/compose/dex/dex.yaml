@@ -1,0 +1,175 @@
+# Dex — OpenID Connect Identity Provider used as a bridge between the
+# Buildbarn web UIs (bb-browser :7984, bb-scheduler admin :7982) and
+# GitHub OAuth.
+#
+# Why Dex sits in the middle and we don't talk to GitHub directly:
+#
+# Buildbarn's native OIDC implementation (see bb-storage/pkg/proto/
+# configuration/http/server/server.proto :: OIDCAuthenticationPolicy)
+# can extract claims with one JMESPath expression against ONE user_info
+# response. GitHub's OAuth user_info endpoint (`/user`) does not return
+# team membership — that's a separate `/orgs/{org}/teams/{slug}/
+# memberships/{user}` call. Dex's GitHub connector knows how to make
+# all those calls, validate the user is in at least one of the
+# `orgs[].teams[]` we whitelist below, and pack the result into a
+# single `groups` claim that Buildbarn's JMESPath can match in one
+# shot. That's why we add a tiny IdP container instead of pointing
+# Buildbarn straight at GitHub.
+#
+# Substitution: strings of the form `$VAR` are replaced by Dex itself
+# at startup from the process environment. We pass the values via
+# the docker-compose `environment:` block, populated by the central
+# `.env` file (mode 0600, baked by create-central.sh).
+
+# `issuer` is the public URL clients (bb-browser, bb-scheduler) will
+# embed in their OIDC discovery requests AND that Dex will sign into
+# the `iss` claim of every ID token it mints. It must:
+#   * be reachable from clients (verified via /.well-known/openid-configuration)
+#   * match the SAN of the TLS cert presented on `web.https` below
+#   * stay stable — changing it invalidates every refresh token in flight
+issuer: https://bb-psmdb.ddns.net:5556
+
+# Persistent storage for auth-codes (10 min TTL), refresh tokens
+# (1 y TTL — see `expiry` below), offline sessions, and Dex's own
+# JWT signing-key history (rotates every 6 h, retains 24 h of past
+# kids so already-issued tokens stay valid until they expire).
+# SQLite was chosen over `memory:` because losing this state on a
+# Dex container restart would force every active operator through
+# a fresh GitHub login flow; over Postgres because the data set is
+# tiny (KBs), interactive, and lives on the same persistent BB
+# volume that already holds the cache. Migration to Postgres later
+# is a config-only swap — no data needs to be carried over.
+storage:
+  type: sqlite3
+  config:
+    file: /var/dex/dex.db
+
+# Public-facing HTTPS listener. We deliberately do NOT front Dex
+# with Envoy / nginx: Dex speaks TLS natively and reuses the same
+# Let's Encrypt cert that envoy-proxy / bb-browser / bb-scheduler
+# already present, so there's nothing to gain from a second hop.
+# The cert directory is /var/lib/buildbarn/certs on the host
+# (resolved fullchain + privkey, mode 0644, refreshed in-place by
+# certbot's deploy-hook), mounted read-only at /etc/buildbarn/certs.
+# Dex re-reads the files on TLS handshake misses, so the deploy-hook
+# `docker compose restart dex` line keeps cert rotation hands-off
+# (a stale cert would only hit users on the next renewal cycle).
+web:
+  https: 0.0.0.0:5556
+  tlsCert: /etc/buildbarn/certs/fullchain.pem
+  tlsKey:  /etc/buildbarn/certs/privkey.pem
+
+# OAuth2-level knobs.
+oauth2:
+  # Dex's default consent screen ("Buildbarn Browser would like to
+  # access your account") adds a click for no security gain — the
+  # user already trusts the central control plane and we're not
+  # asking for arbitrary data, just identity. Skipping it makes the
+  # login UX feel native (one redirect to GitHub, one back).
+  skipApprovalScreen: true
+  # Force PKCE for all clients. bb-browser / bb-scheduler are
+  # confidential clients (server-side secrets), so this is belt-and-
+  # suspenders, but it's free and fends off auth-code replay if a
+  # client secret ever leaks.
+  passwordConnector: ""
+  alwaysShowLoginScreen: false
+
+# Token TTLs. See decisions log §5 in buildbarn-auth-tls-plan.md.
+#
+# idTokens=1h: short enough that a revoked GitHub team membership
+#   takes effect within an hour even if the user keeps a tab open.
+# refreshTokens.absoluteLifetime=8760h (1 y): matches the JWT
+#   lifetime decision for human users; on hard expiry the operator
+#   re-clicks "Sign in with GitHub" — 5-second flow.
+# refreshTokens.validIfNotUsedFor=2160h (90 d idle): forces inactive
+#   sessions out before they hit absolute expiry.
+# signingKeys: defaults (rotate=6h, retain=24h) are fine.
+expiry:
+  idTokens: 1h
+  refreshTokens:
+    reuseInterval: 5s
+    validIfNotUsedFor: 2160h
+    absoluteLifetime: 8760h
+
+# Where the user is actually authenticated. We use ONE connector —
+# GitHub — and rely on org+team gating for authorization. No
+# password connector, no LDAP, no SAML. If we ever need a CI bot
+# identity, we'll add a `static_passwords` block (off by default).
+connectors:
+- type: github
+  id: github
+  name: GitHub
+  config:
+    clientID:     $GITHUB_OAUTH_CLIENT_ID
+    clientSecret: $GITHUB_OAUTH_CLIENT_SECRET
+    # Must match exactly what is registered in the GitHub OAuth App
+    # (Settings → Developer settings → OAuth Apps). A mismatch fails
+    # at the GitHub callback with `redirect_uri_mismatch`.
+    redirectURI:  https://bb-psmdb.ddns.net:5556/callback
+
+    # Authorization gate. A user is allowed in iff they are a member
+    # of at least one of the listed `orgs[].teams[]`. Anyone outside
+    # these teams (including org admins not on the teams) is rejected
+    # at login with "User <login> is not in any of the required
+    # organizations or teams".
+    #
+    # MAINTENANCE: team names here are GitHub `slug`s, not display
+    # names — see buildbarn-auth-tls-plan.md §6 for the lookup
+    # command. Adding a team = edit list + `docker compose restart dex`.
+    # Removing a team = same; existing refresh tokens for users in
+    # only the removed team will fail their next refresh and force
+    # a re-login (which then bounces them).
+    orgs:
+    - name: percona
+      teams:
+      - build-engineers
+      - iit
+      - dev-psmdb
+
+    # `loadAllGroups: false` means Dex only emits the `groups` claim
+    # for the teams in the allow-list above (not every team the user
+    # happens to be in). Keeps the JWT small and prevents accidental
+    # over-disclosure of org structure to clients.
+    loadAllGroups: false
+
+    # Use slugs, not display names, in the emitted `groups` claim.
+    # Buildbarn's JMESPath authorization expression matches on slugs.
+    teamNameField: slug
+
+    # Allow re-auth without going through GitHub's consent screen
+    # again on every refresh — refresh tokens validate against
+    # GitHub's API, so a deleted team membership still kicks in
+    # within minutes regardless.
+    useLoginAsID: false
+
+# Static OAuth clients — i.e. the Buildbarn web services that will
+# delegate login to Dex once Step 4 wires them up. Defining them
+# here in Step 3 means smoke-testing the full Discovery → /token
+# loop is possible TODAY, before bb-browser / bb-scheduler are
+# OIDC-aware.
+#
+# Each client gets:
+#   * a stable `id` referenced by the bb-browser / bb-scheduler
+#     `oidc.client_id` field
+#   * a per-service `secret` (random 32 bytes hex, generated and
+#     stashed in .env by create-central.sh)
+#   * the exact `redirect_uris` that bb-browser / bb-scheduler will
+#     register — these have to match character-for-character or
+#     Dex rejects the auth request
+staticClients:
+- id: bb-browser
+  name: 'Buildbarn Browser'
+  secret: $BB_BROWSER_OIDC_SECRET
+  redirectURIs:
+  - https://bb-psmdb.ddns.net:7984/oidc-callback
+- id: bb-scheduler-admin
+  name: 'Buildbarn Scheduler Admin'
+  secret: $BB_SCHED_OIDC_SECRET
+  redirectURIs:
+  - https://bb-psmdb.ddns.net:7982/oidc-callback
+
+# Logging — JSON to stdout so docker compose / journald pick it up
+# uniformly with the other services on this host.
+logger:
+  level: info
+  format: json

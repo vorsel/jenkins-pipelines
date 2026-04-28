@@ -138,6 +138,59 @@ services:
       - scheduler
 
   # ---------------------------------------------------------------------
+  # Dex — OIDC identity provider used as a thin bridge between
+  # Buildbarn's web UIs and GitHub OAuth. We need it because GitHub's
+  # OIDC user_info does NOT expose team membership; Dex performs the
+  # extra `/teams/{slug}/memberships/{user}` calls and packs the
+  # result into a single `groups` claim that bb-browser / bb-scheduler
+  # can match with one JMESPath expression. See dex/dex.yaml header
+  # and buildbarn-auth-tls-plan.md §2 for the full rationale.
+  #
+  # Step 3 of the auth plan: Dex stands up with the GitHub connector
+  # and the bb-* static clients pre-declared. Step 4 wires bb-browser
+  # / bb-scheduler to actually delegate login here.
+  # ---------------------------------------------------------------------
+  dex:
+    <<: *bb-image-common
+    image: ghcr.io/dexidp/dex:${DEX_IMAGE_TAG}
+    command: ["dex", "serve", "/etc/dex/dex.yaml"]
+    ports:
+      # Public TLS endpoint for OIDC clients. Cert SAN must match
+      # bb-psmdb.ddns.net or browsers / bb-* HTTP clients reject
+      # token endpoint calls.
+      - "5556:5556"
+    volumes:
+      # Dex config. Read-only — secrets come in via the environment
+      # so the YAML stays committable to the public repo.
+      - ./dex/dex.yaml:/etc/dex/dex.yaml:ro
+      # Same Let's Encrypt cert that envoy-proxy / browser /
+      # scheduler use, served via Dex's `web.tlsCert/tlsKey`.
+      - /var/lib/buildbarn/certs:/etc/buildbarn/certs:ro
+      # SQLite storage on the persistent BB volume (chowned 1001:1001
+      # by create-central.sh's bootstrap_dex_dir step). Holds
+      # auth-codes, refresh tokens, signing-key history. Survives
+      # `docker compose down` and `docker compose up -d` — losing
+      # this file kicks every operator into a fresh GitHub login.
+      - /var/lib/buildbarn/dex:/var/dex
+    environment:
+      # Substituted into dex.yaml at startup. Loaded from compose's
+      # `.env` (mode 0600), populated by create-central.sh's bake_env.
+      - GITHUB_OAUTH_CLIENT_ID=${GITHUB_OAUTH_CLIENT_ID}
+      - GITHUB_OAUTH_CLIENT_SECRET=${GITHUB_OAUTH_CLIENT_SECRET}
+      - BB_BROWSER_OIDC_SECRET=${BB_BROWSER_OIDC_SECRET}
+      - BB_SCHED_OIDC_SECRET=${BB_SCHED_OIDC_SECRET}
+    healthcheck:
+      # Dex exposes /healthz on the same port as the discovery
+      # endpoint. We curl with --insecure because docker's healthcheck
+      # runs from inside the same container that serves the cert —
+      # no point cross-validating localhost.
+      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://127.0.0.1:5556/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------
   # REAPI v2 capabilities shim — Bazel 7.x refuses to talk to BuildBarn
   # because BuildBarn advertises a newer REAPI minor version than Bazel
   # supports. This tiny Go proxy rewrites the ServerCapabilities response

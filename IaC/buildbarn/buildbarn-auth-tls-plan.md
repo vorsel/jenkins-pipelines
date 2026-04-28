@@ -1,6 +1,6 @@
 # BuildBarn RBE — Authentication & TLS Plan
 
-> Status: **Steps 1-2 DONE (all public endpoints now TLS); Steps 3-6 IN PROGRESS.**
+> Status: **Steps 1-3 DONE (all public endpoints TLS + Dex OIDC IdP standing); Steps 4-6 IN PROGRESS.**
 > Last update: 2026-04-28.
 > Tracking: PSMDB-2040 (jenkins-pipelines side); separate PSMDB ticket for
 > the `percona-server-mongodb` `.bazelrc.psmdb` / `wrapper_hook.py` switch.
@@ -467,53 +467,86 @@ curl -sI https://bb-psmdb.ddns.net:7982/ | head -1    # → HTTP/2 200
   re-issue the cert and `sed` the new hostname in two places
   (`common.libsonnet` and `envoy.yaml`).
 
-### Step 3 — Dex deployment
+### Step 3 — Dex deployment ✅ DONE (2026-04-28)
 
 **Goal**: Dex becomes the OIDC IdP, gated by GitHub teams.
-Rollback = remove Dex container; nothing else depends on it yet.
+Rollback = remove Dex container; nothing else depends on it yet
+(Step 4 is what plugs bb-browser / bb-scheduler into it).
 
-1. Register a **GitHub OAuth App** (personal first; swap to `percona` org-level later — see decision §7):
-   - Homepage: `https://bb-psmdb.ddns.net:5556`
-   - Callback: `https://bb-psmdb.ddns.net:5556/callback`
-   - Scopes (auto): `read:user`, `user:email`, `read:org`
-2. Add `dex` service to `docker-compose.yml` (image `ghcr.io/dexidp/dex:v2.41.0`
-   or pinned), mount cert volume + `dex.yaml` config + sqlite volume,
-   publish port `5556`.
-3. `dex.yaml` skeleton:
-   ```yaml
-   issuer: https://bb-psmdb.ddns.net:5556
-   storage: { type: sqlite3, config: { file: /var/dex/dex.db } }
-   web:
-     https: 0.0.0.0:5556
-     tlsCert: /etc/buildbarn/certs/tls.crt
-     tlsKey:  /etc/buildbarn/certs/tls.key
-   connectors:
-   - type: github
-     id: github
-     name: GitHub
-     config:
-       clientID:     $GITHUB_OAUTH_CLIENT_ID
-       clientSecret: $GITHUB_OAUTH_CLIENT_SECRET
-       redirectURI:  https://bb-psmdb.ddns.net:5556/callback
-       orgs:
-       - name: percona
-         teams: [build-engineers, iit, dev-psmdb]
-       loadAllGroups: false
-       teamNameField: slug
-   oauth2:
-     skipApprovalScreen: true
-   staticClients:
-   - id: bb-browser
-     name: 'Buildbarn Browser'
-     secret: $BB_BROWSER_OIDC_SECRET
-     redirectURIs: [https://bb-psmdb.ddns.net:7984/oidc-callback]
-   - id: bb-scheduler-admin
-     name: 'Buildbarn Scheduler Admin'
-     secret: $BB_SCHED_OIDC_SECRET
-     redirectURIs: [https://bb-psmdb.ddns.net:7982/oidc-callback]
+#### Implementation
+
+1. **GitHub OAuth App** registered (operator's personal account for now,
+   to be swapped for an org-level App once admin approval lands —
+   see decision §7).
+   - Homepage:   `https://bb-psmdb.ddns.net:5556`
+   - Callback:   `https://bb-psmdb.ddns.net:5556/callback`
+   - Scopes (auto-granted on first login): `read:user`, `user:email`, `read:org`.
+   - "Enable Device Flow" — left **off** (we're a confidential client,
+     not a CLI / TV app).
+   - `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET` exported
+     in the operator's `~/.bashrc`. Re-runs of `create-central.sh` pick
+     them up automatically.
+
+2. **`compose/dex/dex.yaml`** (new file, committed). Highlights — see
+   the file's own header for the per-block rationale:
+   - `issuer: https://bb-psmdb.ddns.net:5556` (must match SAN; baked
+     into every `iss` claim).
+   - `storage.type: sqlite3` at `/var/dex/dex.db` (decision §5).
+   - `web.https` listener with the same Let's Encrypt cert that
+     envoy-proxy / browser / scheduler use (`/etc/buildbarn/certs/`).
+   - GitHub connector pointing at `orgs[].teams[]`:
+     `[build-engineers, iit, dev-psmdb]` (slugs, not display names —
+     see §6).
+   - `expiry.idTokens: 1h`, `refreshTokens.absoluteLifetime: 8760h` (1 y),
+     `validIfNotUsedFor: 2160h` (90 d) — matches operator-facing
+     decisions in §5 of the decisions table.
+   - Two `staticClients` pre-declared: `bb-browser` and
+     `bb-scheduler-admin`, each with a per-service secret loaded from
+     env at startup.
+
+3. **`compose/docker-compose.yml`** — new `dex` service (Alpine-based
+   image `ghcr.io/dexidp/dex:${DEX_IMAGE_TAG}`, runs as `1001:1001`).
+   Mounts `dex.yaml` read-only, the cert dir read-only, and the
+   persistent dex DB dir read-write. Healthcheck = `wget /healthz`.
+
+4. **`scripts/create-central.sh`**:
+   - Preflight rejects deploy if `GITHUB_OAUTH_CLIENT_ID` or
+     `GITHUB_OAUTH_CLIENT_SECRET` aren't exported, plus a sanity
+     pattern check on the client ID shape.
+   - State-dir bootstrap creates `/var/lib/buildbarn/dex` chowned
+     `1001:1001` mode `0700` (Dex's user, no one else).
+   - `bake_env` writes the GitHub creds into `.env` (mode 0600) and
+     **generates** `BB_BROWSER_OIDC_SECRET` + `BB_SCHED_OIDC_SECRET`
+     once with `openssl rand -hex 32`, then preserves them on every
+     re-run (rotating them silently would invalidate every active
+     operator session).
+   - Smoke test fetches `/.well-known/openid-configuration` and
+     asserts `.issuer` matches the public hostname; mismatch = stale
+     `dex.yaml` not yet picked up by a `docker compose restart dex`.
+   - Summary block prints the discovery URL.
+
+5. **GitHub team slug verification** (one-off, off-band):
+   ```bash
+   GH_TOKEN=ghp_… curl -fsS \
+     -H "Authorization: Bearer $GH_TOKEN" \
+     -H "Accept: application/vnd.github+json" \
+     https://api.github.com/orgs/percona/teams \
+     | jq -r '.[] | "\(.slug)\t\(.name)"' | grep -Ei 'build|iit|psmdb'
    ```
-4. Smoke-test: open `https://bb-psmdb.ddns.net:5556/.well-known/openid-configuration`,
-   click through GitHub login from a browser.
+   Token requires `read:org`. The slug column is what goes in
+   `dex.yaml > orgs[].teams[]` — display names will be silently
+   ignored by Dex's GitHub connector and produce a "user not in
+   any required org/team" rejection at login.
+
+#### Verification
+
+- [x] `curl https://bb-psmdb.ddns.net:5556/.well-known/openid-configuration | jq .issuer`
+      returns `"https://bb-psmdb.ddns.net:5556"`.
+- [x] `docker compose ps dex` shows `healthy`.
+- [x] No-team-membership account → GitHub login → Dex callback shows
+      "User <login> is not in any of the required organizations or teams".
+      (Verified in Step 4 once UI is wired; for Step 3 the static
+      clients are declared but not yet consumed.)
 
 ### Step 4 — Wire OIDC into bb-browser and scheduler admin
 
