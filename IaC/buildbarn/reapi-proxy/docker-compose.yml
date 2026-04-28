@@ -11,8 +11,14 @@ services:
   envoy-proxy:
     image: envoyproxy/envoy:v1.31-latest
     command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "warn"]
+    # Run as root so Envoy can read the Let's Encrypt privkey.pem
+    # (mode 600 root:root on the host volume). Container is isolated.
+    user: "0:0"
     volumes:
       - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+      # Cert dir maintained by the certbot deploy-hook (10-buildbarn.sh):
+      # resolved fullchain.pem + privkey.pem with mode 0644.
+      - /var/lib/buildbarn/certs:/etc/buildbarn/certs:ro
     ports:
       - "8981:8981"
     networks:

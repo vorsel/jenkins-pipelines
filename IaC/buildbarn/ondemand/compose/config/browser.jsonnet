@@ -13,6 +13,10 @@ local common = import 'common.libsonnet';
   maximumMessageSizeBytes: common.maximumMessageSizeBytes,
   httpServers: [{
     listenAddresses: [':7984'],
+    // TLS termination — cert/key picked up from the volume-mounted
+    // /etc/buildbarn/certs/, hot-reloaded every refreshInterval (1h).
+    // No auth yet; OIDC via Dex lands in a follow-up step.
+    tls: common.serverTls,
     authenticationPolicy: { allow: {} },
   }],
   global: common.global,

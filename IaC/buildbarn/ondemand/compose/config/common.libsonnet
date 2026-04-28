@@ -75,4 +75,20 @@
       enableActiveSpans: true,
     },
   },
+
+  // TLS for public HTTP servers (bb-browser :7984, bb-scheduler admin :7982).
+  // The cert files are kept in /var/lib/buildbarn/certs on the host and
+  // mounted read-only into each container at /etc/buildbarn/certs by
+  // docker-compose.yml. The certbot deploy-hook (10-buildbarn.sh) re-copies
+  // both files in place after each renewal; refreshInterval picks them up
+  // without restarting the BB process. See buildbarn-auth-tls-plan.md §4.
+  serverTls: {
+    serverKeyPair: {
+      files: {
+        certificatePath: '/etc/buildbarn/certs/fullchain.pem',
+        privateKeyPath: '/etc/buildbarn/certs/privkey.pem',
+        refreshInterval: '3600s',
+      },
+    },
+  },
 }

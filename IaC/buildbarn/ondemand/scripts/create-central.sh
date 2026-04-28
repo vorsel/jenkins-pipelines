@@ -54,6 +54,21 @@ set -euo pipefail
 # Mode override (attach|wipe-attach|abort). Empty = ask interactively.
 : "${MODE:=}"
 
+# Public hostname under which the central is reachable from operator laptops
+# and CI runners. Must match the SAN on the TLS cert served by Envoy
+# (gRPC :8981), bb-browser (:7984), and bb-scheduler admin UI (:7982).
+# Required because TLS certs are issued for DNS names — `https://<ip>:port`
+# would never validate. The script uses this value to:
+#
+#   * sed the __BB_PUBLIC_URL__ placeholder in common.libsonnet
+#     (→ https://$PUBLIC_HOSTNAME:7984)
+#   * build the public summary printed at the end of the run
+#
+# The matching cert is provisioned out-of-band (certbot + HTTP-01 on :80)
+# and stored under /var/lib/buildbarn/certs/. See buildbarn-auth-tls-plan.md
+# §4 for the full TLS layout.
+: "${PUBLIC_HOSTNAME:=}"
+
 # -----------------------------------------------------------------------------
 # Repo paths (resolved relative to this script so the tool can be invoked from
 # any CWD).
@@ -218,6 +233,14 @@ preflight() {
   [[ -f "$COMPOSE_SRC/config/scheduler.jsonnet" ]] \
     || die "compose/config/scheduler.jsonnet missing"
   ok "repo layout OK"
+
+  # PUBLIC_HOSTNAME is required so the in-jsonnet browserUrl points at the
+  # TLS-served https endpoint. Refusing to default to PUBLIC_IP is intentional:
+  # an IP-based URL would never validate against the Let's Encrypt cert
+  # provisioned for the DNS name, and we'd silently serve broken UI links.
+  [[ -n "$PUBLIC_HOSTNAME" ]] \
+    || die "PUBLIC_HOSTNAME env var is required (e.g. PUBLIC_HOSTNAME=bb-psmdb.ddns.net) — see buildbarn-auth-tls-plan.md §4"
+  ok "public hostname: $PUBLIC_HOSTNAME"
 
   # NB: there used to be a preflight drift check here — it verified that
   # every routing-key entry in ondemand-pools.yaml also appeared in
@@ -775,6 +798,7 @@ REMOTE
     "REMOTE_COMPOSE='$REMOTE_COMPOSE'" \
     "PRIVATE_IP='$PRIVATE_IP'" \
     "PUBLIC_IP='$PUBLIC_IP'" \
+    "PUBLIC_HOSTNAME='$PUBLIC_HOSTNAME'" \
     "HCLOUD_TOKEN='$HCLOUD_TOKEN'" \
     "CENTRAL_SSH_KEY_ID='$CENTRAL_SSH_KEY_ID'" \
     "bash -se" <<'REMOTE'
@@ -833,9 +857,11 @@ chmod 600 "$REMOTE_COMPOSE/.env"   # token inside; keep off `ls -l` casual reads
 
 # Replace the __BB_PUBLIC_URL__ placeholder in the jsonnet library so the
 # scheduler admin UI, browser, and frontend all emit links that work from the
-# operator's laptop. Using the public IP on port 7984 matches how bb-browser
-# is exposed in docker-compose.yml.
-sed -i "s|__BB_PUBLIC_URL__|http://$PUBLIC_IP:7984|g" \
+# operator's laptop. Uses the public DNS hostname (not the raw IP) on port
+# 7984 over https so links match the TLS cert SAN — see buildbarn-auth-
+# tls-plan.md §4. The cert is provisioned out-of-band by certbot and
+# mounted into bb-browser at /etc/buildbarn/certs/.
+sed -i "s|__BB_PUBLIC_URL__|https://$PUBLIC_HOSTNAME:7984|g" \
   "$REMOTE_COMPOSE/config/common.libsonnet"
 
 # Patch ondemand-pools.yaml at bake time:
@@ -857,7 +883,7 @@ sed -i "s|__BB_PUBLIC_URL__|http://$PUBLIC_IP:7984|g" \
 # repo file for docs, the baked copy is an artifact consumed by the
 # scaler which only cares about structure.
 POOLS="$REMOTE_COMPOSE/config/ondemand-pools.yaml"
-python3 - "$POOLS" "http://$PUBLIC_IP:7982" "$PRIVATE_IP" "$CENTRAL_SSH_KEY_ID" <<'PY'
+python3 - "$POOLS" "https://$PUBLIC_HOSTNAME:7982" "$PRIVATE_IP" "$CENTRAL_SSH_KEY_ID" <<'PY'
 import sys, yaml
 path, pub_url, priv_ip, key_id_str = sys.argv[1:5]
 key_id = int(key_id_str)
@@ -1002,18 +1028,21 @@ REMOTE
 smoke() {
   step "Smoke tests"
 
-  # 7982 = scheduler admin HTML UI (public).
-  if curl -sSf -m 5 "http://$PUBLIC_IP:7982/" >/dev/null; then
-    ok "scheduler admin UI reachable on http://$PUBLIC_IP:7982"
+  # 7982 = scheduler admin HTML UI (public, https).
+  # We hit it via the DNS hostname so the TLS cert SAN validates; the
+  # alternative — curl https://<floating-ip>:7982 — would fail with
+  # SSL_ERROR_BAD_CERTIFICATE_DOMAIN every time.
+  if curl -sSf -m 5 "https://$PUBLIC_HOSTNAME:7982/" >/dev/null; then
+    ok "scheduler admin UI reachable on https://$PUBLIC_HOSTNAME:7982"
   else
-    warn "scheduler admin UI at http://$PUBLIC_IP:7982 not responding"
+    warn "scheduler admin UI at https://$PUBLIC_HOSTNAME:7982 not responding"
   fi
 
-  # 7984 = browser (public).
-  if curl -sSf -m 5 "http://$PUBLIC_IP:7984/" >/dev/null; then
-    ok "bb-browser reachable on http://$PUBLIC_IP:7984"
+  # 7984 = browser (public, https).
+  if curl -sSf -m 5 "https://$PUBLIC_HOSTNAME:7984/" >/dev/null; then
+    ok "bb-browser reachable on https://$PUBLIC_HOSTNAME:7984"
   else
-    warn "bb-browser at http://$PUBLIC_IP:7984 not responding"
+    warn "bb-browser at https://$PUBLIC_HOSTNAME:7984 not responding"
   fi
 
   # 8981 = Envoy for Bazel clients. A bare TCP dial is enough to prove the
@@ -1095,11 +1124,18 @@ summary() {
   # sequence, making terminals print `\033[1;32m...` verbatim.
   printf '\n\033[1;32mbb-psmdb-ondemand central node ready.\033[0m\n\n'
   cat <<EOF
-  Public:
-    SSH              : ssh -i $SSH_PRIV_KEY root@$PUBLIC_IP
-    Scheduler admin  : http://$PUBLIC_IP:7982/
-    bb-browser       : http://$PUBLIC_IP:7984/
-    Bazel clients    : grpc://$PUBLIC_IP:8981         (no TLS/auth, matches barn-psmdb)
+  Public (TLS via Let's Encrypt cert for $PUBLIC_HOSTNAME):
+    SSH              : ssh -i $SSH_PRIV_KEY root@$PUBLIC_HOSTNAME
+    Scheduler admin  : https://$PUBLIC_HOSTNAME:7982/
+    bb-browser       : https://$PUBLIC_HOSTNAME:7984/
+    Bazel clients    : grpcs://$PUBLIC_HOSTNAME:8981  (TLS terminated by Envoy)
+
+    NB: We always print the DNS hostname here, never the raw \$PUBLIC_IP
+    ($PUBLIC_IP). The hostname resolves to the Hetzner Floating IP
+    that's pinned to this VM and survives VM redeploys; the primary
+    \$PUBLIC_IP can rotate. Browsing https://<floating-ip>:7982/ also
+    fails TLS validation because the cert SAN is the hostname, not the
+    IP — always use the hostname.
 
   Private (network 11374636 / psmdb.cd.percona.com):
     Worker gRPC      : grpc://$PRIVATE_IP:8983        (ondemand workers only)
@@ -1111,12 +1147,12 @@ summary() {
     Mode             : \$SCALER_DRY_RUN in $REMOTE_COMPOSE/.env
                        (fresh install defaults to true = logs-only; redeploys
                         preserve whatever was set before — see bake_env)
-    Logs             : ssh root@$PUBLIC_IP 'cd $REMOTE_COMPOSE && docker compose logs -f scaler'
+    Logs             : ssh root@$PUBLIC_HOSTNAME 'cd $REMOTE_COMPOSE && docker compose logs -f scaler'
     Go live          : edit $REMOTE_COMPOSE/.env → SCALER_DRY_RUN=false
-                       then: ssh root@$PUBLIC_IP 'cd $REMOTE_COMPOSE && docker compose up -d scaler'
+                       then: ssh root@$PUBLIC_HOSTNAME 'cd $REMOTE_COMPOSE && docker compose up -d scaler'
 
   Debugging a worker (from this central host, over the private network):
-    ssh root@$PUBLIC_IP
+    ssh root@$PUBLIC_HOSTNAME
     ssh-worker <worker-private-ip>                    (wrapper at /usr/local/bin/ssh-worker)
     ssh-worker <worker-private-ip> 'cd /opt/buildbarn && docker compose ps'
     (requires the worker was spawned AFTER this deploy — workers created
@@ -1126,7 +1162,9 @@ summary() {
   Next steps:
     * Manual worker  : scripts/spawn-worker.sh            (for debugging, always works)
     * Autoscaling    : flip SCALER_DRY_RUN=false after watching a dry-run cycle
-    * Bazel clients  : --remote_executor=grpc://$PUBLIC_IP:8981
+    * Bazel clients  : --remote_executor=grpcs://$PUBLIC_HOSTNAME:8981
+                       (TLS-only since Step 1 of buildbarn-auth-tls-plan.md;
+                        plain grpc:// will be rejected at the Envoy listener)
 EOF
 }
 

@@ -112,6 +112,10 @@ services:
       - "127.0.0.1:8984:8984"
     volumes:
       - ./config:/config:ro
+      # TLS material for the public admin UI on :7982. Files are kept on
+      # the persistent BB volume and refreshed by certbot's deploy-hook;
+      # bb-scheduler picks them up via tls.serverKeyPair.files.refreshInterval.
+      - /var/lib/buildbarn/certs:/etc/buildbarn/certs:ro
 
   # ---------------------------------------------------------------------
   # Browser — human-facing web UI for inspecting actions, CAS blobs, and
@@ -125,6 +129,9 @@ services:
       - "7984:7984"
     volumes:
       - ./config:/config:ro
+      # TLS material for the public web UI on :7984 — same source as
+      # scheduler/envoy, hot-reloaded via refreshInterval.
+      - /var/lib/buildbarn/certs:/etc/buildbarn/certs:ro
     depends_on:
       - storage-0
       - storage-1
@@ -156,20 +163,33 @@ services:
   # ---------------------------------------------------------------------
   # Envoy — the gateway Bazel clients actually connect to. Routes
   # Capabilities RPCs to reapi-proxy (version patching) and every other
-  # RPC straight to frontend. Listens on 8981 inside the container; we
-  # publish it only on the private network interface.
+  # RPC straight to frontend. Listens on 8981 inside the container; this
+  # is the only TLS termination point on the path — frontend and
+  # reapi-proxy stay plaintext on the docker bridge. JWT validation
+  # (planned, PSMDB-2040) will land in the same listener via
+  # envoy.filters.http.jwt_authn so we don't add a second hop.
   # ---------------------------------------------------------------------
   envoy-proxy:
     <<: *bb-image-common
     image: envoyproxy/envoy:${ENVOY_IMAGE_TAG}
     command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "warn"]
+    # Run as root inside the container so Envoy can read the Let's Encrypt
+    # privkey.pem (mode 600 root:root on the host volume). The container is
+    # isolated; nothing on the host changes.
+    user: "0:0"
     ports:
-      # Public — Bazel clients outside the private network need this (matches
-      # existing barn-psmdb, bare gRPC, no TLS). Add a Hetzner firewall with
-      # an IP allowlist later if the exposure becomes a concern.
+      # Public TLS endpoint for Bazel clients. Cert is the Let's Encrypt
+      # cert for bb-psmdb.ddns.net (see envoy.yaml). Plain gRPC clients
+      # (grpc://) will fail with "connection reset" — they must use
+      # grpcs:// from now on.
       - "8981:8981"
     volumes:
       - /var/lib/buildbarn/reapi-proxy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      # Cert dir maintained by the certbot deploy-hook (10-buildbarn.sh):
+      # contains resolved fullchain.pem + privkey.pem (mode 0644) so the
+      # files are readable inside the container regardless of any docker
+      # userns-remap setup. The hook restarts this service on renewal.
+      - /var/lib/buildbarn/certs:/etc/buildbarn/certs:ro
     depends_on:
       - reapi-proxy
       - frontend

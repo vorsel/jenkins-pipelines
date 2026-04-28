@@ -6,7 +6,29 @@ static_resources:
         address: 0.0.0.0
         port_value: 8981
     filter_chains:
-    - filters:
+    # TLS termination for Bazel clients reaching the cluster from the
+    # public internet. Cert is the Let's Encrypt cert for
+    # bb-psmdb.ddns.net (No-IP free DDNS, A-record on the central VM's
+    # Hetzner Floating IP). Cert files are deploy-copied (resolved
+    # symlinks, mode 0644) from /etc/letsencrypt/live/<host>/ into
+    # /var/lib/buildbarn/certs/ on the host by the certbot deploy-hook
+    # at /etc/letsencrypt/renewal-hooks/deploy/10-buildbarn.sh, and that
+    # directory is mounted into this container at /etc/buildbarn/certs.
+    # The hook also restarts this envoy service after each renewal.
+    # Frontend and reapi-proxy behind Envoy stay plaintext on the docker
+    # bridge — they are not reachable from outside the central VM.
+    - transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            alpn_protocols: [h2]
+            tls_certificates:
+            - certificate_chain:
+                filename: /etc/buildbarn/certs/fullchain.pem
+              private_key:
+                filename: /etc/buildbarn/certs/privkey.pem
+      filters:
       - name: envoy.filters.network.http_connection_manager
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager

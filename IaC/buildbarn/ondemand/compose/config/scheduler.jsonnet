@@ -19,8 +19,22 @@ local predeclared = import 'predeclared.libsonnet';
 {
   adminHttpServers: [{
     listenAddresses: [':7982'],
+    // TLS — cert/key from the volume-mounted /etc/buildbarn/certs/, hot-
+    // reloaded every refreshInterval (1h). No auth yet; OIDC via Dex
+    // lands in a follow-up step.
+    tls: common.serverTls,
     authenticationPolicy: { allow: {} },
   }],
+  // The next three gRPC servers stay plaintext on purpose:
+  //   * clientGrpc :8982 lives on the docker-compose default bridge
+  //     and is reached only by the frontend container (no host port).
+  //   * workerGrpc :8983 is bound to ${PRIVATE_IP} (Hetzner private
+  //     network) and only the ondemand worker VMs in the same network
+  //     can reach it.
+  //   * buildQueueStateGrpc :8984 is bound to 127.0.0.1 and is consumed
+  //     only by the scaler daemon running on this host.
+  // None of them is reachable from the public internet; adding TLS here
+  // would only add cert-rotation surface without security benefit.
   clientGrpcServers: [{
     listenAddresses: [':8982'],
     authenticationPolicy: { allow: {} },
