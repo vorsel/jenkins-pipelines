@@ -12,17 +12,21 @@
 #
 #   PUBLIC  (0.0.0.0)           PRIVATE (${PRIVATE_IP})     LOCAL (127.0.0.1)
 #   ──────────────────────────  ──────────────────────────  ──────────────────
-#   7982  scheduler admin HTML  8983  scheduler ↔ workers   8984  buildQueueState
-#   7984  bb-browser                                              (scaler only)
+#   7982  scheduler admin HTML  8980  frontend (worker CAS) 8984  buildQueueState
+#   7984  bb-browser            8983  scheduler ↔ workers         (scaler only)
 #   8981  Envoy / Bazel clients
 #
-#   Rationale: 8981 (Bazel clients) is exposed publicly to match the existing
-#   barn-psmdb topology — developers and CI outside the Hetzner private
-#   network need to hit it. This is bare gRPC without TLS/auth, same as prod;
-#   a firewall allowlist can be bolted on later without re-architecting.
-#   Worker gRPC (8983) stays private because every worker is an ondemand VM
-#   created inside the psmdb.cd private network. BuildQueueState (8984) stays
-#   localhost because the scaler daemon runs on THIS host.
+#   Rationale: 8981 (Bazel clients) is exposed publicly with TLS+JWT auth
+#   (see envoy.yaml, Step 1+5 of buildbarn-auth-tls-plan.md). Workers run
+#   inside the Hetzner private network on ondemand VMs, so they reach the
+#   central's CAS/AC/FSAC directly via bb-frontend's :8980 (plaintext, no
+#   auth — the network IS the boundary on this path). Bypassing Envoy for
+#   workers avoids provisioning service-account JWTs to every spawned VM
+#   and removes the TLS handshake from every CAS read. See
+#   worker/config/common.libsonnet header for the long version.
+#   Worker scheduler dispatch (8983) stays private — same reasoning.
+#   BuildQueueState (8984) stays localhost because the scaler daemon
+#   runs on THIS host.
 #
 # Workers and their runner sidecars are NOT defined here — they live on
 # ephemeral ondemand VMs bootstrapped by the scaler (see §5.2).
@@ -85,7 +89,14 @@ services:
     image: ghcr.io/buildbarn/bb-storage:${BB_STORAGE_TAG}
     command: [/config/frontend.jsonnet]
     expose:
-      - "8980"   # gRPC — Envoy's upstream
+      - "8980"   # gRPC — Envoy's upstream (intra-compose docker bridge)
+    ports:
+      # Same gRPC :8980 also bound on the Hetzner private interface so
+      # that ondemand worker VMs can reach CAS/AC/FSAC directly without
+      # hairpinning through the public Envoy listener (which now requires
+      # TLS+JWT — see header port-strategy block and
+      # worker/config/common.libsonnet for the full reasoning).
+      - "${PRIVATE_IP}:8980:8980"
     volumes:
       - ./config:/config:ro
     depends_on:
@@ -154,6 +165,31 @@ services:
     <<: *bb-image-common
     image: ghcr.io/dexidp/dex:${DEX_IMAGE_TAG}
     command: ["dex", "serve", "/etc/dex/dex.yaml"]
+    networks:
+      # Network alias for the public hostname so that bb-browser and
+      # bb-scheduler — which sit on the same docker-compose default
+      # bridge network as dex — can resolve `bb-psmdb.ddns.net` to
+      # this container directly via docker's embedded DNS, without
+      # hairpin-ing through the host's NAT.
+      #
+      # Why this matters: the OIDC config in browser.jsonnet /
+      # scheduler.jsonnet uses the public issuer URL (https://
+      # bb-psmdb.ddns.net:5556) for BOTH the user-browser-facing
+      # /auth redirect AND the server-to-server /token call from
+      # BB. The user's browser resolves the hostname via public DNS
+      # (No-IP → Hetzner Floating IP); the BB container resolves the
+      # same hostname via docker DNS thanks to this alias and the
+      # call stays inside the bridge. TLS validation succeeds in
+      # both cases because the cert SAN matches the hostname in the
+      # URL, regardless of which IP the connection lands on.
+      #
+      # Without this alias, BB → /token would have to NAT-loop
+      # through the host's external interface (Hetzner allows this
+      # in practice but it's an extra hop and a class of failure
+      # we don't need).
+      default:
+        aliases:
+          - bb-psmdb.ddns.net
     ports:
       # Public TLS endpoint for OIDC clients. Cert SAN must match
       # bb-psmdb.ddns.net or browsers / bb-* HTTP clients reject
@@ -218,9 +254,11 @@ services:
   # Capabilities RPCs to reapi-proxy (version patching) and every other
   # RPC straight to frontend. Listens on 8981 inside the container; this
   # is the only TLS termination point on the path — frontend and
-  # reapi-proxy stay plaintext on the docker bridge. JWT validation
-  # (planned, PSMDB-2040) will land in the same listener via
-  # envoy.filters.http.jwt_authn so we don't add a second hop.
+  # reapi-proxy stay plaintext on the docker bridge. Step 5 added a
+  # jwt_authn filter that validates `Authorization: Bearer <jwt>`
+  # against Dex's /keys (issuer https://bb-psmdb.ddns.net:5556,
+  # audience bazel-cli); see envoy.yaml for the filter and the
+  # `dex_jwks` upstream cluster.
   # ---------------------------------------------------------------------
   envoy-proxy:
     <<: *bb-image-common
@@ -246,6 +284,12 @@ services:
     depends_on:
       - reapi-proxy
       - frontend
+      # dex must be up before envoy starts so the very first /keys
+      # fetch on cold-start succeeds. Envoy's remote_jwks does retry
+      # in the background, but a failed first fetch turns every Bazel
+      # RPC into a 401 for ~1 cache_duration after recovery. Cheaper
+      # to gate the start order.
+      - dex
 
   # ---------------------------------------------------------------------
   # Scaler — the control loop that spawns and reaps worker VMs based on

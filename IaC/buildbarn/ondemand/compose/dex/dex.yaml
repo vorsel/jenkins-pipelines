@@ -16,10 +16,25 @@
 # shot. That's why we add a tiny IdP container instead of pointing
 # Buildbarn straight at GitHub.
 #
-# Substitution: strings of the form `$VAR` are replaced by Dex itself
-# at startup from the process environment. We pass the values via
-# the docker-compose `environment:` block, populated by the central
-# `.env` file (mode 0600, baked by create-central.sh).
+# Substitution rules (Dex v2.41.1, see storage/storage.go +
+# cmd/dex/config.go):
+#
+#   * Inside `connectors[].config.*` and `storage.config.*`:
+#     `$VAR` and `${VAR}` are expanded via os.ExpandEnv at config load
+#     (gated by DEX_EXPAND_ENV, defaults to true). That's how the
+#     GitHub OAuth client_id/secret below get injected.
+#
+#   * Inside `staticClients[]`: the `$VAR` form is NOT expanded —
+#     `Secret`/`ID` are stored verbatim. To pull a value from env,
+#     use the dedicated `secretEnv: VAR_NAME` / `idEnv: VAR_NAME`
+#     fields (without `$`), which Dex resolves via os.Getenv at the
+#     same load step. Mixing the two patterns silently breaks token
+#     exchange (Dex stores `"$VAR"` as the secret, BB sends the real
+#     value, /token returns "invalid_client"). Bit us once on first
+#     OIDC login attempt — see commit message.
+#
+# Values come from the docker-compose `environment:` block, populated
+# by the central `.env` file (mode 0600, baked by create-central.sh).
 
 # `issuer` is the public URL clients (bb-browser, bb-scheduler) will
 # embed in their OIDC discovery requests AND that Dex will sign into
@@ -159,14 +174,50 @@ connectors:
 staticClients:
 - id: bb-browser
   name: 'Buildbarn Browser'
-  secret: $BB_BROWSER_OIDC_SECRET
+  secretEnv: BB_BROWSER_OIDC_SECRET
   redirectURIs:
   - https://bb-psmdb.ddns.net:7984/oidc-callback
 - id: bb-scheduler-admin
   name: 'Buildbarn Scheduler Admin'
-  secret: $BB_SCHED_OIDC_SECRET
+  secretEnv: BB_SCHED_OIDC_SECRET
   redirectURIs:
   - https://bb-psmdb.ddns.net:7982/oidc-callback
+# Step 5: Bazel CLI client for the Device Authorization Grant
+# (RFC 8628). This client is PUBLIC — it has no secret because Bazel
+# clients run on developer machines / CI runners where we cannot
+# safely keep one. Security comes from PKCE (mandatory in Dex when
+# `oauth2.passwordConnector == ""`) plus the team-membership gate in
+# the GitHub connector above (a stolen device_code is useless without
+# also passing GitHub OAuth as a member of one of the allowed teams).
+#
+# `redirectURIs` is unintuitive for a Device Code client and contains
+# TWO entries for two different reasons:
+#
+#   * `urn:ietf:wg:oauth:2.0:oob` — the RFC-6749-blessed "out-of-band"
+#     placeholder. Dex's static-client validator requires the list be
+#     non-empty even though Device Code flow has no real callback URL
+#     for the *RBE client* side.
+#
+#   * `/device/callback` — REQUIRED by Dex internally. When the user
+#     opens https://.../device, picks GitHub, and is bounced through
+#     GitHub OAuth, Dex starts an *internal* OIDC flow with
+#     `redirect_uri=/device/callback` (its own handler that finishes
+#     the device-code → id_token exchange). That `redirect_uri` is
+#     validated against this client's redirectURIs list — same
+#     validator as for any other OAuth flow, no special-case for the
+#     device path. Without `/device/callback` here, the GitHub login
+#     step terminates with `Bad Request: Unregistered redirect_uri
+#     ("/device/callback")` and the user_code never gets approved.
+#     This is a Dex-side wart, not an OAuth spec quirk.
+#
+# Audience: id_tokens minted for this client carry `aud: ["bazel-cli"]`,
+# which Envoy's jwt_authn filter on :8981 verifies on every Bazel RPC.
+- id: bazel-cli
+  name: 'Bazel RBE CLI'
+  public: true
+  redirectURIs:
+  - urn:ietf:wg:oauth:2.0:oob
+  - /device/callback
 
 # Logging — JSON to stdout so docker compose / journald pick it up
 # uniformly with the other services on this host.

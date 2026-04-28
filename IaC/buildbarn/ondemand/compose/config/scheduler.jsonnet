@@ -20,10 +20,26 @@ local predeclared = import 'predeclared.libsonnet';
   adminHttpServers: [{
     listenAddresses: [':7982'],
     // TLS — cert/key from the volume-mounted /etc/buildbarn/certs/, hot-
-    // reloaded every refreshInterval (1h). No auth yet; OIDC via Dex
-    // lands in a follow-up step.
+    // reloaded every refreshInterval (1h).
     tls: common.serverTls,
-    authenticationPolicy: { allow: {} },
+    // OIDC delegation to Dex (mirrors browser.jsonnet — see that file
+    // for the rationale behind each oidcAuth() argument). The admin UI
+    // at :7982 is a separate origin from bb-browser at :7984 (different
+    // ports = different origins per RFC 6265), so users WILL log in
+    // twice (once per UI). That's acceptable for the operator audience
+    // — they hit scheduler-admin rarely and the round-trip is a few
+    // seconds with an active GitHub session.
+    //
+    // The `bb-scheduler-admin` clientId / secret pair is registered as
+    // a SEPARATE staticClient in dex.yaml from `bb-browser` so the
+    // services have independent credentials — a leaked cookie/secret
+    // on one UI doesn't compromise the other.
+    authenticationPolicy: common.oidcAuth(
+      clientId='bb-scheduler-admin',
+      clientSecret='__BB_SCHED_OIDC_CLIENT_SECRET__',
+      redirectUrl=common.schedulerUrl + '/oidc-callback',
+      cookieSeed='__BB_SCHED_COOKIE_SEED__',
+    ),
   }],
   // The next three gRPC servers stay plaintext on purpose:
   //   * clientGrpc :8982 lives on the docker-compose default bridge

@@ -59,6 +59,65 @@ static_resources:
                   max_stream_duration:
                     grpc_timeout_header_max: 3600s
           http_filters:
+          # Step 5 — JWT authentication for Bazel clients.
+          # Order matters: jwt_authn MUST come before the router so
+          # that an Authorization: Bearer header is verified against
+          # Dex's JWKS BEFORE Envoy forwards the RPC to the upstream
+          # cluster (capabilities_proxy or buildbarn_frontend).
+          # A request without a valid bearer is rejected at this
+          # filter with HTTP 401 and never touches BB.
+          - name: envoy.filters.http.jwt_authn
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+              providers:
+                # Dex is the sole issuer at this stage. id_tokens minted
+                # for `bazel-cli` (Device Code flow) carry:
+                #   iss = https://bb-psmdb.ddns.net:5556
+                #   aud = ["bazel-cli"]
+                # We pin BOTH so that a Dex token meant for bb-browser
+                # or bb-scheduler-admin (different `aud`) cannot be
+                # replayed against the gRPC endpoint — a defense-in-
+                # depth against the not-actually-bad-but-let's-not-
+                # confuse-them scenario where someone copy-pastes
+                # their browser session cookie's id_token here.
+                dex_provider:
+                  issuer: https://bb-psmdb.ddns.net:5556
+                  audiences:
+                  - bazel-cli
+                  # Refresh the JWKS in the background every 600s.
+                  # Dex rotates signing keys every 6h and keeps the
+                  # past 24h of public keys in `/keys` for offline
+                  # verification of in-flight tokens; 10-minute cache
+                  # is well under that window so a fresh `kid` is
+                  # always available before the previous one expires.
+                  remote_jwks:
+                    http_uri:
+                      uri: https://bb-psmdb.ddns.net:5556/keys
+                      cluster: dex_jwks
+                      timeout: 5s
+                    cache_duration: 600s
+                  # `forward: true` keeps the Authorization header
+                  # attached when Envoy forwards to BB. We don't
+                  # actually consume it on the BB side today (BB
+                  # frontend stays `allow{}` on the docker bridge,
+                  # see "BB-side note" in the plan), but leaving it
+                  # in lets us turn on BB-level JWT validation as
+                  # defense-in-depth later without re-shipping
+                  # Envoy.
+                  forward: true
+                  from_headers:
+                  - name: authorization
+                    value_prefix: "Bearer "
+              rules:
+              # All RPCs require a valid token — no public path. The
+              # /build.bazel.remote.execution.v2.Capabilities/ split
+              # in the route_config above is purely an upstream-
+              # selection question; both the Capabilities and the
+              # Execution streams need auth.
+              - match:
+                  prefix: /
+                requires:
+                  provider_name: dex_provider
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -102,3 +161,37 @@ static_resources:
               socket_address:
                 address: frontend
                 port_value: 8980
+
+  # Step 5 — upstream cluster the jwt_authn filter uses to fetch
+  # Dex's public signing keys. We connect via the docker network alias
+  # `bb-psmdb.ddns.net` (added on the dex service in docker-compose.yml
+  # for the Step 4 OIDC token exchange) so traffic stays on the bridge
+  # rather than hairpinning out through the floating IP. SNI matches
+  # the cert SAN, so the upstream TLS handshake validates cleanly
+  # against the system CA bundle (Let's Encrypt R10/R11 is in there).
+  - name: dex_jwks
+    connect_timeout: 5s
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: dex_jwks
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: bb-psmdb.ddns.net
+                port_value: 5556
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: bb-psmdb.ddns.net
+        common_tls_context:
+          validation_context:
+            trusted_ca:
+              filename: /etc/ssl/certs/ca-certificates.crt
+            match_typed_subject_alt_names:
+            - san_type: DNS
+              matcher:
+                exact: bb-psmdb.ddns.net

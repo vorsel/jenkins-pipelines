@@ -1,6 +1,6 @@
 # BuildBarn RBE — Authentication & TLS Plan
 
-> Status: **Steps 1-3 DONE (all public endpoints TLS + Dex OIDC IdP standing); Steps 4-6 IN PROGRESS.**
+> Status: **Steps 1-4 DONE; Step 5 server-side DONE (Dex `bazel-cli` client + Envoy `jwt_authn` against Dex JWKS); Step 5b (PSMDB wrapper_hook + `bazel-rbe-login`) E2E-VERIFIED on `master` (PSMDB-2043) — full `install-dist-test` build via grpcs+JWT 6:23 wall, 10437 cache hits, 2 fresh remote actions; Step 5d ("Worker bypass" / Option C) DONE — workers reach CAS/AC/FSAC via private `frontend:8980`, not Envoy; Step 6 (firewall) PENDING.**
 > Last update: 2026-04-28.
 > Tracking: PSMDB-2040 (jenkins-pipelines side); separate PSMDB ticket for
 > the `percona-server-mongodb` `.bazelrc.psmdb` / `wrapper_hook.py` switch.
@@ -44,9 +44,14 @@ without adding heavy reverse-proxy infrastructure or writing custom Go middlewar
   on file change — `certbot --deploy-hook` rotation **without service restart**.
 - **gRPC auth (Bazel clients)**: terminated **in Envoy** using the standard
   [`envoy.filters.http.jwt_authn`](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/jwt_authn_filter)
-  filter. JWKS file shared with BB. Reason Envoy stays in the picture: it hosts
-  our reapi-proxy that rewrites REAPI 2.3 → 2.0 for legacy MongoDB Bazel —
-  this is non-negotiable. Adding JWT auth here is just extra YAML, no custom code.
+  filter. JWTs are **issued by Dex** via the OAuth 2.0 Device Authorization
+  Grant (RFC 8628) — same identity model as the UIs (GitHub team allow-list),
+  no parallel "RBE-only" key universe, no manual key rotation, auto-refresh
+  on the client side. Envoy fetches `https://bb-psmdb.ddns.net:5556/keys`
+  via `remote_jwks` (cache 600s). Reason Envoy stays in the picture: it
+  hosts our reapi-proxy that rewrites REAPI 2.3 → 2.0 for legacy MongoDB
+  Bazel — this is non-negotiable. Adding JWT auth here is just extra YAML,
+  no custom code.
 - **HTTP auth (UI)**: native **OIDC** in BB with full code+refresh token flow,
   AES-GCM-encrypted session cookie, JMESPath claims-to-metadata.
 - **GitHub teams gating**: GitHub OAuth alone is NOT enough (the OIDC user_info
@@ -548,150 +553,456 @@ Rollback = remove Dex container; nothing else depends on it yet
       (Verified in Step 4 once UI is wired; for Step 3 the static
       clients are declared but not yet consumed.)
 
-### Step 4 — Wire OIDC into bb-browser and scheduler admin
+### Step 4 — Wire OIDC into bb-browser and scheduler admin ✅ DONE (2026-04-28)
 
-**Goal**: UI now requires GitHub login + team membership.
+**Goal**: UIs now delegate login to Dex+GitHub, gated to the three
+allowed teams. End-to-end flow: anonymous request → 302 to
+`https://bb-psmdb.ddns.net:5556/auth` → GitHub OAuth consent →
+Dex `/callback` enforces `orgs[].teams[]` membership → 302 to
+`https://bb-psmdb.ddns.net:{7984|7982}/oidc-callback` → BB drops an
+AES-GCM-encrypted session cookie keyed off `cookieSeed`.
 
-`browser.jsonnet` and `scheduler.jsonnet` `adminHttpServers` get:
+#### Architecture choices that diverged from the original sketch
 
-```jsonnet
-local certPath = '/etc/buildbarn/certs/tls.crt';
-local keyPath  = '/etc/buildbarn/certs/tls.key';
-local serverTls = {
-  serverKeyPair: {
-    files: { certificatePath: certPath, privateKeyPath: keyPath, refreshInterval: '3600s' },
-  },
-};
+1. **Authorization gating lives in Dex, not in BB.** BB's HTTP server
+   proto (`bb-storage/pkg/proto/configuration/http/server/server.proto::
+   Configuration`) has only `authentication_policy`, NO authorizer
+   field. There's no place to plug a `jmespathExpression` authorizer
+   on `httpServers` like the earlier sketch implied. Dex's GitHub
+   connector already enforces `orgs[].teams[]` at `/callback` (returns
+   "User not in any of the required organizations or teams" for
+   non-members), so any user who reaches BB's `/oidc-callback` with a
+   valid auth code is, by construction, in `[build-engineers, iit,
+   dev-psmdb]`. We don't need a second JMESPath gate.
 
-local groupsAllowExpression = |||
-  contains(authenticationMetadata.public.groups, 'percona:build-engineers') ||
-  contains(authenticationMetadata.public.groups, 'percona:iit') ||
-  contains(authenticationMetadata.public.groups, 'percona:dev-psmdb')
-|||;
+2. **`useIdTokenClaims: {}` instead of `userInfoEndpointUrl`.** BB's
+   `IDTokenOIDCClaimsFetcher` (oidc_authenticator.go:328-356)
+   base64-decodes the id_token payload directly without verifying its
+   signature; trust comes from the TLS-secured `/token` round-trip.
+   This saves a `/userinfo` round-trip and avoids Dex's connector-
+   specific `/userinfo` shape — `groups` only appears in id_token by
+   default in the GitHub connector path.
 
-local oidcPolicy(clientId, secretEnv, redirectUrl, cookieSeedEnv) = {
-  oidc: {
-    clientId: clientId,
-    clientSecret: std.extVar(secretEnv),
-    authorizationEndpointUrl: 'https://bb-psmdb.ddns.net:5556/auth',
-    tokenEndpointUrl:         'https://bb-psmdb.ddns.net:5556/token',
-    userInfoEndpointUrl:      'https://bb-psmdb.ddns.net:5556/userinfo',
-    scopes: ['openid', 'email', 'groups', 'offline_access'],
-    redirectUrl: redirectUrl,
-    cookieSeed: std.extVar(cookieSeedEnv),
-    metadataExtractionJmespathExpression: {
-      expression: '{ "public": { "email": email, "groups": groups, "login": preferred_username } }',
-    },
-  },
-};
+3. **Internal docker network alias for `bb-psmdb.ddns.net`.** The OIDC
+   config uses the same public hostname for BOTH the user-browser-
+   facing `/auth` redirect AND the BB-internal `/token` exchange.
+   Without help, the BB → /token call would have to NAT-loop through
+   the host's external interface. Adding `aliases: [bb-psmdb.ddns.net]`
+   to the dex service in docker-compose.yml means BB resolves the
+   hostname via docker's embedded DNS to the dex container directly;
+   the call stays on the docker bridge, and TLS validation still
+   succeeds because the cert SAN is matched against the URL hostname,
+   not the destination IP.
 
-// In browser.jsonnet:
-httpServers: [{
-  listenAddresses: [':7984'],
-  tls: serverTls,
-  authenticationPolicy: oidcPolicy(
-    'bb-browser', 'BB_BROWSER_OIDC_SECRET',
-    'https://bb-psmdb.ddns.net:7984/oidc-callback',
-    'BB_BROWSER_COOKIE_SEED',
-  ),
-}],
-authorizer: { jmespathExpression: { expression: groupsAllowExpression } },
+4. **Restart-list expanded to all `./config/`-mounted services.** First
+   deploy of this step left `bb-browser` running with the prior
+   `allow{}` policy for ~5h while smoke tests reported `302` for
+   scheduler and `200` for browser — exactly because `compose_up` only
+   restarted `scheduler scaler` (it was sized for the predeclared-queue
+   rollout and we never revisited it). `docker compose up -d` only
+   recreates a service when its compose definition (image, env,
+   volumes) changes, NOT when the bind-mounted file content changes.
+   Fix in `scripts/create-central.sh` is to `restart` every service
+   that mounts `./config/` (browser, frontend, scheduler, storage-{0,1},
+   plus scaler whose own dir is rsynced from `./scaler/`, plus `dex`
+   whose dex.yaml is also bind-mounted). Cost: a ~10s rolling bounce
+   on every redeploy. Cheap insurance against the class of bug "we
+   silently shipped stale config".
 
-// In scheduler.jsonnet:
-adminHttpServers: [{
-  listenAddresses: [':7982'],
-  tls: serverTls,
-  authenticationPolicy: oidcPolicy(
-    'bb-scheduler-admin', 'BB_SCHED_OIDC_SECRET',
-    'https://bb-psmdb.ddns.net:7982/oidc-callback',
-    'BB_SCHED_COOKIE_SEED',
-  ),
-}],
-modifyDrainsAuthorizer:   { jmespathExpression: { expression: groupsAllowExpression } },
-killOperationsAuthorizer: { jmespathExpression: { expression: groupsAllowExpression } },
+5. **Dex `staticClients` doesn't expand `$VAR`.** First end-to-end
+   login attempt failed at the BB → Dex `/token` exchange with
+   `oauth2: "invalid_client" "Invalid client credentials."`. Cause:
+   we wrote `secret: $BB_SCHED_OIDC_SECRET` in `dex.yaml`. Dex's
+   environment-variable expansion (`os.ExpandEnv`, gated by
+   `DEX_EXPAND_ENV` defaulting to `true`) ONLY runs on
+   `connectors[].config.*` and `storage.config.*` — see
+   `cmd/dex/config.go::Connector.UnmarshalJSON`. The top-level
+   `staticClients[].secret` field stores its value verbatim, so Dex
+   was comparing the BB-supplied real hex against the literal string
+   `"$BB_SCHED_OIDC_SECRET"`. The dedicated escape hatch is the
+   `secretEnv: VAR_NAME` (no `$`) field on `storage.Client` —
+   resolved via `os.Getenv()` at config load time, distinct from the
+   raw-text `os.ExpandEnv` path. Same caveat for `idEnv`. Fix:
+   replaced both `secret: $...` lines with `secretEnv: ...` in
+   `dex.yaml` (`bb-browser`, `bb-scheduler-admin`); the connector's
+   `clientID/clientSecret` lines stay on `$VAR` syntax because
+   they're inside `connectors[].config.*` where expansion does run.
+
+#### Implementation
+
+1. **`compose/config/common.libsonnet`** — added a generic
+   `oidcAuth(clientId, clientSecret, redirectUrl, cookieSeed)` builder
+   plus three new placeholders (`__BB_PUBLIC_URL__` already existed):
+   - `__BB_SCHEDULER_URL__` → `https://$PUBLIC_HOSTNAME:7982`
+   - `__BB_OIDC_ISSUER__` → `https://$PUBLIC_HOSTNAME:5556`
+   The builder hard-codes `useIdTokenClaims: {}`, scopes
+   `[openid, email, profile, groups, offline_access]`, and the
+   `metadataExtractionJmespathExpression`
+   `{"public": {"username": preferred_username, "email": email, "groups": groups}}`.
+
+2. **`compose/config/browser.jsonnet`** — `httpServers[0].
+   authenticationPolicy = common.oidcAuth(...)` with `clientId='bb-browser'`,
+   secrets pulled from `__BB_BROWSER_OIDC_CLIENT_SECRET__` /
+   `__BB_BROWSER_COOKIE_SEED__`, redirect to
+   `common.browserUrl + '/oidc-callback'`.
+
+3. **`compose/config/scheduler.jsonnet`** — same pattern on
+   `adminHttpServers[0]` with `clientId='bb-scheduler-admin'`.
+   Other gRPC servers (clientGrpc, workerGrpc, buildQueueStateGrpc)
+   stay `allow{}` — they are not user-facing.
+
+4. **`compose/docker-compose.yml`** — `dex.networks.default.aliases:
+   [bb-psmdb.ddns.net]` (see choice #3 above).
+
+5. **`scripts/create-central.sh`**:
+   - `bake_env` generates `BB_BROWSER_COOKIE_SEED` and
+     `BB_SCHED_COOKIE_SEED` (`openssl rand -hex 32`) and persists
+     them in `.env` alongside the OIDC client secrets, with the same
+     "preserve across re-runs" semantics (rotating either invalidates
+     all live sessions).
+   - sed-replace pass for all six new placeholders, followed by an
+     anti-regression `grep -RIl '__BB_[A-Z_]*__'` that fails the
+     deploy if any token survived.
+   - Smoke test loops over `[browser:7984:bb-browser,
+     scheduler:7982:bb-scheduler-admin]` and asserts each `/` returns
+     a 302 to `https://$PUBLIC_HOSTNAME:5556/auth?...client_id=<expected>...`.
+     A 200 here would mean the OIDC placeholders weren't replaced and
+     BB silently fell back to allow{}.
+
+#### Verification
+
+- [x] `curl -sI https://bb-psmdb.ddns.net:7984/` → `302 location:
+      https://bb-psmdb.ddns.net:5556/auth?client_id=bb-browser&...`
+      (covered by `create-central.sh` smoke test on every redeploy)
+- [x] `curl -sI https://bb-psmdb.ddns.net:7982/` → `302 location:
+      https://bb-psmdb.ddns.net:5556/auth?client_id=bb-scheduler-admin&...`
+      (covered by `create-central.sh` smoke test on every redeploy)
+- [ ] Browser end-to-end (manual, one-time after Step 4 deploy): open
+      `https://bb-psmdb.ddns.net:7984/`, click through GitHub consent →
+      land on bb-browser UI. Repeat for `:7982/`.
+- [ ] Non-team-member account hits "User not in any required org/team"
+      page at Dex `/callback` and never reaches BB. (Manual; needs an
+      account that's NOT in build-engineers/iit/dev-psmdb.)
+
+### Step 5 — JWT for Bazel clients via Dex Device Code flow (server side) — DONE
+
+**Architecture decision change vs. the original draft**: the first plan
+proposed minting our own RSA JWT via a `scripts/issue-rbe-jwt.sh` utility
+(static keypair, manual `kid` rotation, secret distribution). We replaced
+this with a **Dex-issued OIDC token** via the OAuth 2.0 Device
+Authorization Grant (RFC 8628). Reasons:
+
+- **No new key material**. Dex is already running for the UIs (Step 3 + 4)
+  and already owns a JWT signing key (rotated every 6 h, last 24 h kept
+  in `/keys`). Reusing it eliminates the parallel "RBE-only" key universe.
+- **Auto-refresh, no quarterly rotation drama**. Tokens are short-lived
+  (1 h `id_token` + 90 d sliding refresh) and refreshed silently by the
+  Bazel wrapper. There is no "issue 10-20 tokens by hand every 90 days"
+  ritual.
+- **Same identity model as the UIs**. `sub` and `groups` claims come from
+  GitHub via Dex's connector — the same allow-list (Percona orgs +
+  build-engineers / iit / dev-psmdb teams) that gates bb-browser /
+  bb-scheduler-admin gates Bazel access. One source of truth.
+- **Revocation = remove from the GitHub team**. No "rotate `kid`,
+  redistribute to N people" emergency procedure.
+- **Headless / SSH-only machines work** via the Device Code flow
+  (RFC 8628): the wrapper prints a `https://bb-psmdb.ddns.net:5556/device`
+  URL + a short user_code; the engineer logs in on any browser-capable
+  device, the wrapper polls Dex's `/token` endpoint, and the build
+  proceeds. No in-tunnel browser required.
+
+This step covers **only the server side** (Dex + Envoy). The client
+side (wrapper_hook + `bazel-rbe-login` CLI) is Step 5b in the
+`percona-server-mongodb` repo.
+
+**Goal**: every Bazel client must present a valid signed JWT issued by
+Dex; Envoy validates it via `remote_jwks` against Dex's `/keys`. The BB
+frontend itself stays `allow{}` because all traffic to it has already
+been authenticated upstream.
+
+#### 5.1 Dex — `bazel-cli` public client (Device Code grant)
+
+Add a third static client to `compose/dex/dex.yaml` next to
+`bb-browser` and `bb-scheduler-admin`:
+
+```yaml
+- id: bazel-cli
+  name: 'Bazel RBE CLI'
+  public: true
+  redirectURIs:
+  - urn:ietf:wg:oauth:2.0:oob
 ```
 
-`cookieSeed` = 32 random bytes, base64-encoded; stored in env file
-(read by `docker-compose` and surfaced via `--ext-str` to `jsonnet`).
+- `public: true` — no `secretEnv`. Bazel clients run on developer
+  machines / CI runners; we cannot safely ship a client secret there.
+  Security comes from PKCE (mandatory in Dex when there is no password
+  connector) plus the team-membership gate in the GitHub connector
+  (a stolen `device_code` is useless without also passing GitHub OAuth
+  as a member of one of the allowed teams).
+- `redirectURIs` — Device Code flow does not use them, but Dex's
+  static-client validation requires at least one. The
+  `urn:ietf:wg:oauth:2.0:oob` placeholder makes it explicit that no
+  real callback URL is expected.
+- Dex enables the device-code grant on every public client by default;
+  no extra `oauth2.grantTypes` is needed.
 
-### Step 5 — JWT for Bazel clients (RS256), enforced in Envoy
+#### 5.2 Envoy — `jwt_authn` + `remote_jwks` against Dex
 
-**Goal**: every Bazel client must present a valid signed JWT. Validation
-happens in Envoy (since Envoy is already on the path for reapi-proxy);
-the BB frontend itself stays `allow{}` because all traffic to it has
-already been authenticated upstream.
+Patch `IaC/buildbarn/reapi-proxy/envoy.yaml`:
 
-1. Generate one RSA-2048 key pair (one-time, outside repo):
-   ```bash
-   openssl genrsa -out /secrets/rbe-jwt-private.pem 2048
-   openssl rsa  -in /secrets/rbe-jwt-private.pem -pubout -out /secrets/rbe-jwt-public.pem
-   step crypto key format --jwk /secrets/rbe-jwt-public.pem > bazel-clients-jwks.json
-   ```
-   Add `kid` (key ID) to JWKS, e.g. `"kid": "rbe-2026-01"`. Rotate annually
-   by issuing new keys with new `kid` and updating JWKS file.
-2. Mount `bazel-clients-jwks.json` (public-only, safe to ship in image) into
-   the Envoy container at `/etc/envoy/jwks/bazel-clients.json`.
-3. Add the JWT filter to Envoy `http_filters`, **before** the router:
-   ```yaml
-   http_filters:
-   - name: envoy.filters.http.jwt_authn
-     typed_config:
-       "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
-       providers:
-         percona_rbe_issuer:
-           issuer: percona-rbe-issuer
-           audiences: [percona-rbe]
-           local_jwks:
-             filename: /etc/envoy/jwks/bazel-clients.json
-           forward: true                # forward token downstream for traceability
-           forward_payload_header: x-jwt-payload  # optional, useful for logging
-           from_headers:
-           - name: authorization
-             value_prefix: "Bearer "
-       rules:
-       - match: { prefix: "/" }
-         requires:
-           provider_name: percona_rbe_issuer
-   - name: envoy.filters.http.router
-     typed_config:
-       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-   ```
-   Refs: [Envoy `jwt_authn` filter docs](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/jwt_authn_filter),
-   [`JwtAuthentication` proto](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/jwt_authn/v3/config.proto).
-   - JWKS file is reloaded automatically when `local_jwks.filename` changes
-     and Envoy is reloaded; for fully hot-reload use SDS (later improvement).
-4. Token issuance utility `scripts/issue-rbe-jwt.sh <subject> [validity-days]`:
-   - signs `{sub, iss: percona-rbe-issuer, aud: percona-rbe, iat, exp, kid}` with private key.
-   - Default validity 365 days.
-   - Output: a single base64url string. To revoke: rotate JWKS `kid`.
-5. Install:
-   - **Jenkins**: store as Jenkins credential `rbe-jwt-token` (Secret text).
-     `withCredentials([string(credentialsId:'rbe-jwt-token', variable:'RBE_JWT_TOKEN')])`
-     in pipelines.
-   - **Devs**: distribute individually (1 token per person), they `export RBE_JWT_TOKEN=...` in shell init.
+```yaml
+http_filters:
+- name: envoy.filters.http.jwt_authn
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+    providers:
+      dex_provider:
+        issuer: https://bb-psmdb.ddns.net:5556
+        audiences: [bazel-cli]
+        remote_jwks:
+          http_uri:
+            uri: https://bb-psmdb.ddns.net:5556/keys
+            cluster: dex_jwks
+            timeout: 5s
+          cache_duration: 600s
+        forward: true
+        from_headers:
+        - name: authorization
+          value_prefix: "Bearer "
+    rules:
+    - match: { prefix: "/" }
+      requires: { provider_name: dex_provider }
+- name: envoy.filters.http.router
+  ...
+```
 
-**BB-side note**: with Envoy enforcing the JWT, BB scheduler `clientGrpcServers`
-and frontend `grpcServers` can stay `allow{}` — Envoy is the only ingress
-to them. We can OPTIONALLY also enable BB JWT auth as defense-in-depth
-(Envoy does it primarily; BB does it secondarily). Adds CPU cost but no
-functional benefit. Default: keep BB `allow{}`, document that all auth lives
-in Envoy.
+Plus a new `dex_jwks` upstream cluster pointing at the
+`bb-psmdb.ddns.net` docker network alias (added on the Dex service in
+Step 4) on port 5556, with TLS upstream context, SNI =
+`bb-psmdb.ddns.net`, and `validation_context.trusted_ca` =
+`/etc/ssl/certs/ca-certificates.crt` (Let's Encrypt R10/R11 is in the
+system bundle). Pinning SAN match to `bb-psmdb.ddns.net` prevents an
+upstream impersonation attack from succeeding even if a different cert
+ever ended up trusted in the bundle.
 
-### Step 6 — Bazel client side (`.bazelrc.psmdb` + `wrapper_hook.py`)
+`forward: true` keeps the Authorization header attached when Envoy
+forwards to BB. BB does not validate it today (frontend stays
+`allow{}` on the docker bridge), but leaving it in the request lets us
+turn on BB-side JWT validation as defense-in-depth later without
+re-shipping Envoy.
 
-In every PSMDB branch ([`v8.0`](../../percona-server-mongodb/.bazelrc.psmdb), `v8.3`, `master`):
+#### 5.3 Audience pinning
+
+`audiences: [bazel-cli]` in the jwt_authn provider means a token minted
+for `bb-browser` or `bb-scheduler-admin` (different `aud`) cannot be
+replayed against the gRPC endpoint, even though all three are signed
+by the same Dex key. This is a defense-in-depth against e.g. a
+developer accidentally pasting their UI session's id_token into
+`--remote_header`.
+
+#### 5.4 Smoke tests added to `create-central.sh`
+
+- `GET /keys` on `https://bb-psmdb.ddns.net:5556` returns a JWKS with
+  at least one key (`.keys | length > 0`). An empty set means Envoy
+  jwt_authn rejects every RPC.
+- `grpcurl -insecure -d {} 127.0.0.1:8981 build.bazel.remote.execution.v2.Capabilities/GetCapabilities`
+  from inside the scaler container (host networking, ships grpcurl)
+  must respond with `Jwt is missing` / `Unauthenticated`. A 200 response
+  here means jwt_authn is silently OFF.
+
+#### 5.5 BB-side note (unchanged from original plan)
+
+With Envoy enforcing the JWT, BB scheduler `clientGrpcServers` and
+frontend `grpcServers` stay `allow{}` — Envoy is the only ingress to
+them on this host. Optional defense-in-depth (BB also validating the
+forwarded JWT) is deferred; current plan keeps BB `allow{}` and
+documents that all gRPC auth lives in Envoy.
+
+### Step 5b — Bazel client (`.bazelrc.psmdb` + `wrapper_hook.py`) — PR-READY
+
+Tracked in a separate `percona-server-mongodb` repo PR (PSMDB-2043).
+Server side (Step 5) is independently testable with `grpcurl` once a
+developer has obtained a token via Dex's `/device/code` + `/token`
+directly; the wrapper just automates that.
+
+**What landed in PSMDB-2043** (one PR per branch, `v8.0` / `v8.3` /
+`master`):
+
+* `bazel/wrapper_hook/rbe_auth.py` — new module. Stdlib only
+  (`urllib`, `json`, `ssl`, `base64`). Single entry-point
+  `get_id_token()` with the four-tier fallback (cache → refresh →
+  device-code on TTY → `RbeAuthRequired` non-TTY). Token cache at
+  `~/.cache/rbe/token.json` mode 0600, atomic-rename writes.
+  Constants `ISSUER` / `CLIENT_ID` / `AUDIENCE` hardcoded at the top
+  of the file (variant D from the design discussion — one file to
+  edit when the buildfarm migrates off `bb-psmdb.ddns.net`, no env
+  var ceremony).
+* `bazel/wrapper_hook/bazel-rbe-login` — standalone CLI. Modes:
+  default (force fresh device-code flow), `--status`, `--logout`,
+  `--print-token` (handy for `grpcurl` smoke tests).
+* `bazel/wrapper_hook/wrapper_hook.py` — hook in `main()`. When the
+  current build invocation contains `--config=psmdb_buildfarm`,
+  fetch the token and `append_args(args,
+  ["--remote_header=authorization=Bearer <token>"])` before writing
+  the final args file. Failure modes return a friendly `_info()`
+  line and `sys.exit(4)` rather than letting Bazel run the build
+  unauthenticated and fail every action with Envoy 401s.
+* `.bazelrc.psmdb` — endpoint flipped from
+  `grpc://95.216.189.238:8981` (rotating primary IP, plain gRPC) to
+  `grpcs://bb-psmdb.ddns.net:8981` (TLS, hostname pinned to the
+  Hetzner Floating IP).
+
+**Explicitly not in PSMDB-2043 (deferred)**:
+
+* No `--remote_header` line in `.bazelrc.psmdb`. The token is
+  per-user, lives 1 h, and committing it would defeat the point.
+* No proactive expiry warnings in `wrapper_hook.py`. Users only see
+  the prompt when their build is actually blocked, same UX as
+  `gh auth login`.
+* Jenkins service-account flow → Step 5c.
+
+In every PSMDB branch (`v8.0`, `v8.3`, `master`):
 
 ```
 build:psmdb_buildfarm --remote_executor=grpcs://bb-psmdb.ddns.net:8981
 build:psmdb_buildfarm --remote_cache=grpcs://bb-psmdb.ddns.net:8981
-# JWT injected by wrapper_hook from RBE_JWT_TOKEN env
+# Authorization header injected by wrapper_hook from ~/.cache/rbe/token.json
 ```
 
-`wrapper_hook.py` (already present in PSMDB) gets a small extension: when
-`RBE_JWT_TOKEN` is set, append `--remote_header=authorization=Bearer ${RBE_JWT_TOKEN}`
-to the command line. Avoids leaking the token into committed files.
+`wrapper_hook.py` extension (`bazel/wrapper_hook/rbe_auth.py`) does:
 
-### Step 7 — Hetzner Cloud Firewall
+1. Look for `~/.cache/rbe/token.json` (mode 0600): `{access_token,
+   id_token, refresh_token, expires_at}`.
+2. If `id_token` is still valid (with 60 s skew margin), inject
+   `--remote_header=authorization=Bearer <id_token>` into the Bazel
+   argv and continue.
+3. If expired but `refresh_token` is present, exchange it at
+   `https://bb-psmdb.ddns.net:5556/token` (silent), update
+   `token.json`, inject, continue.
+4. If `refresh_token` is missing/rejected and stdin is a TTY: start
+   the Device Authorization Grant — print the URL + user_code on
+   stderr (no fancy "your token expires in 7 days" preamble; users
+   only see the prompt when their build is actually blocked), poll
+   `/token` every `interval` seconds until success / denial / timeout,
+   persist tokens, inject, continue.
+5. Non-TTY (e.g. Jenkins, deferred to Step 5c): fail fast with a
+   short error pointing at the standalone `bazel-rbe-login` tool —
+   no interactive flow attempted.
+
+A standalone `bazel-rbe-login` utility lives next to `wrapper_hook.py`
+for explicit re-auth ahead of a build (e.g. when a user knows their
+refresh token has been revoked).
+
+The wrapper does **not** scan stderr for 401s or print proactive token
+expiry warnings. If a build fails with a 401-equivalent gRPC status,
+the user re-runs `bazel-rbe-login` and tries again — same UX as a
+GitHub `gh` re-auth.
+
+#### 5d — Worker bypass (Option C) — DONE
+
+**Symptom (E2E test 2026-04-28):** With Steps 1+5 deployed, the first
+`bazel build --config=psmdb_buildfarm install-dist-test` from a fresh
+laptop got 10 437 cache hits on the unary CAS/AC path through Envoy
+(JWT validated, TLS terminated — exactly Step 5's contract), then
+**every remote-execution attempt** failed with:
+
+```
+Remote Execution Failure: Unavailable: Failed to obtain input directory ".":
+connection error: desc = "error reading server preface: unexpected EOF"
+```
+
+**Root cause:** Bazel client → Envoy → frontend works fine. But the
+**worker** also has to fetch action inputs from CAS, and our worker
+config (`worker/config/common.libsonnet` from the PSMDB-2040 design)
+pointed those reads at the **same Envoy listener on `:8981`**:
+
+```
+contentAddressableStorage: { grpc: { client: { address: '__CENTRAL_PRIVATE_IP__:8981' } } }
+actionCache:               { grpc: { client: { address: '__CENTRAL_PRIVATE_IP__:8981' } } }
+fileSystemAccessCache:     { grpc: { client: { address: '__CENTRAL_PRIVATE_IP__:8981' } } }
+```
+
+That was harmless before Step 5 (Envoy was a transparent passthrough).
+After Step 5, Envoy `:8981` requires:
+* TLS (worker would need to trust our self-signed cert), and
+* a Dex-issued OIDC bearer token in `authorization: Bearer …`.
+
+Workers are headless ondemand VMs spawned by `scaler/bootstrap.py`.
+They have neither. The plaintext gRPC handshake into a TLS listener
+manifests as "unexpected EOF" at HTTP/2 framing time — Envoy drops
+the TCP connection because byte 0 isn't a valid TLS ClientHello.
+
+**Why not just give workers a JWT:** would have meant either
+(a) provisioning a long-lived service-account token to every spawned
+VM (key-distribution problem we don't currently have), or
+(b) adding `oauth2-token-source` plumbing to `bb-runner` and a Dex
+client-credentials flow. Both add ~hours of build time across thousands
+of remote actions for the TLS handshake alone, with no security gain
+because the workers already live behind the Hetzner private network
+perimeter.
+
+**Fix (Option C — "workers bypass Envoy"):** route worker→CAS over
+the trusted private hop, leave Envoy purely as the public auth gateway.
+
+* `compose/docker-compose.yml` — bb-frontend already had
+  `expose: 8980` (intra-compose). **Added** a host port mapping
+  `${PRIVATE_IP}:8980:8980` so the same listener is reachable from
+  worker VMs over the Hetzner private interface, but **NOT** on
+  the public IP.
+* `worker/config/common.libsonnet` — flipped CAS / AC / FSAC
+  `address` from `__CENTRAL_PRIVATE_IP__:8981` to
+  `__CENTRAL_PRIVATE_IP__:8980`. Updated the file header to spell
+  out the security reasoning so the next person editing it doesn't
+  "fix" it back.
+* `scripts/create-central.sh` — new smoke test asserts:
+  `:8980 reachable on $PRIVATE_IP`, `:8980 NOT reachable on
+  $PUBLIC_IP` (proves we didn't accidentally re-expose CAS to
+  the public Internet).
+
+**Auth posture after 5d:**
+
+| Path                         | Listener         | TLS | Auth         | Why |
+|------------------------------|------------------|-----|--------------|-----|
+| Bazel client → CAS/AC        | Envoy `:8981`    | yes | Dex JWT      | public Internet |
+| Bazel client → executor      | Envoy `:8981`    | yes | Dex JWT      | public Internet |
+| Worker → CAS/AC/FSAC         | frontend `:8980` | no  | network only | Hetzner private subnet |
+| Worker → scheduler           | scheduler `:8983`| no  | network only | Hetzner private subnet |
+| `frontend` → storage shards  | `storage-N:8981` | no  | none         | docker bridge only |
+
+The "network only" hops are protected by Hetzner Cloud Firewall + the
+private-network ACL (Step 6 will tighten the FW rules; the network
+itself is already isolated to the `psmdb.cd` cloud network).
+
+**Verification on `master`:**
+```
+INFO: Elapsed time: 361.588s, Critical Path: 332.49s
+INFO: 18209 processes: 10437 remote cache hit, 5967 internal, 1803 local, 2 remote.
+INFO: Build completed successfully, 18209 total actions
+```
+
+The `2 remote` count is the new evidence — those are actions that
+actually went to a freshly-spawned worker VM, fetched inputs from
+`frontend:8980` over the private IP, executed, and uploaded outputs
+back. Previously every "remote execution" attempt hit the EOF.
+
+**Operational note:** existing idle workers carry the OLD
+`common.libsonnet` (with `:8981`). On a Step-5d redeploy you must
+either (a) wait ~10 min for the scaler's idle reaper, or (b) delete
+them via `hcloud server delete` from the operator's laptop. Spawned
+workers AFTER the redeploy automatically get the new config because
+`scaler/bootstrap.py` re-renders user-data from
+`/var/lib/buildbarn/worker/` on every spawn.
+
+#### 5b.1 Jenkins — deferred (Step 5c)
+
+The Device Code flow assumes a human at a browser. For Jenkins jobs
+we will issue a service-account refresh token via Dex's `/token`
+endpoint with a long-lived client and store it as a Jenkins
+credential. Tracked separately because it requires a different Dex
+client config (`offline_access`, no PKCE) and a per-job rotation
+policy that is out of scope for the human-developer Step 5b.
+
+### Step 6 — Hetzner Cloud Firewall
 
 Create one firewall (`rbe-central-fw`) attached to the central VM:
 
@@ -800,12 +1111,10 @@ The Dex `connectors[].config.orgs[].teams[]` allow-list does not change — team
 |---|---|---|
 | 4 | **Rollout = (c) in-place rolling** | Step 1 (TLS gRPC) → smoke → Step 2 (TLS UI) → smoke → Step 3 (Dex stand-alone, not yet wired) → smoke → Step 4 (UI OIDC) → smoke → Step 5 (JWT for Bazel) → smoke. Rollback at any step is `git revert` + `docker compose up -d`. |
 | 5 | **Dex storage = SQLite on persistent volume** (`/var/lib/buildbarn/dex/dex.db`, mode 0600) | Dex's storage holds OAuth auth-codes, refresh tokens, offline sessions, and Dex's own JWT signing-key history (rotates every 6 h, keeps 24 h). Users come from GitHub; Dex itself doesn't store user accounts. SQLite cost: one tiny file on the same volume that already holds CAS+certs. Survives container restart and central VM redeploy (volume persists). Postgres would be overkill for ~10 interactive UI users; `memory:` would force a re-login on every Dex restart. Migration path: switch the `storage:` block to `postgres`/`mysql` later if scale demands — no data needs to be migrated, since Dex storage is all short-lived state. |
-
-### Pending — please confirm before Step 5 (Bazel JWT)
-
-| # | Question | Default if not specified |
-|---|---|---|
-| 6 | **JWT lifetime / rotation cadence** — 1y default? Or shorter (90d) with auto-rotate? | 1y default for human users, `kid` rotation annually. Jenkins token: same 1y + Jenkins-credentials manual rotation. Shorter terms only if infosec asks. |
+| 6 | **JWT lifetime / rotation = Dex-issued OIDC token, NOT static signing key** (1 h `id_token` + 90 d sliding refresh, key `kid` rotated by Dex every 6 h) | First draft proposed a per-deployment RSA-2048 keypair + `scripts/issue-rbe-jwt.sh` + 90 d / quarterly rotation. Reusing Dex eliminates that key universe entirely: same identity model as the UIs (GitHub team gate), automatic refresh in the wrapper, revocation = remove from GitHub team. Headless / SSH-only machines work via Device Authorization Grant (RFC 8628) — print URL + user_code on stderr, poll `/token` until login completes on a separate browser-capable device. |
+| 7 | **No proactive token-expiry warnings in `wrapper_hook.py` for human users** | First draft of Step 5b suggested printing "your token expires in 7 days" notices. Removed — human developers only see the prompt when their build is actually blocked, same UX as a `gh auth login` re-prompt. Token monitoring on Jenkins is a separate concern (Step 5c, deferred). |
+| 8 | **`envoy-proxy` MUST restart on `envoy.yaml` change** | Initially excluded from `create-central.sh`'s `docker compose restart` list under the (wrong) assumption that "reapi-proxy + envoy configs are baked at build time". `envoy.yaml` is bind-mounted; `compose up -d` doesn't pick up bind-mount file changes. Bit us briefly during Step 5 testing where edits to the jwt_authn filter weren't picked up. The path `/var/lib/buildbarn/reapi-proxy/envoy.yaml` is misleading too — the file is the **envoy** proxy's config, not reapi-proxy's. |
+| 9 | **Dex `bazel-cli` static client MUST list `/device/callback` in `redirectURIs`** (in addition to `urn:ietf:wg:oauth:2.0:oob`) | Dex's Device Code handler does NOT special-case `/device/callback` in the redirect-URI validator. When the user opens `/device`, picks GitHub, and gets bounced through GitHub OAuth, Dex starts an *internal* OIDC flow with `redirect_uri=/device/callback` (its own handler that finishes the device-code → id_token exchange) and validates THAT against the same `staticClients[].redirectURIs` list as any other OAuth flow. Without it the GitHub-login step ends with `Bad Request: Unregistered redirect_uri ("/device/callback")`. This is a Dex-side wart and is documented inside `dex.yaml` next to the field. |
 
 ---
 

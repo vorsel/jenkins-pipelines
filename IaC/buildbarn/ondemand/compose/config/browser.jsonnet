@@ -15,9 +15,31 @@ local common = import 'common.libsonnet';
     listenAddresses: [':7984'],
     // TLS termination — cert/key picked up from the volume-mounted
     // /etc/buildbarn/certs/, hot-reloaded every refreshInterval (1h).
-    // No auth yet; OIDC via Dex lands in a follow-up step.
     tls: common.serverTls,
-    authenticationPolicy: { allow: {} },
+    // OIDC delegation to Dex. Anonymous requests get a 302 to Dex /auth
+    // → GitHub OAuth → Dex /callback (where team membership is checked)
+    // → /oidc-callback here (BB exchanges code for token, drops a
+    // session cookie). See common.libsonnet :: oidcAuth for the full
+    // flow walk-through and the precise reasons each field is shaped
+    // the way it is.
+    //
+    // CLIENT IDENTITY: 'bb-browser' is the Dex staticClient ID declared
+    // in compose/dex/dex.yaml; the secret on the next line is the
+    // matching staticClient secret. Both placeholders are sed-replaced
+    // by create-central.sh's bake_env step from .env (mode 0600,
+    // generated once with `openssl rand -hex 32` and preserved across
+    // re-runs to avoid invalidating live sessions).
+    //
+    // CALLBACK: /oidc-callback is registered in dex.yaml's staticClients
+    // [bb-browser].redirectURIs. Path chosen to NOT overlap with any
+    // valid bb-browser route (CAS blob views, action explorers, etc.
+    // all live under /<digest>/… or /operations/…).
+    authenticationPolicy: common.oidcAuth(
+      clientId='bb-browser',
+      clientSecret='__BB_BROWSER_OIDC_CLIENT_SECRET__',
+      redirectUrl=common.browserUrl + '/oidc-callback',
+      cookieSeed='__BB_BROWSER_COOKIE_SEED__',
+    ),
   }],
   global: common.global,
   fileSystemAccessCache: common.fileSystemAccessCache,
