@@ -1713,11 +1713,17 @@ Our current `.bazelrc.local` sets `--spawn_strategy=remote,local` and `--strateg
 
 Permanent nodes (always present):
 
+Live IPs for these nodes are recorded in `INFRASTRUCTURE.md` (the
+operator runbook — see `INFRASTRUCTURE.md.example` for the template),
+not here, so the public mirror of this repo doesn't double as a
+target list for opportunistic scanners. Cross-reference by hostname
+when reading this section against a live cluster.
+
 | Server | Public IP | Private IP | Role | `nproc` | Concurrency | Runner image |
 |--------|-----------|------------|------|---------|-------------|--------------|
-| barn-psmdb | 65.108.253.73 | 10.30.242.3 | Central (frontend, scheduler, storage, worker, proxy) | 16 | 12 (≈×0.75, undersubscribed — shares with storage/scheduler/frontend) | `psmdb-runner-ubuntu-noble-x86_64:poc` on the `hardlinking` pool; fuse pool retains `ghcr.io/catthehacker/ubuntu:act-22.04` (unused by PSMDB) |
-| barn-psmdb-worker-1 | 95.217.219.115 | 10.30.242.4 | Worker node (worker + runner) | 16 | 24 (×1.5 oversubscribed) | `psmdb-runner-ubuntu-noble-x86_64:poc` |
-| barn-psmdb-worker-2 | 95.217.221.140 | 10.30.242.5 | Worker node (worker + runner, **multi-pool**) | 16 | 24 on ubuntu24 pool **+** 24 on debian12 pool (independent caps; see §9.7 second variant) | `psmdb-runner-ubuntu-noble-x86_64:poc` (ubuntu24 pool) **+** `psmdb-runner-debian-bookworm-x86_64:poc` (debian12 pool) |
+| barn-psmdb | (see runbook) | (see runbook) | Central (frontend, scheduler, storage, worker, proxy) | 16 | 12 (≈×0.75, undersubscribed — shares with storage/scheduler/frontend) | `psmdb-runner-ubuntu-noble-x86_64:poc` on the `hardlinking` pool; fuse pool retains `ghcr.io/catthehacker/ubuntu:act-22.04` (unused by PSMDB) |
+| barn-psmdb-worker-1 | (see runbook) | (see runbook) | Worker node (worker + runner) | 16 | 24 (×1.5 oversubscribed) | `psmdb-runner-ubuntu-noble-x86_64:poc` |
+| barn-psmdb-worker-2 | (see runbook) | (see runbook) | Worker node (worker + runner, **multi-pool**) | 16 | 24 on ubuntu24 pool **+** 24 on debian12 pool (independent caps; see §9.7 second variant) | `psmdb-runner-ubuntu-noble-x86_64:poc` (ubuntu24 pool) **+** `psmdb-runner-debian-bookworm-x86_64:poc` (debian12 pool) |
 
 All workers have **32 GB swap** enabled to absorb peak memory on PSMDB's ~2–3 GB RSS `cc1plus` compilations (see §10 Improvements #6).
 
@@ -1744,10 +1750,10 @@ Client invokes with `--jobs=96` so the scheduler always has work queued regardle
 
 | Port | Service | Host |
 |------|---------|------|
-| 8980 | BuildBarn frontend (gRPC, direct) | 65.108.253.73 |
-| 8981 | Envoy proxy (gRPC, for PSMDB clients) | 65.108.253.73 |
-| 7984 | bb-browser (HTTP) | 65.108.253.73 |
-| 7982 | Scheduler admin (HTTP) | 65.108.253.73 |
+| 8980 | BuildBarn frontend (gRPC, direct) | barn-psmdb (see runbook for IP) |
+| 8981 | Envoy proxy (gRPC, for PSMDB clients) | barn-psmdb (see runbook for IP) |
+| 7984 | bb-browser (HTTP) | barn-psmdb (see runbook for IP) |
+| 7982 | Scheduler admin (HTTP) | barn-psmdb (see runbook for IP) |
 
 ## Part 11: Release Matrix Roadmap
 

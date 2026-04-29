@@ -1,0 +1,136 @@
+# BuildBarn — Operator Infrastructure Runbook (template)
+
+> **DO NOT** rename this file to `INFRASTRUCTURE.md` and commit it. The
+> repo-root `.gitignore` blocks `IaC/buildbarn/**/INFRASTRUCTURE.md`
+> on purpose, but git is good at outsmarting itself. If you want to
+> keep the live runbook in version control, store it in a private
+> Percona repo, the corp password manager, or a Vault entry — anywhere
+> that isn't this public-bound repository.
+>
+> Workflow:
+>   `cp INFRASTRUCTURE.md.example INFRASTRUCTURE.md`
+>   then fill in the placeholders below from your live deployment.
+>   `INFRASTRUCTURE.md` will sit untracked in your local working copy
+>   and survive `git pull` / `git checkout`.
+
+This file complements `ondemand/compose/.env.example`. The `.env.example`
+is the *form* (variable names + per-variable comments, all in one place
+so docker-compose can source it). This file is the *map* — it pairs
+each placeholder with where it appears in code/docs/Hetzner console and
+why it's there. When you change something live, search this file first
+to find every other place that needs the same edit.
+
+---
+
+## 1. Domain / DNS
+
+| Placeholder | Live value (fill in) | Source / where set |
+|---|---|---|
+| `${PUBLIC_HOSTNAME}` | `____________________` | DNS A record (No-IP for dev) → `${PUBLIC_IP}`. Subject of the Let's Encrypt cert at `/etc/buildbarn/certs/fullchain.pem`. |
+| `${LE_EMAIL}` | `____________________` | `certbot register --email …` — Let's Encrypt notifications. Use a Percona address (e.g. `builds-noreply@percona.com`); personal mail leaks into LE's public CT log. |
+
+Migration trigger: when this graduates onto a Percona-owned domain, the
+swap touches:
+- DNS (point new hostname at the same Floating IP)
+- Cert renewal hook (`certbot certonly … -d <new>`)
+- `${PUBLIC_HOSTNAME}` in `.env`
+- Dex `oidcIssuer` (`compose/dex/dex.yaml`) and OAuth callback URL on
+  GitHub
+- All redirect URIs registered in `dex.yaml::staticClients[].redirectURIs`
+
+## 2. Hetzner Cloud project
+
+| Placeholder | Live value (fill in) | Where it appears |
+|---|---|---|
+| `${HCLOUD_PROJECT_NAME}` | `____________________` | Hetzner console > Projects |
+| `${HCLOUD_TOKEN}` | `(in .env only)`     | Project > Security > API tokens. Read+write on servers, networks, SSH keys. |
+| `${HCLOUD_NETWORK_ID}` | `____________________` | `hcloud network list -o noheader -o columns=id,name`. Numeric ID workers join on spawn. |
+| `${HCLOUD_NETWORK_NAME}` | `____________________` | Same query, name column. Used in Hetzner console UI navigation. |
+| `${HCLOUD_NETWORK_CIDR}` | `____________________` | `hcloud network describe ${HCLOUD_NETWORK_ID}`. The `/16` your private IPs come from. |
+
+## 3. Central VM
+
+| Placeholder | Live value (fill in) | Notes |
+|---|---|---|
+| `${CENTRAL_VM_NAME}` | `____________________` | `hcloud server list` |
+| `${CENTRAL_VM_TYPE}` | `____________________` | e.g. cpx41. Influences how many workers you can colocate; doesn't affect auth. |
+| `${CENTRAL_PUBLIC_IP}` | `____________________` | Primary IPv4 of the VM. **Rotates** on VM redeploy — do NOT bake into anything stable. |
+| `${PUBLIC_IP}` (Floating) | `____________________` | Hetzner Floating IP attached to the central VM. The DNS A-record points HERE. Stable across VM redeploy; €1/mo. |
+| `${PRIVATE_IP}` | `____________________` | Address in `${HCLOUD_NETWORK_CIDR}`. Workers dial scheduler at `${PRIVATE_IP}:8983` and frontend at `${PRIVATE_IP}:8980`. |
+
+## 4. Worker fleet (existing barn-psmdb cluster — pre-ondemand)
+
+The legacy fixed-size cluster mentioned in
+`buildbarn-remote-execution-setup.md` lives separately from the
+ondemand work covered here. Inventory it once for reference:
+
+| Role | Hostname | Public IP (fill in) | Private IP (fill in) |
+|---|---|---|---|
+| central | `____________________` | `____________________` | `____________________` |
+| worker-1 | `____________________` | `____________________` | `____________________` |
+| worker-2 | `____________________` | `____________________` | `____________________` |
+
+(The ondemand cluster doesn't have a fixed worker IP table — those VMs
+are spawned/destroyed by the scaler and addressed by name only.)
+
+## 5. GitHub OAuth App
+
+| Placeholder | Live value (fill in) | Notes |
+|---|---|---|
+| `${GITHUB_OAUTH_APP_NAME}` | `____________________` | App display name shown on the GitHub login page. Currently a personal app; the swap to a Percona-org app is documented in `buildbarn-auth-tls-plan.md` §"Migration Path". |
+| `${GITHUB_OAUTH_CLIENT_ID}` | `(in .env only)`     | Format: `Iv1.<16hex>` or `Ov23li<random>`. |
+| `${GITHUB_OAUTH_CLIENT_SECRET}` | `(in .env only)` | Generated once on the GitHub side; if rotated, edit `.env` and `docker compose restart dex`. |
+| `${GITHUB_TEAM_SLUGS}` | `percona/build-engineers, percona/iit, percona/dev-psmdb` | Lives in `compose/dex/dex.yaml::connectors[].config.orgs[].teams`. Removing a team rejects its members at next OIDC refresh. |
+
+## 6. OIDC / cookie secrets
+
+These are generated locally by `create-central.sh::bake_env()`
+the first time it runs (`openssl rand -hex 32`). Store the generated
+values in `.env` only — they're only valid against this specific
+Dex instance and don't need backing up; if you lose them, regenerate
+and restart Dex + bb-browser + bb-scheduler.
+
+| Placeholder | Live value (fill in) |
+|---|---|
+| `${BB_BROWSER_OIDC_SECRET}` | `(in .env only)` |
+| `${BB_SCHED_OIDC_SECRET}` | `(in .env only)` |
+| `${BB_BROWSER_COOKIE_SEED}` | `(in .env only)` |
+| `${BB_SCHED_COOKIE_SEED}` | `(in .env only)` |
+
+Effects of rotating each:
+- OIDC secrets: re-register with Dex (auto on restart). Active sessions keep working.
+- Cookie seeds: every active UI session is invalidated; users get
+  bounced through Dex on their next request. Use this if you suspect
+  a session-cookie compromise.
+
+## 7. TLS certificates
+
+Lives at `/etc/buildbarn/certs/{fullchain,privkey}.pem` on the central
+host (mode 0644 fullchain, 0640 privkey, both root:root). Bind-mounted
+read-only into bb-browser, bb-scheduler-admin, dex, envoy-proxy.
+
+| Placeholder | Live value (fill in) | Notes |
+|---|---|---|
+| Cert subject (CN/SAN) | `____________________` | Should equal `${PUBLIC_HOSTNAME}` |
+| Issuer | Let's Encrypt (R3 or successor) | |
+| Key type | ECDSA P-256 | (`certbot --key-type ecdsa --elliptic-curve secp256r1`) |
+| Renewal hook | `/etc/letsencrypt/renewal-hooks/deploy/buildbarn.sh` | Copies new cert into `/var/lib/buildbarn/certs/` and `docker compose kill -s SIGHUP envoy-proxy dex bb-browser bb-scheduler-admin` |
+| Next expiry | `____________________` | `openssl x509 -in fullchain.pem -noout -enddate` |
+
+## 8. Runtime contact / on-call
+
+| Role | Owner (fill in) | Channel |
+|---|---|---|
+| Hetzner billing | `____________________` | |
+| GitHub OAuth app owner | `____________________` | |
+| LE renewal escalation | `____________________` | |
+| Slack channel | `____________________` | |
+
+---
+
+When updating the live runbook, also update:
+- `IaC/buildbarn/ondemand/compose/.env.example` if a new variable was added
+- `IaC/buildbarn/buildbarn-auth-tls-plan.md` if the auth/TLS posture
+  changed
+- `IaC/buildbarn/buildbarn-portal-plan.md` if observability touched
+  these values

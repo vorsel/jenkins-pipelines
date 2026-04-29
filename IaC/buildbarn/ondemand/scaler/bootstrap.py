@@ -278,7 +278,7 @@ if __name__ == "__main__":
     rendered = render_user_data(
         worker_src=src,
         worker_hostname="bb-worker-dryrun-00000000-000000",
-        central_private_ip="10.30.242.7",
+        central_private_ip="10.0.0.1",
         central_public_url="http://CENTRAL_PUB:7984",
         pool_name="ubuntu-noble-x86_64__v8_3__9873907c9659",
         runner_image=sample_runner,

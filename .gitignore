@@ -3,3 +3,27 @@
 *.tfstate*
 .vscode
 .history
+
+# ---------------------------------------------------------------------------
+# IaC/buildbarn — never commit live secrets, certificates, token caches, or
+# the operator's private infrastructure runbook.
+#
+# Templates / examples (e.g. .env.example, INFRASTRUCTURE.md.example) ARE
+# committed; the live counterpart files (without `.example` suffix) MUST
+# stay out of git. See IaC/buildbarn/INFRASTRUCTURE.md.example for the
+# rationale and the catalogue of values that belong in the live runbook.
+# ---------------------------------------------------------------------------
+IaC/buildbarn/**/.env
+IaC/buildbarn/**/secrets.env
+IaC/buildbarn/**/INFRASTRUCTURE.md
+IaC/buildbarn/**/runbook.local.md
+
+IaC/buildbarn/**/*.pem
+IaC/buildbarn/**/*.key
+IaC/buildbarn/**/privkey*
+IaC/buildbarn/**/fullchain*
+IaC/buildbarn/**/token.json
+IaC/buildbarn/**/jwks*.json
+
+IaC/buildbarn/**/__pycache__/
+IaC/buildbarn/**/*.pyc

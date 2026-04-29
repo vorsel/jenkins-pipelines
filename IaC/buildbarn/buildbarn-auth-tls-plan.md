@@ -1,17 +1,36 @@
 # BuildBarn RBE — Authentication & TLS Plan
 
-> Status: **Steps 1-4 DONE; Step 5 server-side DONE (Dex `bazel-cli` client + Envoy `jwt_authn` against Dex JWKS); Step 5b (PSMDB wrapper_hook + `bazel-rbe-login`) E2E-VERIFIED on `master` (PSMDB-2043) — full `install-dist-test` build via grpcs+JWT 6:23 wall, 10437 cache hits, 2 fresh remote actions; Step 5d ("Worker bypass" / Option C) DONE — workers reach CAS/AC/FSAC via private `frontend:8980`, not Envoy; Step 6 (firewall) PENDING.**
-> Last update: 2026-04-28.
+> Status: **COMPLETE for the application-layer auth/TLS surface.**
+> Steps 1-5d all DONE and E2E-verified across `master` / `v8.3` / `v8.0`
+> PSMDB branches (PSMDB-2034 / PSMDB-2040 / PSMDB-2043). The pipeline
+> on a fresh laptop is: `rbe_login.py` → device-code OAuth via Dex →
+> `wrapper_hook.py` injects the JWT → Bazel build over
+> `grpcs://bb-psmdb.ddns.net:8981` (Envoy TLS + `jwt_authn`) → workers
+> fetch CAS/AC over the private `frontend:8980` hop. Verified end-to-end:
+> master 18 209-action build 6:23 wall (10 437 cache hits + 2 remote);
+> v8.0 12 932-action build 17:06 wall (1 995 cache hits + 4 314 remote).
+> Step 6 (Hetzner Cloud Firewall) intentionally **DEFERRED** — see
+> §"Step 6 — Hetzner Cloud Firewall — DEFERRED" for the trigger
+> conditions (upstream merge, production URI, possible Floating-IP
+> migration). Build observability (history of past invocations,
+> per-action timeline) is tracked separately in
+> [`buildbarn-portal-plan.md`](./buildbarn-portal-plan.md) — out of
+> scope for this plan, since it's an observability concern, not an
+> auth concern.
+> Last update: 2026-04-29.
 > Tracking: PSMDB-2040 (jenkins-pipelines side); separate PSMDB ticket for
 > the `percona-server-mongodb` `.bazelrc.psmdb` / `wrapper_hook.py` switch.
-> Working domain: **`bb-psmdb.ddns.net`** (No-IP free DDNS).
-> Public IP: **`95.217.242.120`** (Hetzner Floating IP, attached to the
-> central VM; survives VM redeploy).
+> Working domain: **`bb-psmdb.ddns.net`** (No-IP free DDNS, dev cluster).
+> Public IP: a Hetzner Floating IP (attached to the central VM,
+> survives VM redeploy). The exact value is in the operator's
+> `INFRASTRUCTURE.md` runbook (template:
+> `IaC/buildbarn/INFRASTRUCTURE.md.example`) — kept out of git on
+> purpose; see `.gitignore`.
 > TLS cert: Let's Encrypt via HTTP-01 standalone, ECDSA P-256, expires 2026-07-26.
 > Cert path inside containers: `/etc/buildbarn/certs/{fullchain,privkey}.pem`
 > (deploy-hook copies from `/etc/letsencrypt/live/.../` to
 > `/var/lib/buildbarn/certs/`; mode 0644).
-> Related docs: [`buildbarn-remote-execution-setup.md`](./buildbarn-remote-execution-setup.md), [`buildbarn-ondemand-scaler.md`](./buildbarn-ondemand-scaler.md), [`ondemand/README.md`](./ondemand/README.md).
+> Related docs: [`buildbarn-remote-execution-setup.md`](./buildbarn-remote-execution-setup.md), [`buildbarn-ondemand-scaler.md`](./buildbarn-ondemand-scaler.md), [`ondemand/README.md`](./ondemand/README.md), [`buildbarn-portal-plan.md`](./buildbarn-portal-plan.md) (proposed follow-up: build observability via bb-portal).
 
 This document captures the comprehensive plan for securing the public endpoints
 of our BuildBarn Remote Build Execution cluster on Hetzner Cloud. It is the
@@ -210,7 +229,7 @@ covers single names only). One cert, one hostname, four listening ports.
                                    ↓
             claims.groups = ["percona:dev-psmdb", …]
 
-Internal (Hetzner private network 10.0.0.0/16):
+Internal (Hetzner private cloud network — see `${HCLOUD_NETWORK_CIDR}`):
     :8983 gRPC scheduler ↔ workers       (allow{} OK, network-isolated)
     :8984 gRPC BuildQueueState (scaler)  (allow{}, localhost-only)
 ```
@@ -224,14 +243,11 @@ docker network, listening only on the docker bridge.
 ### 3.1 Domain (interim) — `bb-psmdb.ddns.net` on No-IP free DDNS
 
 Decided 2026-04-27: we use **`bb-psmdb.ddns.net`** (No-IP free tier) as the
-**interim** hostname, with a single A record to the central VM
-`95.216.189.238`:
-
-```
-$ dig @8.8.8.8 bb-psmdb.ddns.net
-;; ANSWER SECTION:
-bb-psmdb.ddns.net.   60   IN   A   95.216.189.238
-```
+**interim** hostname, with a single A record pointing at the central
+VM's Hetzner Floating IP (the live value lives in `INFRASTRUCTURE.md`).
+You can verify resolution from any public network with
+`dig @8.8.8.8 bb-psmdb.ddns.net` — the answer should match
+`${PUBLIC_IP}` from your `.env`.
 
 Why this and not Hetzner DNS / `bb.psmdb.io`: `psmdb.io` is **not publicly
 registered** (Hetzner DNS zone is authoritative only locally; `dig @8.8.8.8`
@@ -254,7 +270,7 @@ resolves on public DNS.
 
 ```bash
 certbot certonly --standalone --non-interactive --agree-tos \
-  --email vorsel@gmail.com -d bb-psmdb.ddns.net
+  --email "${LE_EMAIL}" -d "${PUBLIC_HOSTNAME}"
 # → /etc/letsencrypt/live/bb-psmdb.ddns.net/{fullchain,privkey}.pem
 # → expires 2026-07-26 (90d), systemd timer auto-renews
 ```
@@ -296,16 +312,17 @@ HTTP for now — TLS picked up by Step 2, auth picked up by Step 4 / Step 3 resp
 
 What landed:
 
-1. **Hetzner Floating IP `95.217.242.120`** assigned to the central VM,
-   persistent via `/etc/network/interfaces.d/60-floating-ip.cfg`. Decouples
-   public DNS from VM lifecycle: redeploying the VM keeps the IP and the
-   cert intact.
-2. **No-IP A-record** for `bb-psmdb.ddns.net` → `95.217.242.120` (was
-   primary IP `95.216.189.238`).
+1. **Hetzner Floating IP** assigned to the central VM, persistent via
+   `/etc/network/interfaces.d/60-floating-ip.cfg`. Decouples public DNS
+   from VM lifecycle: redeploying the VM keeps the IP and the cert
+   intact. (Live IP recorded in `INFRASTRUCTURE.md` — kept out of git;
+   pull from `${PUBLIC_IP}` in your `.env`.)
+2. **No-IP A-record** for `bb-psmdb.ddns.net` → `${PUBLIC_IP}` (was
+   pointing at the VM's primary IP, which rotates on redeploy).
 3. **Let's Encrypt cert** via HTTP-01 (`certbot --standalone`):
    ```bash
    certbot certonly --standalone --non-interactive --agree-tos \
-     --email vorsel@gmail.com -d bb-psmdb.ddns.net
+     --email "${LE_EMAIL}" -d "${PUBLIC_HOSTNAME}"
    ```
    - Whole `letsencrypt` tree moved to the BB volume:
      `mv /etc/letsencrypt /var/lib/buildbarn/letsencrypt`,
@@ -848,7 +865,7 @@ directly; the wrapper just automates that.
   line and `sys.exit(4)` rather than letting Bazel run the build
   unauthenticated and fail every action with Envoy 401s.
 * `.bazelrc.psmdb` — endpoint flipped from
-  `grpc://95.216.189.238:8981` (rotating primary IP, plain gRPC) to
+  `grpc://<central-primary-ip>:8981` (rotating primary IP, plain gRPC) to
   `grpcs://bb-psmdb.ddns.net:8981` (TLS, hostname pinned to the
   Hetzner Floating IP).
 
@@ -1002,7 +1019,38 @@ credential. Tracked separately because it requires a different Dex
 client config (`offline_access`, no PKCE) and a per-job rotation
 policy that is out of scope for the human-developer Step 5b.
 
-### Step 6 — Hetzner Cloud Firewall
+### Step 6 — Hetzner Cloud Firewall — DEFERRED
+
+**Status:** intentionally **PENDING** as of 2026-04-29. The
+authentication / TLS pipeline (Steps 1-5d) already gates every public
+endpoint at the application layer (TLS + Dex OIDC for UIs / JWT for
+Bazel clients), so the network ACL is hardening-on-top, not a missing
+foundation. Locking the FW down today would also lock in three
+artifacts that are likely to change soon:
+
+1. **Upstream merge.** The PSMDB-2034 / PSMDB-2040 / PSMDB-2043 work
+   is currently living on Percona's `vorsel/percona-server-mongodb`
+   fork + `percona/jenkins-pipelines` private branch. Once that is
+   merged upstream / into Percona main, the public surface (which
+   Jenkins runners contact this RBE from, what egress IPs we need to
+   allowlist for SSH, etc.) is more settled.
+
+2. **Production URI / domain.** We're on `bb-psmdb.ddns.net` (No-IP
+   free DDNS) for the dev cluster. When this graduates, Percona will
+   provision a `.percona.com` (or similar) hostname and Let's Encrypt
+   cert, and SSH ACLs will pivot to the corp VPN CIDRs. Pinning the
+   firewall now would just create a re-do task at promotion.
+
+3. **Floating IP.** The Floating IP (recorded in
+   `INFRASTRUCTURE.md`, exposed as `${PUBLIC_IP}` in `.env`) is
+   attached to this dev central VM. It's stable across VM redeploy
+   *of this VM*, but not across an account / project
+   migration to the Percona Hetzner tenant — which is the most likely
+   path to production. The FW rules would have to be re-keyed against
+   the new IP/network anyway.
+
+**What the firewall WILL look like** when we do come back to this
+(target shape, not currently applied):
 
 Create one firewall (`rbe-central-fw`) attached to the central VM:
 
@@ -1010,16 +1058,23 @@ Create one firewall (`rbe-central-fw`) attached to the central VM:
 |---|---|---|---|
 | 80   | TCP | 0.0.0.0/0 | ACME HTTP-01 renewal (Let's Encrypt) |
 | 5556 | TCP | 0.0.0.0/0 | Dex OIDC IdP |
-| 7982 | TCP | 0.0.0.0/0 | bb-scheduler admin UI |
-| 7984 | TCP | 0.0.0.0/0 | bb-browser UI |
-| 8981 | TCP | 0.0.0.0/0 | Envoy → BB frontend gRPC (TLS+JWT) |
+| 7982 | TCP | 0.0.0.0/0 | bb-scheduler admin UI (TLS + OIDC) |
+| 7984 | TCP | 0.0.0.0/0 | bb-browser UI (TLS + OIDC) |
+| 8981 | TCP | 0.0.0.0/0 | Envoy → BB frontend gRPC (TLS + JWT) |
 | 22   | TCP | Percona VPN/office CIDRs | SSH |
 | (other) | — | DROP | default deny |
 
-Internal:
-- Worker VMs see scheduler `:8983` over Hetzner private network only;
-  worker firewall blocks all public inbound except SSH from admin.
-- `:8984` BuildQueueState bound to `127.0.0.1`, used by `scaler.py` only.
+Internal (private network — `psmdb.cd` Hetzner cloud network, no
+firewall on the worker side beyond the implicit network-level
+isolation):
+- Worker VMs reach scheduler `:8983` and frontend `:8980` over the
+  Hetzner private network only.
+- `:8984` BuildQueueState bound to `127.0.0.1`, used by `scaler.py`
+  on the central host itself.
+
+**Trigger to revisit:** any one of (a) PSMDB-2034 family merged
+upstream, (b) production hostname / cert provisioned, (c) project
+migrated off the personal Hetzner account.
 
 ---
 
@@ -1072,7 +1127,7 @@ In docs:
 - **Cert renewal**: certbot's systemd timer + `--deploy-hook` symlinks new cert into `/etc/buildbarn/certs/` → BB hot-reloads, Envoy reloaded via signal, Dex restarted.
 - **Cert emergency rotation**: replace files in `/etc/buildbarn/certs/` in place; BB picks up within `refresh_interval` (default 1h, can lower to 60s); restart Envoy + Dex.
 - **No-IP hostname keepalive (free tier)**: every 30 days No-IP emails the
-  account owner (vorsel@gmail.com) asking to confirm the hostname is still
+  account owner (the address in `${LE_EMAIL}`) asking to confirm the hostname is still
   in use; if missed, `bb-psmdb.ddns.net` is freed and someone else can
   register it. **Calendar reminder set for the 28th of every month**.
   An on-host weekly check (`scripts/check-noip.sh` — TODO) will alert if
@@ -1088,7 +1143,7 @@ In docs:
 |---|---|---|
 | 1 | **Interim domain: `bb-psmdb.ddns.net`** (No-IP free DDNS). Single host, port-based service layout. | `psmdb.io` we initially planned was never publicly registered (NXDOMAIN on public resolvers); registering a real domain is the right next step but takes admin approval. No-IP is free, public-resolvable, A record was set up in 5 min. Trade-off: no DNS-01 → no wildcard cert → port-based instead of subdomain-based service split. |
 | 2 | **Cert acquisition: Let's Encrypt via HTTP-01** (`certbot --standalone`) on port 80 of the central VM. systemd timer auto-renews. | DNS-01 not possible because No-IP free tier doesn't expose TXT record control. HTTP-01 with single-name cert is simple, reliable, and covers all four ports of the same host. |
-| 3 | **Hetzner Floating IP `95.217.242.120`** attached to the central VM, persistent via `/etc/network/interfaces.d/60-floating-ip.cfg`. DNS A-record points at the FI, not at the VM's primary IP. | Decouples the public-facing IP from VM lifecycle. Recreating the central VM no longer churns DNS / cert / OAuth callback URLs — just `hcloud floating-ip assign` after `create-central.sh`. Cost: €1/month per IP. |
+| 3 | **Hetzner Floating IP** attached to the central VM, persistent via `/etc/network/interfaces.d/60-floating-ip.cfg`. DNS A-record points at the FI, not at the VM's primary IP. (Live IP value lives in `INFRASTRUCTURE.md` / `${PUBLIC_IP}` in `.env`.) | Decouples the public-facing IP from VM lifecycle. Recreating the central VM no longer churns DNS / cert / OAuth callback URLs — just `hcloud floating-ip assign` after `create-central.sh`. Cost: €1/month per IP. |
 | 4 | **Cert lives on the BB volume**: `/var/lib/buildbarn/letsencrypt/` (whole letsencrypt tree moved + symlinked from `/etc/letsencrypt`); deploy-hook copies resolved files to `/var/lib/buildbarn/certs/` with mode 0644 for container consumption. | Persists across VM redeploys. The 0644 copy avoids docker user-namespace traversal issues we hit when mounting the LE tree directly into a non-root container. Renewal: certbot.timer → deploy-hook re-copies → restarts envoy-proxy. |
 | 5 | **TLS terminated only in Envoy** for now. Frontend / reapi-proxy / scheduler-grpc / worker-grpc stay plaintext on the docker bridge or the Hetzner private network. | Single termination point = single cert mount + single restart on renewal. BB and Dex TLS land in Steps 2-3 when their config files are touched anyway. |
 | 6 | **GitHub OAuth App: personal app first**, `clientID` + `clientSecret` stored in `secrets.env`. Will swap to a Percona org-level OAuth App after Percona admins approve a request. The swap is mechanical — only `clientID` / `clientSecret` env vars change in `dex.yaml` (Dex re-reads on restart). | Personal app is created in 1 minute; org-level has indefinite admin-approval lead time. Acceptable risk: only people we hand individual JWTs / login URLs to can authorize against the personal app, and Dex still gates on `orgs[].teams[]`. |

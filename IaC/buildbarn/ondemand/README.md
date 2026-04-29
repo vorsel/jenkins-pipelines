@@ -62,7 +62,7 @@ These IDs are hard-coded as defaults in [`scripts/create-central.sh`](scripts/cr
 | ----- | -- | ----- |
 | Hetzner server (will be created) | name `bb-psmdb-ondemand`, `cpx42`, `hel1`, Debian 13 | 8c shared / 16 GB / 320 GB boot disk |
 | Hetzner volume (must exist) | `105484418` — `psmdb-buildbarn-cas-ondemand`, 750 GB xfs | CAS/AC/FSAC backing store |
-| Hetzner private network | `11374636` — `psmdb.cd.percona.com` | Workers and Bazel clients live here |
+| Hetzner private network | `${HCLOUD_NETWORK_ID}` — `psmdb.cd.percona.com` (live ID in `INFRASTRUCTURE.md`) | Workers and Bazel clients live here |
 | Hetzner SSH keys (both added to the server) | `24333399` (`htz.cd.key`) + `111196538` (`htz.cd.bb-psmdb-ondemand`) | The latter is the "day-to-day" key for this fleet |
 
 ## Port strategy
@@ -164,9 +164,9 @@ ephemeral and Hetzner recycles IPs):
 
 ```bash
 ssh root@<central-public-ip>
-ssh-worker 10.30.242.10                          # interactive shell on a worker
-ssh-worker 10.30.242.10 'cd /opt/buildbarn && docker compose ps'
-ssh-worker 10.30.242.10 'docker compose logs --tail=100 runner worker'
+ssh-worker <worker-private-ip>                          # interactive shell on a worker
+ssh-worker <worker-private-ip> 'cd /opt/buildbarn && docker compose ps'
+ssh-worker <worker-private-ip> 'docker compose logs --tail=100 runner worker'
 ```
 
 Two caveats:
@@ -207,7 +207,7 @@ Defaults (all overridable via env):
 | `SERVER_TYPE` | `cpx42` | 8c shared / 16 GB / 320 GB disk — enough for one `--jobs=12` pool with ~100 GB hardlinking cache |
 | `LOCATION` | `hel1` | same as the central so the private network works |
 | `OS_IMAGE` | `debian-13` | matches the central's host OS |
-| `NETWORK_ID` | `11374636` | `psmdb.cd.percona.com` private net |
+| `NETWORK_ID` | (project-specific; live ID in `INFRASTRUCTURE.md` / `${HCLOUD_NETWORK_ID}`) | `psmdb.cd.percona.com` private net |
 | `SSH_KEY_IDS` | `24333399 111196538` | both ops keys injected, same as central |
 | `CENTRAL_NAME` | `bb-psmdb-ondemand` | discovered via `hcloud server describe` |
 | `SERVER_NAME` | `bb-worker-<pool-slug>-${TS}` | underscores in pool name → hyphens, RFC 1123-safe |

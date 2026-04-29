@@ -119,7 +119,7 @@ global:
     - 24333399         # htz.cd.key — operator's daily-driver key
     - 111196538        # htz.cd.bb-psmdb-ondemand — per-fleet key
     # bb-psmdb-ondemand-central id is APPENDED here at bake time.
-  hcloud_network_id: 11374636            # psmdb.cd.percona.com private net
+  hcloud_network_id: 11374636            # psmdb.cd.percona.com private net (also recorded in INFRASTRUCTURE.md)
   hcloud_os_image: debian-13             # host OS for workers; decoupled from runner distro
 
   # Region try-chain. hel1 first because the central lives there → lowest

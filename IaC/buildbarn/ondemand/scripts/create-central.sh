@@ -7,8 +7,8 @@
 #   1. Preflight checks on the operator's laptop (hcloud auth, jq, rsync,
 #      local SSH private key, repo layout, Hetzner resource IDs).
 #   2. Ensure the server exists in Hetzner Cloud (create if missing) with
-#      both SSH keys installed, attached to the private network 11374636,
-#      on Debian 13.
+#      both SSH keys installed, attached to the project's private network
+#      (NETWORK_ID — live value in `INFRASTRUCTURE.md`), on Debian 13.
 #   3. Attach the 750 GB xfs volume (ID 105484418) if not already attached.
 #   4. Install Docker on the host (via get.docker.com) and rsync, if missing.
 #   5. Mount the volume at /var/lib/buildbarn and add an fstab entry.
@@ -754,7 +754,7 @@ WRAP
 chmod +x /usr/local/bin/ssh-worker
 echo "  ssh-worker wrapper installed at /usr/local/bin/ssh-worker"
 REMOTE
-  ok "ssh-worker wrapper installed — run e.g. 'ssh-worker 10.30.242.42 docker compose ps' on central"
+  ok "ssh-worker wrapper installed — run e.g. 'ssh-worker <worker-private-ip> docker compose ps' on central"
 }
 
 sync_configs() {
@@ -1395,7 +1395,7 @@ summary() {
     fails TLS validation because the cert SAN is the hostname, not the
     IP — always use the hostname.
 
-  Private (network 11374636 / psmdb.cd.percona.com):
+  Private (psmdb.cd.percona.com network):
     Worker gRPC      : grpc://$PRIVATE_IP:8983        (ondemand workers only)
 
   Localhost (on central host only):

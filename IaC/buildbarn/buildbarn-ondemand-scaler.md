@@ -52,7 +52,7 @@ Concrete resource naming convention (everything new gets `-ondemand` suffix or `
 | server `bb-psmdb` (cpx62, hel1) | server `bb-psmdb-ondemand` (`cpx42`, hel1) |
 | volume `build_buddy_psmdb_cache` (100 GB, BuildBuddy's) | volume `psmdb-buildbarn-cas-ondemand` (750 GB xfs, hel1) |
 | servers `barn-psmdb-worker-1/2`, `psmdb-mongot` (permanent) | ephemeral `psmdb-bb-worker-<pool>-<timestamp>` (scaler-owned) |
-| network `11374636 psmdb.cd.percona.com` (shared with old fleet) | same network is fine — or a dedicated new one if we want stricter isolation (see §5.4) |
+| `psmdb.cd.percona.com` network (shared with old fleet; ID in `INFRASTRUCTURE.md`) | same network is fine — or a dedicated new one if we want stricter isolation (see §5.4) |
 | SSH key `htz.cd.key` (Jenkins fleet) | new SSH key `htz.cd.bb-worker.key` (§5.10) |
 | `ghcr.io/...` images distributed via `docker save/load` | `ghcr.io/vorsel/psmdb-buildbarn-runners/*` (§7) |
 
@@ -134,7 +134,7 @@ Notes:
          | ephemeral ondemand workers.              |
          +------------------+-----------------------+
                             |
-                            | private network `psmdb.cd.percona.com` (ID 11374636)
+                            | private network `psmdb.cd.percona.com` (ID = ${HCLOUD_NETWORK_ID})
                             | gRPC :8983 (pull-based worker→scheduler)
                             |
         +-------------------+----------------+----------------+
@@ -443,8 +443,8 @@ Single YAML file (`ondemand-pools.yaml`) with one entry per variant in §11.1 of
 global:
   hcloud_project: psmdb-buildbarn                   # Hetzner project name
   hcloud_ssh_key_id: "htz.cd.bb-worker.key"         # public-key ID in Hetzner for ops SSH (see §5.10)
-  hcloud_network_id: 11374636                       # psmdb.cd.percona.com private network
-  scheduler_worker_grpc: 10.30.242.3:8983           # private IP workers dial to register
+  hcloud_network_id: ${HCLOUD_NETWORK_ID}           # psmdb.cd.percona.com private network
+  scheduler_worker_grpc: ${PRIVATE_IP}:8983         # private IP workers dial to register
   scheduler_state_grpc:  localhost:8984             # scaler reads queue state from here
   registry: ghcr.io/vorsel/psmdb-buildbarn-runners  # dev phase — public, anonymous pull; production switches to ghcr.io/percona/...
   region_try_chain: [hel1, nbg1, fsn1]              # matches htz.cloud.groovy region rotation
@@ -571,7 +571,7 @@ Bootstrap timing budget:
 
 Pre-bake into a Hetzner snapshot once cloud-init is stable, dropping boot time to ~40–60 s (see §8 Phase 3).
 
-**Private-IP-only networking**: the VM is created with `networks=[hcloud_network_id]` and `start_after_create=true` but **without** `public_net.ipv4=True`. Outbound internet (needed for `apt-get update`, `docker pull ghcr.io`) still works via Hetzner's default NAT from the private network's subnet gateway. Workers dial the scheduler at its **private** IP (`10.30.242.3:8983`) — no public-IP hop. This eliminates public-IP bandwidth costs for CAS traffic (hundreds of GB per full matrix).
+**Private-IP-only networking**: the VM is created with `networks=[hcloud_network_id]` and `start_after_create=true` but **without** `public_net.ipv4=True`. Outbound internet (needed for `apt-get update`, `docker pull ghcr.io`) still works via Hetzner's default NAT from the private network's subnet gateway. Workers dial the scheduler at its **private** IP (`${PRIVATE_IP}:8983`) — no public-IP hop. This eliminates public-IP bandwidth costs for CAS traffic (hundreds of GB per full matrix).
 
 ### 5.5 Pre-warm API
 
@@ -654,10 +654,10 @@ Workers have no public IP, so direct `ssh root@<public>` is not available. Two a
 **Ops SSH (for debugging)** — bastion via central:
 
 ```bash
-ssh -J root@barn-psmdb root@10.30.242.XX   # jump through central
+ssh -J root@barn-psmdb root@<worker-private-ip>   # jump through central
 ```
 
-This works out of the box because central has a public IP and a private IP in the same `11374636 psmdb.cd.percona.com` network as workers. Only access prerequisite: your public key is in central's `/root/.ssh/authorized_keys`.
+This works out of the box because central has a public IP and a private IP in the same `psmdb.cd.percona.com` private network as workers. Only access prerequisite: your public key is in central's `/root/.ssh/authorized_keys`.
 
 **Dedicated SSH key for workers**: `htz.cd.bb-worker.key` (parallel to the existing `htz.cd.key` used by `htz.cloud.groovy`). The public half is uploaded to the Hetzner project as an SSH key resource and referenced in `ondemand-pools.yaml` `global.hcloud_ssh_key_id`; cloud-init auto-injects it into `/root/.ssh/authorized_keys` via `hcloud server create --ssh-key <id>`. The private half lives on central under `/opt/buildbarn/scaler/secrets/htz.cd.bb-worker.key` (0600 root) and in Jenkins credential store for pipeline jobs that need to reach a worker directly.
 
@@ -667,7 +667,7 @@ For phase 3 consider Tailscale overlay — gives `ssh worker-pool-bookworm-1` by
 
 ## 6. How the scaler reads scheduler state
 
-**Not via `/metrics` on port 7982.** That port serves the HTML admin UI (`adminHttpServers`), which has no `/metrics` path — hitting `http://65.108.253.73:7982/metrics` returns `404 page not found`, which is correct behaviour for that endpoint.
+**Not via `/metrics` on port 7982.** That port serves the HTML admin UI (`adminHttpServers`), which has no `/metrics` path — hitting `http://<central-public-ip>:7982/metrics` returns `404 page not found`, which is correct behaviour for that endpoint.
 
 **Primary: `BuildQueueState` gRPC on port `8984`.** BuildBarn's scheduler exposes a structured, versioned protobuf service intended for programmatic state inspection — this is what `bb-browser` and the HTML admin UI themselves call internally. In the upstream [`scheduler.jsonnet`](https://raw.githubusercontent.com/buildbarn/bb-deployments/master/docker-compose/config/scheduler.jsonnet) it's declared as:
 
@@ -803,7 +803,7 @@ In strict dependency order — each step unblocks the next.
        --image debian-13 \
        --location hel1 \
        --ssh-key htz.cd.bb-worker.key \
-       --network 11374636
+       --network "${HCLOUD_NETWORK_ID}"
 
    hcloud volume attach 105484418 bb-psmdb-ondemand
 
@@ -827,7 +827,7 @@ In strict dependency order — each step unblocks the next.
    - **Region try-chain** `hel1 → nbg1 → fsn1` (lines 151–169 pattern — one template per `(image, region, type)`, walk until one succeeds with HTTP 201 instead of `409 resource_unavailable`).
    - **Host-OS image choice**: `htz.cloud.groovy` uses `114690387 deb12-x64` / `114690389 deb12-aarch64` pre-baked snapshots (Debian 12). For the BuildBarn fleet prefer something newer — **Debian 13 (Trixie)** is the recommended default (available as `debian-13` cloud-image on Hetzner); `ubuntu-24.04` or the upcoming Ubuntu 26.04 LTS are fine alternatives. The host OS is fully decoupled from the runner distro inside the container (see §5.3 notes). In phase 3 we bake our own PSMDB-specific snapshot on top of whichever base we picked.
    - **Init-script pattern** (`initMap['deb-docker']`, lines 79–134): swap, Docker GPG+apt repo, `--data-root=/mnt/docker`, ulimits, DNS pinning, `repo.ci.percona.com` host entry. All of this goes into cloud-init verbatim.
-   - **Network ID**: worker templates in `htz.cloud.groovy` use `networkMap['percona-vpc-eu'] = '10442325'`. **Do not reuse** that one for BuildBarn — use the separate `11374636 psmdb.cd.percona.com` network (shared with the old fleet is fine; they don't collide because workers dial the new `bb-psmdb-ondemand` private IP, not `bb-psmdb`). Optionally create a dedicated network later if stricter isolation is wanted.
+   - **Network ID**: worker templates in `htz.cloud.groovy` use a separate `networkMap['percona-vpc-eu']` ID. **Do not reuse** that one for BuildBarn — use the separate `psmdb.cd.percona.com` network whose ID is recorded in `INFRASTRUCTURE.md` (shared with the old fleet is fine; they don't collide because workers dial the new `bb-psmdb-ondemand` private IP, not `bb-psmdb`). Optionally create a dedicated network later if stricter isolation is wanted.
    - **SSH pattern**: `htz.cloud.groovy` uses `SshConnectorAsRoot("htz.cd.key")`. We create a parallel `htz.cd.bb-worker.key` for the ondemand bb-worker fleet (see §5.10).
 
 5. **Run a full `install-dist-test` against `bb-psmdb-ondemand`**: from a developer box, set `.bazelrc` to point `--remote_executor` at the new central, spawn 3×ubuntu-noble workers manually, run the build. Wall-time should match the current permanent fleet's warm build. Proves the cloud-init + registry + auto-join loop end-to-end on fresh infrastructure, with zero impact on the existing fleet.
