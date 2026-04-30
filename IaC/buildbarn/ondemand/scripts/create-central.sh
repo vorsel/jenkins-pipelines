@@ -1218,6 +1218,22 @@ docker compose up -d
 # secretEnv/secret field swaps — that one bit us with `invalid_client`
 # on first scheduler-admin login). Without restart, Dex keeps the
 # previously-loaded YAML in memory.
+#
+# `bb-portal-backend` mounts ./config/bb-portal.jsonnet — same trap as
+# scheduler/browser. We hit this on Phase 2a rollout: edits to
+# browserServiceConfiguration / schedulerServiceConfiguration in
+# bb-portal.jsonnet didn't take effect because docker compose up -d
+# saw "no compose-spec change" and skipped recreation. Frontend
+# changes WERE picked up (env vars in compose definition), so
+# /browser welcome page rendered fine while gRPC-Web calls to
+# /buildbarn.buildqueuestate.BuildQueueState/* on the BACKEND
+# returned 404 ("schedulerConfiguration is not configured" path in
+# grpcweb_proxy_server.go).
+#
+# `bb-portal-frontend` and `bb-portal-db` stay out of this list:
+# the frontend's env vars are part of the compose spec, so any edit
+# triggers normal recreation; the db is image+env only with no
+# bind-mounted config to drift.
 docker compose restart \
   scheduler \
   browser \
@@ -1226,6 +1242,7 @@ docker compose restart \
   storage-1 \
   dex \
   envoy-proxy \
+  bb-portal-backend \
   scaler
 
 echo
@@ -1426,6 +1443,25 @@ smoke() {
   else
     warn "bb-portal /graphql returned '$gql_status' without auth — expected 302/303/401; check 'docker compose logs bb-portal-backend' for OIDC config"
   fi
+
+  # Phase 2a: bb-portal /browser/ and /scheduler/ routes are now wired
+  # (browserServiceConfiguration / schedulerServiceConfiguration in
+  # bb-portal.jsonnet point at frontend:8980 and scheduler:8984
+  # respectively). Both routes must sit behind the same OIDC gate as
+  # the BES /graphql probe above. We confirm with a simple GET; for
+  # GET, bb-storage's authenticatingHandler emits a 302 redirect to
+  # Dex /auth (not 303 — that's POST→GET coercion only). 401 is also
+  # acceptable in case someone wires a non-redirect response later.
+  for route in browser scheduler; do
+    local route_status
+    route_status=$(curl -sS -o /dev/null -m 5 -w '%{http_code}' \
+      "https://$PUBLIC_HOSTNAME:7986/$route/" 2>/dev/null || true)
+    if [[ "$route_status" =~ ^(302|303|401)$ ]]; then
+      ok "bb-portal /$route → $route_status without auth (OIDC gate ON)"
+    else
+      warn "bb-portal /$route returned '$route_status' without auth — expected 302/303/401; check 'docker compose logs bb-portal-backend' for ${route}ServiceConfiguration wiring"
+    fi
+  done
 
   # Step 5/portal: confirm Envoy's jwt_authn filter on :1985 (the new
   # BES listener) also rejects unauthenticated traffic. Same logic as

@@ -1,13 +1,17 @@
 # BuildBarn — Build Observability via bb-portal
 
-> Status: **IN PROGRESS** — Steps 1, 2, 3, 5, 6 DONE (jenkins-pipelines side
-> wired up: compose services, jsonnet, dex client, envoy listener, bake_env,
-> smoke probes, runbook). **Step 4 pending** in `percona-server-mongodb` —
-> needs `--bes_backend` + `--bes_results_url` + `--bes_header` added to
-> `.bazelrc.psmdb`'s `psmdb_buildfarm` config block, plus the matching
-> `wrapper_hook.py` extension if Bazel doesn't auto-forward the `--remote_header`
-> token to BES (verify on first deploy).
-> Last update: 2026-04-29.
+> Status: **PHASE 1 + PHASE 2a DONE** — Phase 1 Steps 1, 2, 3, 4, 5, 6 complete
+> (jenkins-pipelines: compose services, jsonnet, dex client, envoy listener,
+> bake_env, smoke probes, runbook; percona-server-mongodb master/v8.3/v8.0:
+> `--bes_backend` + `--bes_results_url` + `--bes_header` wired in
+> `.bazelrc.psmdb` + `wrapper_hook.py`). **Phase 2a (wire-up, no
+> deprecation): DONE** — `bb-portal.jsonnet` `browserServiceConfiguration` /
+> `schedulerServiceConfiguration` enabled, frontend `Browser` / `Scheduler` /
+> `Operations` views work end-to-end. **Phase 2 (full deprecation of
+> bb-browser + bb-scheduler-admin): not yet started** — gated on ≥2 weeks
+> of daily-driver use with no operator complaints (see "Phase 2 —
+> Deprecation roadmap" below).
+> Last update: 2026-04-30.
 > Tracking: TBD (new Jira PSMDB-* ticket to be created when impl begins).
 > Working domain: `bb-psmdb.ddns.net` (No-IP DDNS, same as the rest of the
 > BuildBarn stack — see [`buildbarn-auth-tls-plan.md`](./buildbarn-auth-tls-plan.md)
@@ -229,6 +233,66 @@ new shape (Next.js, not a Go server).
   invocations that hit `--config=psmdb_buildfarm`.
 * **No Slack / Teams notifications** in MVP. Possibly later via the
   GraphQL subscription API.
+
+## Phase 2a — Wire-up status (DONE, 2026-04-30)
+
+Intermediate step between Phase 1 (coexistence) and Phase 2 (full
+deprecation): the three UI views that bb-portal can serve as
+replacements for the standalone `bb-browser` / `bb-scheduler-admin`
+services — **Browser**, **Scheduler**, **Operations** — were enabled
+without yet retiring the standalone services. This buys us the
+"daily driver" exposure window that Phase 2's go/no-go gate requires,
+while keeping `:7984` (bb-browser) and `:7982` (bb-scheduler-admin)
+as fallback for the same period.
+
+Concrete deltas applied (see git history for exact commits):
+
+* `compose/config/bb-portal.jsonnet` — uncommented and filled in
+  `browserServiceConfiguration` (CAS / AC / FSAC pointing at
+  `frontend:8980`; `initialSizeClassCache` deliberately left unset
+  pending a dedicated backend) and `schedulerServiceConfiguration`
+  (`buildQueueStateClient` → `scheduler:8984`, `killOperationsAuthorizer:
+  { allow: {} }`, `listOperationsPageSize: 500`).
+* `compose/docker-compose.yml` — `bb-portal-frontend` keeps upstream
+  defaults for `NEXT_PUBLIC_ENABLED_FEATURES_BROWSER` /
+  `_SCHEDULER` / `_OPERATIONS` (i.e. `true`); previously-staged
+  `=false` overrides removed.
+* `scripts/create-central.sh` — added `bb-portal-backend` to the
+  `MODE=attach` restart list (config is bind-mounted, but compose
+  doesn't recreate on file-change), plus a smoke probe loop hitting
+  `/browser/` and `/scheduler/` for OIDC redirects (302/303/401).
+
+> **`/builds` page — verification deferred.** The fourth nav entry
+> in the bb-portal frontend, `/builds`, groups Bazel invocations
+> by **CI workflow run** (one Build = one Jenkins job / GitLab
+> pipeline / GitHub Actions run, containing N Bazel invocations).
+> The Build entity is created **only** when the BES `client_env`
+> stream contains one of: `BUILD_URL` (Jenkins), `CI_PIPELINE_URL`
+> (GitLab), or the GitHub Actions trio
+> (`GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` + `GITHUB_RUN_ID`).
+> Source: `bb-portal/internal/database/buildeventrecorder/saveStructuredCommandLine.go::recordBuild`
+> (function `getBuildURL`).
+>
+> For local-laptop builds those env vars are absent → `findBuilds`
+> GraphQL returns `[]` → UI shows "No data". This is **by design**,
+> not a bug. `/invocations` (sibling page) shows the same builds
+> just fine because it doesn't require CI grouping.
+>
+> Verification of `/builds` population is deferred to the first
+> Jenkins job that runs PSMDB Bazel against the build farm with
+> `--config=psmdb_buildfarm`: Jenkins exposes `BUILD_URL`
+> automatically as a job env var, Bazel forwards it via
+> `--client_env=BUILD_URL=…`, bb-portal-backend ingests it,
+> Build entity gets created and linked to the invocation. At that
+> point we run a one-shot operator smoke check:
+> `SELECT count(*) FROM builds; SELECT build_url, build_uuid, timestamp FROM builds ORDER BY timestamp DESC LIMIT 5;`
+> against `bb-portal-db`, and confirm the row appears in `/builds`
+> with the expected Jenkins URL. Tracking: same Jira ticket as
+> Phase 2a (TBD), close-out item.
+
+The standalone `bb-browser` (`:7984`) and `bb-scheduler-admin`
+(`:7982`) services remain running and registered in Dex — Phase 2
+deletes them only after the daily-driver gate clears.
 
 ## Phase 2 — Deprecation roadmap
 

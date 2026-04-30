@@ -8,17 +8,24 @@
 // example this is shaped from. Field names map to
 // pkg/proto/configuration/bb_portal/bb_portal.proto.
 //
-// PHASE-1 SHAPE (coexistence — see plan §"Step 1 → Decision A"):
+// PHASE 2a SHAPE (wire-up, no deprecation — see plan §"Phase 2 —
+// Deprecation roadmap"):
 //
 //   * besServiceConfiguration   — ENABLED. Owns BES gRPC ingest on :8082
 //     and the Postgres pool that persists everything.
 //   * httpServers (UI on :8081) — ENABLED. OIDC via Dex, same pattern as
 //     bb-browser / bb-scheduler-admin.
-//   * browserServiceConfiguration / schedulerServiceConfiguration —
-//     LEFT UNSET. Phase 1 keeps the standalone bb-browser :7984 and
-//     bb-scheduler-admin :7982 services authoritative for blob inspection
-//     and runtime queue state. Phase 2 (separate plan-update) wires these
-//     fields in and retires the standalone services.
+//   * browserServiceConfiguration   — ENABLED. Reverse-proxies /browser/*
+//     gRPC-Web traffic to frontend:8980 (CAS / AC / FSAC). The standalone
+//     bb-browser :7984 stays live in parallel — operators can use either
+//     UI during the soak period.
+//   * schedulerServiceConfiguration — ENABLED. Reverse-proxies
+//     /scheduler/* gRPC-Web traffic to scheduler:8984. The standalone
+//     bb-scheduler-admin :7982 stays live in parallel.
+//
+// Phase 2c (separate plan-update — TODO) deletes the standalone services
+// once bb-portal has been the daily driver for ≥1 week without operator
+// complaints. Until then, three UIs answer in parallel.
 local common = import 'common.libsonnet';
 
 {
@@ -144,21 +151,44 @@ local common = import 'common.libsonnet';
     minEventBatchDuration: '0.1s',
   },
 
-  // Phase-2 toggle points. Wiring these fields makes bb-portal serve
-  // the same content bb-browser :7984 and bb-scheduler-admin :7982
-  // serve today. Until those services are retired, leaving these
-  // unset means /browser and /scheduler routes return 404 from
-  // bb-portal — operators continue to use the standalone UIs for
-  // those views. See plan §"Phase 2 — Deprecation roadmap".
-  // browserServiceConfiguration: {
-  //   contentAddressableStorage: { grpc: { client: { address: 'frontend:8980' } } },
-  //   actionCache: { grpc: { client: { address: 'frontend:8980' } } },
-  //   initialSizeClassCache: { grpc: { client: { address: 'frontend:8980' } } },
-  //   fileSystemAccessCache: { grpc: { client: { address: 'frontend:8980' } } },
-  // },
-  // schedulerServiceConfiguration: {
-  //   buildQueueStateClient: { address: 'scheduler:8984' },
-  //   killOperationsAuthorizer: { allow: {} },
-  //   listOperationsPageSize: 500,
-  // },
+  // Phase 2a wiring — bb-portal now serves /browser and /scheduler
+  // routes alongside the standalone bb-browser :7984 / bb-scheduler-admin
+  // :7982 services. Operators can use either UI during the soak period;
+  // Phase 2c (TODO) retires the standalone services. See plan
+  // §"Phase 2 — Deprecation roadmap".
+  //
+  // CAS / AC / FSAC backends point at the existing bb-frontend service
+  // (compose/config/frontend.jsonnet, listenAddresses :8980 wildcard).
+  // Same shard-cluster the bb-browser :7984 service already uses, so
+  // both UIs see identical blob views.
+  //
+  // initialSizeClassCache is INTENTIONALLY UNSET. Our frontend.jsonnet
+  // doesn't expose an ISCC backend (only CAS/AC/FSAC, matching upstream
+  // bb-deployments shape). Setting `initialSizeClassCache: { grpc: { ...
+  // frontend:8980 } }` here would make bb-portal route ISCC RPCs to
+  // frontend, which would 404 them — UI errors instead of graceful
+  // empty state. Effect of leaving unset: BrowserPreviousExecutionsPage
+  // shows "no previous-execution stats" — Bazel size-estimate visibility
+  // is gone, but action timelines, test results, blob inspection, and
+  // scheduler views all work. Track separately if size estimates become
+  // important; we'd need to stand up a dedicated ISCC backend service.
+  browserServiceConfiguration: {
+    contentAddressableStorage: { grpc: { client: { address: 'frontend:8980' } } },
+    actionCache: { grpc: { client: { address: 'frontend:8980' } } },
+    fileSystemAccessCache: { grpc: { client: { address: 'frontend:8980' } } },
+  },
+
+  // schedulerServiceConfiguration — points at the buildQueueState gRPC
+  // server inside the scheduler container (scheduler.jsonnet ::
+  // buildQueueStateGrpcServers, listenAddresses :8984 wildcard).
+  // killOperationsAuthorizer `allow: {}` because users are already
+  // OIDC-authenticated by the httpServers entry above (Dex enforces
+  // percona:build-engineers team membership at /callback). If we ever
+  // need a per-instance kill gate, plug it in here.
+  // listOperationsPageSize: 500 — proto-recommended value; tunable.
+  schedulerServiceConfiguration: {
+    buildQueueStateClient: { address: 'scheduler:8984' },
+    killOperationsAuthorizer: { allow: {} },
+    listOperationsPageSize: 500,
+  },
 }

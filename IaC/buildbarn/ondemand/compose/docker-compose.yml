@@ -281,21 +281,19 @@ services:
   #     hides the upload button and stops the corresponding backend
   #     route. We do NOT want operators uploading stale .bep files
   #     from a developer laptop into our shared invocation history.
-  #   * NEXT_PUBLIC_ENABLED_FEATURES_BROWSER / _SCHEDULER / _OPERATIONS
-  #     all set to false. These mirror the unset
-  #     browserServiceConfiguration / schedulerServiceConfiguration
-  #     in bb-portal.jsonnet (see plan §"Phase 2 — Deprecation
-  #     roadmap"). The upstream image bakes a `frontend/.env` with all
-  #     feature flags ON by default, so without an explicit override
-  #     here the UI renders /browser, /scheduler and /operations
-  #     pages (plus their AppBar entries) and then their in-page
-  #     gRPC-Web fetches to the backend fail with `Transport error:
-  #     Failed to fetch` (handler not wired). Setting these to false
-  #     hides the menu items AND replaces the page bodies with the
-  #     upstream <PageDisabled/> stub — until Phase 2 wires the
-  #     corresponding backend services. See bb-portal/frontend/.env
-  #     and bb-portal/frontend/src/utils/isFeatureEnabled.ts in the
-  #     local clone for the full feature map.
+  #   * NEXT_PUBLIC_ENABLED_FEATURES_{BROWSER,SCHEDULER,OPERATIONS}
+  #     are intentionally NOT overridden — the upstream image's baked-in
+  #     frontend/.env defaults them to true, which is what we want now
+  #     that Phase 2a has wired browserServiceConfiguration and
+  #     schedulerServiceConfiguration in bb-portal.jsonnet. The /browser,
+  #     /scheduler, and /operations routes render real content; their
+  #     in-page gRPC-Web fetches reach frontend:8980 and scheduler:8984
+  #     via the bb-portal-backend's grpc-web proxy and return real data.
+  #     If you ever need to hide one of these views again (e.g. while
+  #     debugging a regression in bb-portal's browser handler), flip
+  #     the corresponding NEXT_PUBLIC_ENABLED_FEATURES_* to false here
+  #     — the page body falls back to the upstream <PageDisabled/> stub
+  #     and the AppBar entry disappears, without touching backend config.
   bb-portal-frontend:
     <<: *bb-image-common
     image: ghcr.io/buildbarn/bb-portal-frontend:${BB_PORTAL_TAG}
@@ -305,9 +303,6 @@ services:
       - NEXT_PUBLIC_BES_GRPC_BACKEND_URL=grpcs://${PUBLIC_HOSTNAME}:1985
       - NEXT_PUBLIC_COMPANY_NAME=Percona PSMDB
       - NEXT_PUBLIC_ENABLED_FEATURES_BEP_UPLOAD=false
-      - NEXT_PUBLIC_ENABLED_FEATURES_BROWSER=false
-      - NEXT_PUBLIC_ENABLED_FEATURES_SCHEDULER=false
-      - NEXT_PUBLIC_ENABLED_FEATURES_OPERATIONS=false
     expose:
       - "3000"
 
