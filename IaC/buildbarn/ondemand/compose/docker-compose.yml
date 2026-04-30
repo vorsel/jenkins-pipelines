@@ -149,6 +149,169 @@ services:
       - scheduler
 
   # ---------------------------------------------------------------------
+  # bb-portal — build observability UI: ingests Bazel's Build Event
+  # Stream (BES) over gRPC, persists invocations/actions/targets in a
+  # local Postgres, serves a Next.js UI proxied through the Go backend.
+  # Adds the historical-build view that bb-scheduler-admin :7982 can't
+  # provide (the scheduler's in-memory queue forgets operations 60 s
+  # after the Bazel client disconnects). See buildbarn-portal-plan.md.
+  #
+  # Three containers, one logical service:
+  #   bb-portal-db        — Percona Distribution for PostgreSQL 17.x
+  #   bb-portal-backend   — Go process: HTTP UI :8081, BES gRPC :8082,
+  #                          diagnostics :80; reverse-proxies non-API
+  #                          HTTP requests to bb-portal-frontend.
+  #   bb-portal-frontend  — Next.js UI on :3000, internal-only.
+  #
+  # Public surface (Phase 1, coexists with bb-browser :7984 / bb-
+  # scheduler-admin :7982 — see plan §"Step 1 → Decision A"):
+  #   :7986  HTTPS UI    (bb-portal-backend :8081 mapped to host)
+  #   :1985  grpcs BES   (terminated by Envoy with TLS+jwt_authn,
+  #                       see reapi-proxy/envoy.yaml)
+  # ---------------------------------------------------------------------
+
+  # PDP image — drop-in vanilla-PG-17 ABI with Percona's bundled
+  # extensions on disk (none auto-loaded). UID 26 is the postgres user
+  # baked into the image's `USER 26` line; we replicate it on the
+  # `user:` field so the host bind-mount permissions match. PGDATA is
+  # baked at /data/db (image default; see Dockerfile from
+  # github.com/percona/percona-docker/percona-distribution-postgresql-17),
+  # which is why the bind-mount target below is /data/db, not the
+  # Debian-default /var/lib/postgresql/data.
+  #
+  # First-boot ownership requirement: /var/lib/buildbarn/portal-db must
+  # be `chown -R 26:26` BEFORE the first `docker compose up`. handled
+  # by create-central.sh's setup_persistent_dirs step (see the same
+  # script for the matching mkdir for compose/secrets/).
+  bb-portal-db:
+    <<: *bb-image-common
+    image: percona/percona-distribution-postgresql:${BB_PORTAL_PDP_TAG}
+    container_name: bb-portal-db
+    user: "26:26"
+    environment:
+      # Standard Docker-Postgres conventions; the PDP image's
+      # entrypoint.sh accepts the same env-var contract as the
+      # vanilla docker-library/postgres image (verified against
+      # github.com/percona/percona-docker/percona-distribution-
+      # postgresql-17/entrypoint.sh).
+      - POSTGRES_USER=bbportal
+      - POSTGRES_PASSWORD=${BB_PORTAL_DB_PASSWORD}
+      - POSTGRES_DB=bbportal
+    volumes:
+      - /var/lib/buildbarn/portal-db:/data/db
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bbportal -d bbportal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # bb-portal Go backend. Entrypoint is /app/bb_portal (set by
+  # bb-storage's multiarch_go_image macro — same shape as bb-storage,
+  # bb-scheduler, bb-browser images), takes a single positional arg
+  # = jsonnet config path. We pass /config/bb-portal.jsonnet.
+  #
+  # Port roles (see bb-portal.jsonnet for the wiring):
+  #   :8081  public HTTPS — terminates TLS itself (cert mounted from
+  #          /var/lib/buildbarn/certs/), runs OIDC redirect against
+  #          Dex (client_id=bb-portal). Mapped to host :7986.
+  #   :8082  BES gRPC ingest — internal-only on the docker bridge;
+  #          reached from outside via Envoy on :1985 which terminates
+  #          TLS + validates JWT before forwarding.
+  #   :80    diagnostics (Prometheus exporter, pprof) — exporter only,
+  #          no scraper running today; available for ad-hoc curl from
+  #          the host during incident response.
+  bb-portal-backend:
+    <<: *bb-image-common
+    image: ghcr.io/buildbarn/bb-portal-backend:${BB_PORTAL_TAG}
+    container_name: bb-portal-backend
+    command: [/config/bb-portal.jsonnet]
+    ports:
+      # Public HTTPS UI. Host-side port :7986 chosen to extend the
+      # :798x family (7982 scheduler admin, 7984 bb-browser, 7986
+      # bb-portal). bb-portal-backend terminates TLS internally
+      # (see common.serverTls in bb-portal.jsonnet's httpServers
+      # entry) — the Let's Encrypt cert is shared via the volume
+      # mount below.
+      - "7986:8081"
+    volumes:
+      - ./config:/config:ro
+      # Same Let's Encrypt cert / refresh story as bb-browser /
+      # bb-scheduler / dex / envoy: certbot's deploy-hook copies
+      # fullchain.pem + privkey.pem (mode 0644) into this dir on
+      # every renewal and restarts the service so the new cert is
+      # picked up without restart of the whole stack.
+      - /var/lib/buildbarn/certs:/etc/buildbarn/certs:ro
+    depends_on:
+      bb-portal-db:
+        # Postgres init takes ~5–15 s on first boot (initdb +
+        # docker-entrypoint.d scripts). Without service_healthy
+        # gating, bb-portal hits a "connection refused" pgx error,
+        # crashes, and docker restart-loops it for ~30 s before the
+        # next try lands. service_healthy + the pg_isready healthcheck
+        # on bb-portal-db converts that thrash into a clean ordered
+        # startup.
+        condition: service_healthy
+      dex:
+        # OIDC discovery is fetched lazily (on the first
+        # unauthenticated request, not at startup), so this is
+        # `service_started` rather than `service_healthy` — bb-portal
+        # boots even if Dex is briefly unhealthy and only fails the
+        # FIRST login attempt rather than refusing to start. Matches
+        # how envoy-proxy treats dex.
+        condition: service_started
+
+  # bb-portal Next.js frontend. Internal-only — bb-portal-backend
+  # reverse-proxies every non-API HTTP request to it via
+  # `frontendProxyUrl` in bb-portal.jsonnet. EXPOSE 3000 is set in
+  # the upstream Dockerfile and we don't override.
+  #
+  # Configuration is purely env-var-based (no jsonnet, no config file)
+  # — see github.com/buildbarn/bb-portal/README.md "Configuration"
+  # section for the full list. We ship the minimal set:
+  #   * NEXT_PUBLIC_BES_BACKEND_URL / NEXT_PUBLIC_BES_GRPC_BACKEND_URL
+  #     point at the public UI/BES endpoints we expose, so deep-links
+  #     in the UI render with the right hostname for an external
+  #     operator.
+  #   * NEXT_PUBLIC_COMPANY_NAME is the brand string in the UI header.
+  #   * NEXT_PUBLIC_ENABLED_FEATURES_BEP_UPLOAD=false matches the
+  #     server-side enableBepFileUpload=false in bb-portal.jsonnet —
+  #     hides the upload button and stops the corresponding backend
+  #     route. We do NOT want operators uploading stale .bep files
+  #     from a developer laptop into our shared invocation history.
+  #   * NEXT_PUBLIC_ENABLED_FEATURES_BROWSER / _SCHEDULER / _OPERATIONS
+  #     all set to false. These mirror the unset
+  #     browserServiceConfiguration / schedulerServiceConfiguration
+  #     in bb-portal.jsonnet (see plan §"Phase 2 — Deprecation
+  #     roadmap"). The upstream image bakes a `frontend/.env` with all
+  #     feature flags ON by default, so without an explicit override
+  #     here the UI renders /browser, /scheduler and /operations
+  #     pages (plus their AppBar entries) and then their in-page
+  #     gRPC-Web fetches to the backend fail with `Transport error:
+  #     Failed to fetch` (handler not wired). Setting these to false
+  #     hides the menu items AND replaces the page bodies with the
+  #     upstream <PageDisabled/> stub — until Phase 2 wires the
+  #     corresponding backend services. See bb-portal/frontend/.env
+  #     and bb-portal/frontend/src/utils/isFeatureEnabled.ts in the
+  #     local clone for the full feature map.
+  bb-portal-frontend:
+    <<: *bb-image-common
+    image: ghcr.io/buildbarn/bb-portal-frontend:${BB_PORTAL_TAG}
+    container_name: bb-portal-frontend
+    environment:
+      - NEXT_PUBLIC_BES_BACKEND_URL=https://${PUBLIC_HOSTNAME}:7986
+      - NEXT_PUBLIC_BES_GRPC_BACKEND_URL=grpcs://${PUBLIC_HOSTNAME}:1985
+      - NEXT_PUBLIC_COMPANY_NAME=Percona PSMDB
+      - NEXT_PUBLIC_ENABLED_FEATURES_BEP_UPLOAD=false
+      - NEXT_PUBLIC_ENABLED_FEATURES_BROWSER=false
+      - NEXT_PUBLIC_ENABLED_FEATURES_SCHEDULER=false
+      - NEXT_PUBLIC_ENABLED_FEATURES_OPERATIONS=false
+    expose:
+      - "3000"
+
+  # ---------------------------------------------------------------------
   # Dex — OIDC identity provider used as a thin bridge between
   # Buildbarn's web UIs and GitHub OAuth. We need it because GitHub's
   # OIDC user_info does NOT expose team membership; Dex performs the
@@ -211,10 +374,18 @@ services:
     environment:
       # Substituted into dex.yaml at startup. Loaded from compose's
       # `.env` (mode 0600), populated by create-central.sh's bake_env.
+      #
+      # IMPORTANT: every staticClients[].secretEnv NAME in dex.yaml MUST
+      # have a matching entry here. Dex resolves secretEnv via os.Getenv
+      # at config-load time; a missing env var stores `""` as the
+      # secret, and the next /token exchange fails with
+      # `invalid_client / Invalid client credentials` — which is
+      # exactly what bites Phase-1 portal users on first login.
       - GITHUB_OAUTH_CLIENT_ID=${GITHUB_OAUTH_CLIENT_ID}
       - GITHUB_OAUTH_CLIENT_SECRET=${GITHUB_OAUTH_CLIENT_SECRET}
       - BB_BROWSER_OIDC_SECRET=${BB_BROWSER_OIDC_SECRET}
       - BB_SCHED_OIDC_SECRET=${BB_SCHED_OIDC_SECRET}
+      - BB_PORTAL_OIDC_SECRET=${BB_PORTAL_OIDC_SECRET}
     healthcheck:
       # Dex exposes /healthz on the same port as the discovery
       # endpoint. We curl with --insecure because docker's healthcheck
@@ -274,6 +445,12 @@ services:
       # (grpc://) will fail with "connection reset" — they must use
       # grpcs:// from now on.
       - "8981:8981"
+      # bb-portal Build Event Stream (BES) ingest. Same TLS cert + same
+      # JWT issuer/audience as :8981, terminated by the bes_grpc_listener
+      # in envoy.yaml; forwarded plaintext to bb-portal-backend:8082.
+      # Plan §"Step 1 → Decision B" — Envoy is the single auth boundary
+      # for both Bazel-execution and BES traffic.
+      - "1985:1985"
     volumes:
       - /var/lib/buildbarn/reapi-proxy/envoy.yaml:/etc/envoy/envoy.yaml:ro
       # Cert dir maintained by the certbot deploy-hook (10-buildbarn.sh):
@@ -290,6 +467,12 @@ services:
       # RPC into a 401 for ~1 cache_duration after recovery. Cheaper
       # to gate the start order.
       - dex
+      # bb-portal-backend backs the new bes_grpc_listener on :1985.
+      # Envoy starting before bb-portal-backend results in DNS-resolve
+      # failures inside the bb_portal_bes cluster for the first
+      # several seconds — Bazel clients sending early BES events
+      # would see UNAVAILABLE. Cheap fix: gate startup order.
+      - bb-portal-backend
 
   # ---------------------------------------------------------------------
   # Scaler — the control loop that spawns and reaps worker VMs based on

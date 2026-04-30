@@ -122,6 +122,107 @@ static_resources:
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
+  # bb-portal — Build Event Stream (BES) gRPC listener.
+  #
+  # Bazel clients publish their BES events to grpcs://<host>:1985 with the
+  # same Authorization: Bearer <jwt> header that wrapper_hook.py already
+  # injects for --remote_executor. Envoy terminates TLS here, validates
+  # the JWT against Dex via the same `dex_provider` config used on :8981,
+  # and forwards plaintext gRPC to bb-portal-backend:8082 (which has
+  # `authenticationPolicy: { allow: {} }` on its BES gRPC server — see
+  # plan §"Step 1 → Decision B" for the rationale of validating once at
+  # the gateway rather than re-implementing JWKS fetch in bb-portal).
+  #
+  # `dex_provider` config is duplicated (rather than aliased from the
+  # :8981 listener) because Envoy's JwtAuthentication filter scopes
+  # `providers:` to the filter instance — there is no global provider
+  # registry. The two copies MUST stay in lockstep; if you bump
+  # `cache_duration` or change the audience here, do the same on
+  # :8981's filter or BES auth will diverge from execution auth.
+  - name: bes_grpc_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 1985
+    filter_chains:
+    - transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            alpn_protocols: [h2]
+            tls_certificates:
+            - certificate_chain:
+                filename: /etc/buildbarn/certs/fullchain.pem
+              private_key:
+                filename: /etc/buildbarn/certs/privkey.pem
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: bes_proxy
+          codec_type: AUTO
+          http2_protocol_options:
+            max_concurrent_streams: 1000
+            initial_stream_window_size: 1048576
+            initial_connection_window_size: 1048576
+          # BES is bidirectional-streaming: PublishBuildToolEventStream
+          # stays open for the full duration of a Bazel build (minutes
+          # to hours on full-matrix PSMDB CI). Default Envoy stream-idle
+          # / request timeouts would slam the connection mid-build and
+          # make Bazel resend events from scratch. Disable both.
+          stream_idle_timeout: 0s
+          request_timeout: 0s
+          route_config:
+            name: bes_route
+            virtual_hosts:
+            - name: bes
+              domains: ["*"]
+              routes:
+              # Match-all: this listener only serves BES traffic, so we
+              # don't bother with a path-prefix sieve. The actual gRPC
+              # service path (`/google.devtools.build.v1.PublishBuildEvent/…`)
+              # gets forwarded as-is to bb-portal-backend.
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: bb_portal_bes
+                  # Same 0s timeout reasoning as above.
+                  timeout: 0s
+                  max_stream_duration:
+                    grpc_timeout_header_max: 0s
+          http_filters:
+          # JWT authentication — must precede the router so Envoy
+          # short-circuits anonymous traffic before the bb-portal-backend
+          # cluster ever sees it. Lockstep with the :8981 filter — see
+          # block comment above.
+          - name: envoy.filters.http.jwt_authn
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+              providers:
+                dex_provider:
+                  issuer: https://bb-psmdb.ddns.net:5556
+                  audiences:
+                  - bazel-cli
+                  remote_jwks:
+                    http_uri:
+                      uri: https://bb-psmdb.ddns.net:5556/keys
+                      cluster: dex_jwks
+                      timeout: 5s
+                    cache_duration: 600s
+                  forward: true
+                  from_headers:
+                  - name: authorization
+                    value_prefix: "Bearer "
+              rules:
+              - match:
+                  prefix: /
+                requires:
+                  provider_name: dex_provider
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
   clusters:
   - name: capabilities_proxy
     connect_timeout: 5s
@@ -195,3 +296,29 @@ static_resources:
             - san_type: DNS
               matcher:
                 exact: bb-psmdb.ddns.net
+
+  # bb-portal-backend BES gRPC ingest — terminates the :1985 listener.
+  # Plain HTTP/2 over the docker bridge (no TLS, no auth at this hop —
+  # bb-portal-backend's BES gRPC server is configured `allow: {}` in
+  # bb-portal.jsonnet because Envoy already validated the JWT). The
+  # service name `bb-portal-backend` resolves via docker DNS on the
+  # default bridge network.
+  - name: bb_portal_bes
+    connect_timeout: 5s
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options:
+            max_concurrent_streams: 1000
+    load_assignment:
+      cluster_name: bb_portal_bes
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: bb-portal-backend
+                port_value: 8082

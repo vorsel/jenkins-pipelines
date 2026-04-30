@@ -16,16 +16,21 @@ ondemand/
 ├── README.md                       ← you are here
 ├── compose/
 │   ├── docker-compose.yml          ← frontend + 2× storage + scheduler +
-│   │                                  browser + reapi-proxy + envoy-proxy
+│   │                                  browser + bb-portal-{db,backend,frontend} +
+│   │                                  dex + reapi-proxy + envoy-proxy + scaler
 │   ├── .env.example                ← copy to .env; bootstrap script writes
 │   │                                  the real .env for you
+│   ├── dex/dex.yaml                ← Dex IdP (GitHub connector, static clients)
 │   └── config/
-│       ├── common.libsonnet        ← shared blobstore / browserUrl
+│       ├── common.libsonnet        ← shared blobstore / browserUrl / portalUrl
 │       ├── storage.jsonnet         ← 369 GB per shard (sized for 750 GB vol)
 │       ├── scheduler.jsonnet       ← admin :7982, client :8982, worker :8983,
 │       │                             buildQueueState :8984
 │       ├── frontend.jsonnet        ← gRPC :8980 (internal)
 │       ├── browser.jsonnet         ← HTTP :7984
+│       ├── bb-portal.jsonnet       ← BES gRPC ingest :8082, UI :8081
+│       │                             (build observability — see
+│       │                             ../buildbarn-portal-plan.md)
 │       └── ondemand-pools.yaml     ← declarative pool config for the scaler
 ├── worker/                         ← template for an ondemand bb-worker VM
 │   ├── cloud-init.yml.tmpl         ← Debian 13 + Docker + sysctl tuning (spawn-worker.sh only)
@@ -183,6 +188,59 @@ Two caveats:
    destroys the keypair — the next `create-central.sh` generates a new one
    and rotates the Hetzner named key; all existing workers become
    unreachable from the new central. Plan worker rotation accordingly.
+
+**Finding a historical build (bb-portal).**
+`bb-scheduler-admin` (`:7982`) only shows operations that are still
+queued/running or finished within the last minute — once a Bazel client
+disconnects, the scheduler forgets about the operation. For post-mortem
+investigation 30 min, 3 h, or 30 d after a build finished, use bb-portal
+on `https://${PUBLIC_HOSTNAME}:7986/`.
+
+Three common paths in:
+
+```
+1. Login                     →  https://${PUBLIC_HOSTNAME}:7986/
+                                (302 to Dex → GitHub OAuth → team-gate)
+
+2. By invocation ID          →  https://${PUBLIC_HOSTNAME}:7986/invocations/<INV>
+                                (Bazel prints `INFO: Invocation ID: <UUID>` on
+                                 every build; copy/paste that UUID here)
+
+3. By Bazel error digest     →  bb-portal's "Action" tab on an invocation page
+                                shows action stdout/stderr inline; you no
+                                longer need to manually click into bb-browser
+                                for blob lookups.
+```
+
+Sanity-check that BES ingest is actually working (do this after every
+deploy, before relying on the data):
+
+```bash
+ssh root@${PUBLIC_HOSTNAME}
+cd /var/lib/buildbarn/compose
+# Recent BES events received?
+docker compose logs --tail=50 bb-portal-backend | grep -i 'invocation\|bep'
+# Database growing?
+docker compose exec bb-portal-db \
+  psql -U bbportal -d bbportal -c "SELECT count(*) FROM invocations WHERE created_at > now() - interval '1 day';"
+```
+
+If the second query returns 0 days after a deploy, suspect:
+- Bazel clients aren't sending events (check `--bes_backend` in
+  `.bazelrc.psmdb`; should be `grpcs://${PUBLIC_HOSTNAME}:1985`).
+- Envoy is rejecting the JWT on `:1985` — `docker compose logs
+  envoy-proxy | grep -i 'jwt\|1985'` will show 401s.
+- bb-portal-db ran out of disk — `df /var/lib/buildbarn/portal-db`
+  on the host. Default retention is 30 days (see
+  `bb-portal.jsonnet::databaseCleanupConfiguration`); shrink to 7 d
+  if you're on a tight volume.
+
+bb-portal does NOT replace `bb-browser` (`:7984`) or
+`bb-scheduler-admin` (`:7982`) in Phase 1 — all three UIs answer in
+parallel. Phase 2 collapses them; see
+[`../buildbarn-portal-plan.md`](../buildbarn-portal-plan.md)
+§"Phase 2 — Deprecation roadmap" for the conditions under which we'd
+flip the switch.
 
 ## Spawning a worker (Phase 1, manual)
 

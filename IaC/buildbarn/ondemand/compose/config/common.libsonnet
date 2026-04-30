@@ -68,6 +68,13 @@
   // browserUrl on purpose (scheduler admin is on :7982). sed-replaced
   // by create-central.sh's bake_env step with `https://$PUBLIC_HOSTNAME:7982`.
   schedulerUrl: '__BB_SCHEDULER_URL__',
+  // Public URL of bb-portal — build observability UI on :7986. Same
+  // shape and substitution rules as browserUrl / schedulerUrl above;
+  // sed-replaced by create-central.sh's bake_env step with
+  // `https://$PUBLIC_HOSTNAME:7986`. Used by bb-portal.jsonnet to
+  // build the OAuth2 redirect_uri (`portalUrl + '/oidc-callback'`)
+  // and the CORS allow-list (`allowedOrigins: [portalUrl]`).
+  portalUrl: '__BB_PORTAL_URL__',
   // Dex OIDC issuer URL — `https://$PUBLIC_HOSTNAME:5556`. Used both as
   // the prefix for /auth and /token endpoints AND as what Buildbarn
   // expects to see in id_token's `iss` claim. Must EXACTLY match the
