@@ -1387,6 +1387,46 @@ smoke() {
     warn "bb-portal-db NOT ready — check 'docker compose logs bb-portal-db' for initdb errors / permission issues on /var/lib/buildbarn/portal-db"
   fi
 
+  # Step 5/portal: bb-portal's /graphql endpoint must require auth.
+  #
+  # NB on which endpoint this is: bb-portal mounts TWO different paths
+  # whose names look almost identical and routinely get confused —
+  #   /graphql   ← the GraphQL API the Next.js UI calls. Always mounted,
+  #                unconditionally (cmd/bb_portal/main.go:233). Disabling
+  #                it would break every UI panel.
+  #   /graphiql  ← interactive schema explorer (an unauthenticated
+  #                playground UI). Mounted only when
+  #                bb-portal.jsonnet::enableGraphqlPlayground is true.
+  # We probe /graphql here — never /graphiql.
+  #
+  # We do NOT mint a real OIDC token (that would require shipping
+  # rbe_login.py to the operator-laptop side of this smoke or standing
+  # up a service-account in Dex — both out of scope for an unattended
+  # post-deploy probe). Instead we assert the OIDC middleware rejects
+  # an anonymous POST: a 401 (no auth header) or a 302 (redirect to
+  # Dex /auth) both prove the gate is wired. A 200 here would mean
+  # bake_env did not replace the OIDC placeholders and bb-portal
+  # silently fell back to allow{} — same failure mode as the bb-browser
+  # / bb-scheduler-admin probes above. End-to-end "GraphQL returns
+  # real invocations under a real token" verification is left to the
+  # operator runbook in ondemand/README.md §"Finding a historical build".
+  local gql_status
+  gql_status=$(curl -sS -o /dev/null -m 5 -w '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    -d '{"query":"{ invocations(first:1){nodes{id}}}"}' \
+    "https://$PUBLIC_HOSTNAME:7986/graphql" 2>/dev/null || true)
+  # Accept 401 (no auth header → API rejection), 302 (Found —
+  # browser-style redirect for GET), or 303 (See Other — POST→GET
+  # coercion per RFC 7231 §6.4.4, which is what bb-storage's OIDC
+  # handler emits for unauthenticated POSTs because redirecting POST
+  # bodies to a Dex /auth login is meaningless). Anything else means
+  # the OIDC middleware did NOT engage.
+  if [[ "$gql_status" =~ ^(302|303|401)$ ]]; then
+    ok "bb-portal /graphql → $gql_status without auth (OIDC gate ON)"
+  else
+    warn "bb-portal /graphql returned '$gql_status' without auth — expected 302/303/401; check 'docker compose logs bb-portal-backend' for OIDC config"
+  fi
+
   # Step 5/portal: confirm Envoy's jwt_authn filter on :1985 (the new
   # BES listener) also rejects unauthenticated traffic. Same logic as
   # the :8981 probe above — copy-paste with the port flipped, because

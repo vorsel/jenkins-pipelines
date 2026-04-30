@@ -840,8 +840,22 @@ In `scripts/create-central.sh::smoke()`:
 
 * `ondemand/README.md`: new section "Finding a historical build" with
   step-by-step (paste invocation ID into bb-portal URL, drill in).
-* Backup / restore drill for `portal-db/` volume.
-* `bb-portal` log rotation / retention policy (cron).
+* Backup / restore drill for `portal-db/` volume — **operator runbook
+  done, cron automation deferred**. The README explains the manual
+  `pg_dump`/`pg_restore` flow and the decision rationale (build
+  telemetry, not source-of-truth → drill suffices for MVP). A daily
+  cron + retention policy + off-host destination remain "nice-to-have,
+  do later"; revisit if bb-portal becomes the source-of-truth for
+  "did build X pass" or if HA/replication moves out of "Out of scope".
+* `bb-portal` log rotation / retention policy — **already in place
+  via docker-native config**, no cron needed. The `x-bb-image-common`
+  YAML anchor in `compose/docker-compose.yml` ships `json-file` driver
+  with `max-size: 50m` + `max-file: 5` (~250 MB per container,
+  ~2.25 GB total stack ceiling). README §"Log rotation / retention"
+  documents the setup, inspection commands, and the deliberate
+  "no off-host shipping, no logrotate cron" decision. **Off-host log
+  shipping deferred** to a future observability iteration (S3 / Loki
+  / ELK), conditional on a Prometheus / Grafana stack landing first.
 
 ## Open questions
 

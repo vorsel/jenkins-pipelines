@@ -235,6 +235,123 @@ If the second query returns 0 days after a deploy, suspect:
   `bb-portal.jsonnet::databaseCleanupConfiguration`); shrink to 7 d
   if you're on a tight volume.
 
+**Backing up bb-portal-db (manual drill).**
+This is build-telemetry, not source-of-truth data — losing it means
+operators can't post-mortem old invocations, but daily Bazel work is
+unaffected (BES events keep flowing into a freshly-empty database).
+That makes a manual restore drill the right tool for now; cron-driven
+backups are deferred (see "Future automation" below).
+
+When you'd run this:
+- Before a risky deploy that touches `bb-portal-db` config or the PDP
+  image tag.
+- Quarterly, as a "do I still know how" exercise.
+- NOT as a replacement for replication or off-host backup — those
+  remain out of scope for this iteration.
+
+```bash
+ssh root@${PUBLIC_HOSTNAME}
+cd /var/lib/buildbarn/compose
+ts=$(date +%Y%m%d-%H%M%S)
+# Custom-format dump (-Fc): binary, compressed, restorable with
+# pg_restore. Lives on the boot disk, NOT on the CAS volume — so a
+# volume detach/reattach can't take the dump with it.
+docker compose exec -T bb-portal-db \
+  pg_dump -U bbportal -Fc bbportal \
+  > /var/lib/buildbarn/portal-db-backup-${ts}.dump
+ls -lh /var/lib/buildbarn/portal-db-backup-${ts}.dump
+```
+
+Restore drill (run on the central host, into a throwaway container so
+production `bb-portal-db` stays untouched):
+
+```bash
+# Stand up a throwaway PG instance on a different port.
+docker run --rm -d --name pg-restore-test \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=test \
+  -p 5433:5432 percona/percona-distribution-postgresql:17.9
+sleep 5
+# Restore the dump into a fresh DB.
+docker exec -i pg-restore-test \
+  psql -U postgres -c 'CREATE DATABASE bbportal_restore_test;'
+docker exec -i pg-restore-test \
+  pg_restore -U postgres -d bbportal_restore_test \
+  < /var/lib/buildbarn/portal-db-backup-${ts}.dump
+# Sanity-check the row counts came across.
+docker exec -i pg-restore-test \
+  psql -U postgres -d bbportal_restore_test \
+       -c 'SELECT count(*) FROM invocations;'
+# Clean up.
+docker rm -f pg-restore-test
+rm /var/lib/buildbarn/portal-db-backup-${ts}.dump
+```
+
+If that count matches `SELECT count(*) FROM invocations` on the live
+`bb-portal-db`, the drill passed.
+
+**Future automation (deferred — nice-to-have).**
+Daily/weekly cron-driven `pg_dump` to `/var/lib/buildbarn/backups/`
+with retention rotation, plus optional off-host destination, plus a
+matching restore probe in `create-central.sh::smoke()`, would turn
+this manual drill into a real disaster-recovery posture. Tracked
+separately from this plan; revisit when bb-portal becomes the
+source-of-truth for "did build X pass" rather than just observability.
+See [`../buildbarn-portal-plan.md`](../buildbarn-portal-plan.md)
+§"Step 6 — Operator runbook" for the deferral note.
+
+**Log rotation / retention.**
+All BuildBarn services on this stack — including `bb-portal-db`,
+`bb-portal-backend`, and `bb-portal-frontend` — inherit a
+docker-native log rotation policy via the YAML anchor
+`x-bb-image-common` in `compose/docker-compose.yml`:
+
+```yaml
+logging:
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+```
+
+Practical effect:
+- Each container's stdout/stderr stream is capped at 5 rotated files
+  of 50 MB each → **250 MB ceiling per container**.
+- With ~9 long-running containers in the stack, the log footprint on
+  the root disk tops out around 2.25 GB total, regardless of how
+  long the central host has been running.
+- Rotation happens automatically inside Docker — no cron, no
+  external `logrotate`, no operator intervention needed.
+
+Inspection commands (run on the central host):
+
+```bash
+ssh root@${PUBLIC_HOSTNAME}
+cd /var/lib/buildbarn/compose
+# Live tail one service.
+docker compose logs -f --tail=200 bb-portal-backend
+# All bb-portal services at once.
+docker compose logs -f bb-portal-db bb-portal-backend bb-portal-frontend
+# Search across the rotated files (Docker reads them transparently).
+docker compose logs bb-portal-backend 2>&1 | grep -i 'error\|panic\|5[0-9][0-9]'
+# Disk usage right now.
+du -sh /var/lib/docker/containers/*/*-json.log* | sort -h | tail -10
+```
+
+What we deliberately don't do (today):
+- **Off-host log shipping** to S3 / Loki / ELK — central host has
+  no observability stack today; revisit if/when one lands (see
+  `buildbarn-ondemand-scaler.md` §"Observability dashboard").
+- **Long-term archival** beyond 250 MB-per-container — telemetry,
+  not audit data; loss is acceptable.
+- **Cron-driven `logrotate`** on `/var/lib/docker/containers/*` —
+  redundant with `json-file` driver's built-in rotation; would only
+  add monitoring surface (cron-failed alerts) for zero value.
+
+If a panic / crash burst pushes useful evidence outside the 250 MB
+window before you've grabbed it: bump `max-file` to `20` on the
+specific service in `docker-compose.yml`, redeploy, reproduce. Don't
+do that pre-emptively for the whole stack.
+
 bb-portal does NOT replace `bb-browser` (`:7984`) or
 `bb-scheduler-admin` (`:7982`) in Phase 1 — all three UIs answer in
 parallel. Phase 2 collapses them; see
