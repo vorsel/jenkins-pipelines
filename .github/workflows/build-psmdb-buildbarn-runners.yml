@@ -81,7 +81,6 @@ on:
   push:
     branches:
       - main
-      - PSMDB-2034_buildbarn_setup
     paths:
       - "IaC/buildbarn/runners/**"
       - ".github/workflows/build-psmdb-buildbarn-runners.yml"
