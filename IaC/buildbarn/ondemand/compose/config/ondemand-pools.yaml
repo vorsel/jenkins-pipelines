@@ -143,10 +143,17 @@ global:
 
 # Pools. Each key becomes the Hetzner label `psmdb.pool=<key>` on spawned VMs.
 #
-# Current image generation: v8.0 / v8.3 / master all on multi-arch GHA
-# sha 9b28c6ee49dc0118fe6bab8b7e28a87f8979be81 (jenkins-pipelines tip
-# at GHA build time; tag suffix in every runner_image below; pool key
-# short-sha is the first 12 chars).
+# Current image generation (mid-Phase 2 PoC migration — see
+# IaC/buildbarn/runners/README.md "Phased migration plan" for context):
+#   - master:        mongo SHA 5778d9300044e10ca309e589f9213b303a740563
+#                    (last commit touching psmdb_builder.sh on
+#                    vorsel/percona-server-mongodb:PSMDB-2054_psmdb_rbe_support_in_build_routines__master)
+#   - v8.0 / v8.3:   jenkins-pipelines SHA 9b28c6ee49dc0118fe6bab8b7e28a87f8979be81
+#                    (legacy PoC tag from when psmdb_builder_<version>.sh was
+#                    sourced from this repo; will be rotated when PSMDB-2054
+#                    cherry-picks land on v8.0 / v8.3 mongo branches)
+# Tag suffix appears in every runner_image below; pool key short-sha is
+# the first 12 chars.
 #
 # Coverage:
 #   * 11 pools per psmdb_version (3 versions: v8.0, v8.3, master):
@@ -208,8 +215,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-noble-x86_64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  ubuntu-noble-x86_64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
@@ -217,8 +224,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-noble-aarch64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  ubuntu-noble-aarch64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: aarch64
     psmdb_version: "master"
     server_type: cax31
@@ -265,8 +272,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-jammy-x86_64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  ubuntu-jammy-x86_64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
@@ -274,8 +281,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-jammy-aarch64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  ubuntu-jammy-aarch64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: aarch64
     psmdb_version: "master"
     server_type: cax31
@@ -308,8 +315,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-bookworm-x86_64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  debian-bookworm-x86_64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
@@ -356,8 +363,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-8-x86_64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  oraclelinux-8-x86_64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
@@ -365,8 +372,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-8-aarch64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  oraclelinux-8-aarch64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: aarch64
     psmdb_version: "master"
     server_type: cax31
@@ -413,8 +420,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-9-x86_64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  oraclelinux-9-x86_64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
@@ -422,8 +429,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-9-aarch64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  oraclelinux-9-aarch64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: aarch64
     psmdb_version: "master"
     server_type: cax31
@@ -470,8 +477,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  amazonlinux-2023-x86_64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  amazonlinux-2023-x86_64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: x86_64
     psmdb_version: "master"
     server_type: cpx42
@@ -479,8 +486,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  amazonlinux-2023-aarch64__vmaster__9b28c6ee49dc:
-    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81"
+  amazonlinux-2023-aarch64__vmaster__5778d9300044:
+    runner_image: "ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023:master-5778d9300044e10ca309e589f9213b303a740563"
     bazel_pool_value: aarch64
     psmdb_version: "master"
     server_type: cax31
