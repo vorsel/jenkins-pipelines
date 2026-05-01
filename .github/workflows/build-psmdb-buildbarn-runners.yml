@@ -62,6 +62,22 @@ on:
         options:
           - "true"
           - "false"
+      mongo_repo:
+        description: "mongo repo URL (default: https://github.com/vorsel/percona-server-mongodb.git)"
+        required: false
+        default: ""
+      mongo_branch_master:
+        description: "Override mongo branch for psmdb_version=master (default: master)"
+        required: false
+        default: ""
+      mongo_branch_v83:
+        description: "Override mongo branch for psmdb_version=8.3 (default: v8.3)"
+        required: false
+        default: ""
+      mongo_branch_v80:
+        description: "Override mongo branch for psmdb_version=8.0 (default: v8.0)"
+        required: false
+        default: ""
   push:
     branches:
       - main
@@ -85,6 +101,12 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # Serialize per (version, distro, platform) cell — protects against
+    # simultaneous workflow_dispatch + cron firing for the same target,
+    # while keeping different cells parallel up to `max-parallel: 10`.
+    concurrency:
+      group: build-psmdb-buildbarn-runners-${{ matrix.psmdb_version }}-${{ matrix.distro }}-${{ matrix.platform_pair }}
+      cancel-in-progress: false
 
     strategy:
       fail-fast: false
@@ -182,6 +204,10 @@ jobs:
         shell: bash
         env:
           PSMDB_VERSION: ${{ matrix.psmdb_version }}
+          MONGO_REPO_INPUT: ${{ github.event.inputs.mongo_repo }}
+          MONGO_BRANCH_MASTER_INPUT: ${{ github.event.inputs.mongo_branch_master }}
+          MONGO_BRANCH_V83_INPUT: ${{ github.event.inputs.mongo_branch_v83 }}
+          MONGO_BRANCH_V80_INPUT: ${{ github.event.inputs.mongo_branch_v80 }}
         run: |
           # GHCR paths must be lowercase; repo owners like "Percona" would
           # otherwise cause 400 at push time.
@@ -190,13 +216,34 @@ jobs:
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "cache_bust=$(date +%s)" >> "$GITHUB_OUTPUT"
 
-          # Normalize version to a filename-safe slug for the script path:
-          #   "8.0"    -> "8_0"    -> psmdb_builder_8_0.sh
-          #   "8.3"    -> "8_3"    -> psmdb_builder_8_3.sh
-          #   "master" -> "master" -> psmdb_builder_master.sh
-          SLUG="${PSMDB_VERSION//./_}"
-          SCRIPT_PATH="IaC/buildbarn/runners/psmdb_builder_${SLUG}.sh"
-          echo "script_path=${SCRIPT_PATH}" >> "$GITHUB_OUTPUT"
+          # Resolve mongo branch — psmdb_version → default with optional override.
+          case "${PSMDB_VERSION}" in
+            8.0)    DEFAULT_BRANCH=v8.0;   OVERRIDE="${MONGO_BRANCH_V80_INPUT}" ;;
+            8.3)    DEFAULT_BRANCH=v8.3;   OVERRIDE="${MONGO_BRANCH_V83_INPUT}" ;;
+            master) DEFAULT_BRANCH=master; OVERRIDE="${MONGO_BRANCH_MASTER_INPUT}" ;;
+            *) echo "unknown psmdb_version: ${PSMDB_VERSION}" >&2; exit 1 ;;
+          esac
+          MONGO_BRANCH="${OVERRIDE:-$DEFAULT_BRANCH}"
+          echo "mongo_branch=${MONGO_BRANCH}" >> "$GITHUB_OUTPUT"
+
+          # Resolve mongo repo (default: vorsel fork; override via workflow_dispatch input).
+          MONGO_REPO="${MONGO_REPO_INPUT:-https://github.com/vorsel/percona-server-mongodb.git}"
+          echo "mongo_repo=${MONGO_REPO}" >> "$GITHUB_OUTPUT"
+
+          # Resolve last-script-touch SHA via GitHub commits API (public repo, no auth).
+          # Returns SHA of the most recent commit on $MONGO_BRANCH that touched the
+          # script file. Stays constant while the branch advances on commits that
+          # don't touch psmdb_builder.sh — this is the image tag's identity SHA.
+          MONGO_OWNER_REPO=$(echo "${MONGO_REPO}" | sed -re 's|.*github.com[:/]([^/]+/[^/]+)\.git|\1|')
+          SHA=$(curl -fsSL \
+            "https://api.github.com/repos/${MONGO_OWNER_REPO}/commits?path=percona-packaging/scripts/psmdb_builder.sh&sha=${MONGO_BRANCH}&per_page=1" \
+            | jq -r '.[0].sha')
+          if [[ -z "${SHA}" || "${SHA}" == "null" ]]; then
+            echo "Failed to resolve last-script-touch SHA for ${MONGO_OWNER_REPO}@${MONGO_BRANCH}" >&2
+            exit 1
+          fi
+          echo "mongo_sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved mongo_branch=${MONGO_BRANCH} mongo_sha=${SHA}"
 
       - name: Build and push by digest
         if: steps.filter.outputs.run == 'true'
@@ -210,16 +257,18 @@ jobs:
           sbom: false
           outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           build-args: |
-            JENKINS_PIPELINES_REPO=https://github.com/${{ github.repository }}.git
-            JENKINS_PIPELINES_BRANCH=${{ github.ref_name }}
+            MONGO_REPO=${{ steps.meta.outputs.mongo_repo }}
+            MONGO_BRANCH=${{ steps.meta.outputs.mongo_branch }}
             PSMDB_VERSION=${{ matrix.psmdb_version }}
-            PSMDB_BUILDER_SCRIPT_PATH=${{ steps.meta.outputs.script_path }}
             CACHE_BUST=${{ steps.meta.outputs.cache_bust }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ github.event.repository.updated_at }}
             org.percona.psmdb.version=${{ matrix.psmdb_version }}
+            org.percona.psmdb.mongo_repo=${{ steps.meta.outputs.mongo_repo }}
+            org.percona.psmdb.mongo_branch=${{ steps.meta.outputs.mongo_branch }}
+            org.percona.psmdb.mongo_sha=${{ steps.meta.outputs.mongo_sha }}
 
       - name: Export digest
         if: steps.filter.outputs.run == 'true' && github.event_name != 'pull_request'
@@ -250,6 +299,12 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # Serialize per (version, distro) — manifest-list creation is fast enough that
+    # cross-platform contention isn't an issue here (the merge job doesn't include
+    # platform in its matrix).
+    concurrency:
+      group: merge-psmdb-buildbarn-runners-${{ matrix.psmdb_version }}-${{ matrix.distro }}
+      cancel-in-progress: false
 
     strategy:
       fail-fast: false
@@ -328,17 +383,43 @@ jobs:
         shell: bash
         env:
           PSMDB_VERSION: ${{ matrix.psmdb_version }}
+          MONGO_REPO_INPUT: ${{ github.event.inputs.mongo_repo }}
+          MONGO_BRANCH_MASTER_INPUT: ${{ github.event.inputs.mongo_branch_master }}
+          MONGO_BRANCH_V83_INPUT: ${{ github.event.inputs.mongo_branch_v83 }}
+          MONGO_BRANCH_V80_INPUT: ${{ github.event.inputs.mongo_branch_v80 }}
         run: |
           OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
           IMAGE="${REGISTRY}/${OWNER}/${IMAGE_NAMESPACE}/${{ matrix.distro }}"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
 
+          # Resolve mongo branch (with optional per-version override) — same logic
+          # as in `build` job. Re-resolved here instead of plumbed via artifact so
+          # the merge job stays standalone; race between build start and merge
+          # start is in seconds and acceptable for tagging purposes.
+          case "${PSMDB_VERSION}" in
+            8.0)    DEFAULT_BRANCH=v8.0;   OVERRIDE="${MONGO_BRANCH_V80_INPUT}" ;;
+            8.3)    DEFAULT_BRANCH=v8.3;   OVERRIDE="${MONGO_BRANCH_V83_INPUT}" ;;
+            master) DEFAULT_BRANCH=master; OVERRIDE="${MONGO_BRANCH_MASTER_INPUT}" ;;
+            *) echo "unknown psmdb_version: ${PSMDB_VERSION}" >&2; exit 1 ;;
+          esac
+          MONGO_BRANCH="${OVERRIDE:-$DEFAULT_BRANCH}"
+          MONGO_REPO="${MONGO_REPO_INPUT:-https://github.com/vorsel/percona-server-mongodb.git}"
+          MONGO_OWNER_REPO=$(echo "${MONGO_REPO}" | sed -re 's|.*github.com[:/]([^/]+/[^/]+)\.git|\1|')
+          SHA=$(curl -fsSL \
+            "https://api.github.com/repos/${MONGO_OWNER_REPO}/commits?path=percona-packaging/scripts/psmdb_builder.sh&sha=${MONGO_BRANCH}&per_page=1" \
+            | jq -r '.[0].sha')
+          if [[ -z "${SHA}" || "${SHA}" == "null" ]]; then
+            echo "Failed to resolve last-script-touch SHA for ${MONGO_OWNER_REPO}@${MONGO_BRANCH}" >&2
+            exit 1
+          fi
+          echo "mongo_sha=${SHA}" >> "$GITHUB_OUTPUT"
+
           # Tag set:
-          #   :<version>-<sha> — immutable, for production worker pinning
-          #   :<version>       — moving alias, for dev iteration (default on)
+          #   :<version>-<mongo-sha> — immutable, for production worker pinning
+          #   :<version>             — moving alias, for dev iteration (default on)
           # Disable the moving tag with push_moving=false for isolated branch
           # experiments that must not overwrite the current :<version> pointer.
-          IMMUTABLE="${IMAGE}:${PSMDB_VERSION}-${{ github.sha }}"
+          IMMUTABLE="${IMAGE}:${PSMDB_VERSION}-${SHA}"
           MOVING="${IMAGE}:${PSMDB_VERSION}"
           TAGS="${IMMUTABLE}"
           PUSH_MOVING="${{ github.event.inputs.push_moving }}"

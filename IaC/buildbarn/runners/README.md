@@ -4,6 +4,8 @@ Each subdirectory holds a `Dockerfile` for one `(OS, glibc, arch)` combination f
 
 ## Status
 
+Currently **Phase 1 (PoC)** — see [Phased migration plan](#phased-migration-plan) below. Phase 2 (source-of-truth → percona-server-mongodb) and Phase 3 (codegen sync of image tags) are designed but not yet implemented.
+
 The 11-variant × 3-version matrix is the authoritative list from `../buildbarn-ondemand-scaler.md` §3.1, which in turn mirrors the parallel stages in `psmdb/jenkins/percona-server-for-mongodb-8.3.groovy`. GHA workflow `.github/workflows/build-psmdb-buildbarn-runners.yml` builds all 11 × 3 = 33 combinations in one run and pushes each to `ghcr.io/<owner>/psmdb-buildbarn-runners/<variant>:<version>-<sha>` (immutable) and `ghcr.io/<owner>/psmdb-buildbarn-runners/<variant>:<version>` (moving).
 
 The three PSMDB release lines are **`8.0`**, **`8.3`**, and **`master`** — one `psmdb_builder_<version>.sh` copy per line in this directory. Each image repo (e.g. `ubuntu-noble-x86_64`) therefore carries three parallel tag streams, one per release line, so BuildBarn worker configs can pin a variant to a specific PSMDB version without branching the image repo.
@@ -17,6 +19,211 @@ The three PSMDB release lines are **`8.0`**, **`8.3`**, and **`master`** — one
 Image sizes: `ubuntu-noble-x86_64:poc` ~1.73 GB on disk / 441 MB content. `debian-bookworm-x86_64:poc` ~2.17 GB / 615 MB. Both are intentionally larger than strictly necessary because `psmdb_builder.sh install_deps()` installs Go SDK, `valgrind`, `devscripts`/`debhelper`, and pip bootstrap — none of which Bazel uses at runtime (Bazel pulls the hermetic `mongo_toolchain_v5` from CAS). Commenting those blocks in the local `psmdb_builder_<version>.sh` copies is a pending size-reduction follow-up; until it lands, correctness ≫ size.
 
 **Known non-fatal warning on Debian:** `psmdb_builder.sh` tries to install Python 3.13 via `add-apt-repository ppa:deadsnakes/ppa`, which does not exist on Debian. The step fails but `psmdb_builder.sh` runs without `set -e` so the image still builds. Debian's stock Python 3.11 is sufficient for `buildscripts/install_bazel.py` (stdlib-only) and for a full `bazel build install-dist-test`. A proper fix (per-distro Python-3.13 strategy) is tracked in the roadmap and not required for the validation above.
+
+## Phased migration plan
+
+The current shape of this directory (per-version `psmdb_builder_*.sh` copies
+committed here) is **Phase 1 — PoC**. Two follow-up phases are planned and
+recorded here so the next operator can pick up where we left off. The rest
+of this README still describes the Phase-1 architecture in detail; it will
+be rewritten incrementally as each phase lands.
+
+### Phase 1 — PoC (current state)
+
+| Aspect | Value |
+|---|---|
+| Status | DONE — production-validated on `ubuntu-noble-x86_64:poc` (10,330 remote actions, 0 failures), `debian-bookworm-x86_64:poc` (cold `install-dist-test` complete) |
+| Script source | `IaC/buildbarn/runners/psmdb_builder_{8_0,8_3,master}.sh` (3 checked-in copies) |
+| Dockerfile fetch URL | jenkins-pipelines raw GitHub URL, branch parameterized via ARG |
+| Image tag SHA | `${{ github.sha }}` of jenkins-pipelines (the commit that triggered the GHA workflow) |
+| Synchronization to upstream | Manual `cp` from each `mongo:<branch>:percona-packaging/scripts/psmdb_builder.sh`, hand-applied BuildBarn tweaks per release line, then commit to jenkins-pipelines |
+
+Phase-1 trade-off: the three copies inevitably drift from upstream (a `diff
+mongo:v8.0:percona-packaging/scripts/psmdb_builder.sh
+jenkins-pipelines:IaC/buildbarn/runners/psmdb_builder_8_0.sh` already
+shows divergence). Acceptable while the PoC is rapidly iterating; not
+sustainable in production.
+
+### Phase 2 — Source-of-truth migration to percona-server-mongodb (NEXT)
+
+**Goal**: stop maintaining a fork of `psmdb_builder.sh` in jenkins-pipelines.
+Have image builds fetch the script directly from the matching
+percona-server-mongodb branch.
+
+**Trade-off summary**:
+
+| | Phase 1 (today) | Phase 2 |
+|---|---|---|
+| Script location | jenkins-pipelines: `IaC/buildbarn/runners/psmdb_builder_<version>.sh` (3 copies) | percona-server-mongodb: `percona-packaging/scripts/psmdb_builder.sh` (1 file × 3 branches, upstream-owned) |
+| Dockerfile wget URL | `https://raw.githubusercontent.com/vorsel/jenkins-pipelines/<branch>/IaC/buildbarn/runners/psmdb_builder_<version>.sh` | `https://raw.githubusercontent.com/<percona-mongo-org>/percona-server-mongodb/<v8.0\|v8.3\|master>/percona-packaging/scripts/psmdb_builder.sh` |
+| Image tag SHA semantics | jenkins-pipelines commit SHA | SHA of the **last mongo commit that touched** `percona-packaging/scripts/psmdb_builder.sh` on the matching branch (NOT branch HEAD — see "Rebuild trigger logic" below) |
+| Per-rotation operator work in this repo | edit `psmdb_builder_<v>.sh`, push, GHA rebuilds | none — daily cron in jenkins-pipelines GHA detects `psmdb_builder.sh` change in any of the three mongo branches and rebuilds only the variants whose script actually changed; operator can also force-trigger via `workflow_dispatch` |
+
+**Concrete file changes** (one atomic PR):
+
+In jenkins-pipelines:
+
+- **DELETE** `IaC/buildbarn/runners/psmdb_builder_8_0.sh`, `psmdb_builder_8_3.sh`, `psmdb_builder_master.sh` (3 files)
+- **EDIT** 13 Dockerfiles in `IaC/buildbarn/runners/<distro>-<arch>/`:
+  - Replace `JENKINS_PIPELINES_REPO`, `JENKINS_PIPELINES_BRANCH`, `PSMDB_BUILDER_SCRIPT_PATH` ARGs with `MONGO_REPO`, `MONGO_BRANCH`, and a hardcoded path `percona-packaging/scripts/psmdb_builder.sh`
+  - Dockerfile defaults: `MONGO_REPO=https://github.com/Percona-Lab/percona-server-mongodb.git` (long-term target). The GHA workflow visibly overrides via `--build-arg MONGO_REPO=https://github.com/vorsel/percona-server-mongodb.git` until the upstream merge into Percona-Lab lands; that single override line gets deleted post-merge. Default `MONGO_BRANCH=v8.3` (matches existing `PSMDB_VERSION=8.3` default semantics)
+- **EDIT** `.github/workflows/build-psmdb-buildbarn-runners.yml`:
+  - Drop `paths:` trigger entry for `runners/psmdb_builder_*.sh` (those files won't exist)
+  - **Triggers** (Q2c — daily cron + manual):
+    - `schedule: cron "0 3 * * *"` (daily 03:00 UTC) — replaces the weekly Phase-1 cron; bounds latency from script-merge in mongo to fresh image at ≤24 h
+    - `workflow_dispatch` with inputs `versions` (subset of `8.0 8.3 master`) and `variants` (subset of 11 distros) — for forced rebuilds (e.g. dev who just merged an `install_deps` change in mongo and doesn't want to wait for cron)
+    - `push` on `main`/`PSMDB-2034_buildbarn_setup` touching `IaC/buildbarn/runners/**` or the workflow file (covers Dockerfile / workflow edits in this repo)
+  - Add a small mapping in the detect-changes job: `8.0`→`v8.0`, `8.3`→`v8.3`, `master`→`master`
+  - **Resolve last-script-touch SHA per branch** (Q1a):
+    ```
+    gh api "repos/<owner>/percona-server-mongodb/commits?path=percona-packaging/scripts/psmdb_builder.sh&sha=<branch>&per_page=1" --jq '.[0].sha'
+    ```
+    Returns SHA of the most recent mongo commit on `<branch>` that touched `psmdb_builder.sh`. Stays constant while the branch advances on commits that don't touch the script.
+  - **Skip-if-tag-exists**: before launching the build for `(distro, branch, sha)`, query GHCR for `<distro>:<branch>-<sha>`. If it already exists, mark the matrix cell as skipped — same `(distro, branch, sha)` tuple already produced an immutable image. Only Dockerfile / GHA-workflow edits in this repo bypass this check (those legitimately need rebuild even with an unchanged script SHA — handled by `push`-trigger path which carries `force=true`).
+  - Use the resolved mongo last-script-touch SHA as the image tag suffix (instead of `${{ github.sha }}`)
+  - Pass `MONGO_REPO`, `MONGO_BRANCH`, and the resolved SHA into Docker as `--build-arg`s
+  - Add `concurrency: group: build-psmdb-buildbarn-runners-<psmdb_version>, cancel-in-progress: false` so two simultaneous rotations of the same release line serialize
+- **EDIT** this README:
+  - Replace "Strategy: run install_deps() from per-version BuildBarn-tuned copies" section with a "Strategy: fetch from upstream mongo branches" rewrite
+  - Remove `psmdb_builder_*.sh` entries from "Directory layout"
+  - Replace "Keeping the copies in sync with upstream" section with "No syncing required — push commit to mongo branch, dispatch GHA"
+
+In percona-server-mongodb: **zero changes**. `psmdb_builder.sh` already lives at `percona-packaging/scripts/psmdb_builder.sh` on `v8.0`, `v8.3`, `master`. The mongo side simply becomes the canonical source.
+
+**Race conditions and mitigations**:
+
+| Race | Scenario | Mitigation |
+|---|---|---|
+| R1: mongo branch HEAD moves during image build | Not a race in Phase 2: image tag suffix is the **last-script-touch SHA**, not branch HEAD. Branch HEAD can advance to commit Y mid-build with no effect — Y didn't touch the script, so `gh api commits?path=psmdb_builder.sh` still returns the same SHA. | None needed. (`concurrency: group: build-psmdb-buildbarn-runners-<psmdb_version>` is still kept for hygiene against simultaneous `workflow_dispatch` + cron firing.) |
+| R2: SHA-resolve API call fails or returns stale value | GitHub API rate-limit or transient error. | Retry once with 10 s back-off; on second failure, fail fast — incorrect SHA in the image tag is worse than no build. |
+| R3: GHA workflow runs from `vorsel` fork while `MONGO_REPO` defaults to `Percona-Lab` | Dockerfile pulls from a repo that doesn't exist yet (pre-upstream). | GHA explicit `--build-arg MONGO_REPO=https://github.com/vorsel/percona-server-mongodb.git` until upstream merge. Delete that line in a one-commit follow-up the moment upstream lands. |
+| R4: mongo branch is private or requires auth | Future: if mongo repo goes private. | Out of scope for Phase 2; would require a deploy key or App token plumbed through the Dockerfile build. Current `vorsel` and `Percona-Lab` mirrors are public, so `wget` over plain HTTPS works. |
+| R5: two `psmdb_builder.sh`-touching commits land within the same cron window | Cron runs at 03:00 UTC, sees commit X. Operator merges another script-touching commit Y at 04:00. Until next cron run, GHCR reflects only `:<branch>-X`, the cluster still pulls X. | Daily cron + on-demand `workflow_dispatch` covers this — the merger of Y triggers the build manually. Phase-3 webhook (see L1.5 below) eliminates the gap entirely by reacting to the merge event in real time. |
+
+**Acceptance gate (Phase 2 → DONE)**:
+
+- One full `workflow_dispatch` run rebuilds all 33 jobs successfully against the new Dockerfile/workflow shape
+- Output image tags follow `<distro>:<version>-<last-script-touch-sha>` where the suffix matches the output of `gh api "repos/<owner>/percona-server-mongodb/commits?path=percona-packaging/scripts/psmdb_builder.sh&sha=<branch>&per_page=1" --jq '.[0].sha'` at build start
+- A second `workflow_dispatch` run **immediately** after the first completes with **all 33 jobs skipped** (no rebuild because tag already exists in GHCR). Confirms skip-if-tag-exists logic works.
+- After a no-op mongo commit on `v8.0` (e.g. doc-only change that does NOT touch `psmdb_builder.sh`), the next cron run produces zero rebuilds for the 11 `v8.0` variants.
+- After a real `psmdb_builder.sh` change on `v8.0`, the next cron run produces exactly 11 new images (one per distro × arch for `v8.0`), tagged with the new SHA, while `v8.3` and `master` variants stay untouched.
+- The 3 deleted `psmdb_builder_*.sh` files are not referenced by any remaining file in jenkins-pipelines (`grep -r psmdb_builder_ IaC/ .github/` returns 0 hits)
+- A subsequent Bazel build with `--config=psmdb_buildfarm` against the new image tag succeeds end-to-end (RBE handshake validates, action cache invalidation works as expected)
+
+**Rebuild trigger logic** (the heart of Phase 2 — Q1a + Q2c):
+
+The cron-driven detect-changes job reduces wasted GHA minutes by rebuilding only when the script actually changed. Pseudocode:
+
+```bash
+# detect-changes job (runs first, outputs matrix for the build job)
+for psmdb_version in 8.0 8.3 master; do
+  case "$psmdb_version" in
+    8.0)    branch=v8.0 ;;
+    8.3)    branch=v8.3 ;;
+    master) branch=master ;;
+  esac
+
+  # Q1a — last-script-touch SHA, NOT branch HEAD
+  sha=$(gh api "repos/${MONGO_OWNER}/percona-server-mongodb/commits?path=percona-packaging/scripts/psmdb_builder.sh&sha=${branch}&per_page=1" \
+        --jq '.[0].sha')
+
+  for distro_arch in ubuntu-noble-x86_64 debian-bookworm-x86_64 ...; do
+    tag="${psmdb_version}-${sha}"
+    if gh api "users/${REGISTRY_OWNER}/packages/container/psmdb-buildbarn-runners%2F${distro_arch}/versions" \
+       --jq '.[].metadata.container.tags[]' | grep -qx "$tag"; then
+      echo "skip ${distro_arch}:${tag} — already in GHCR"
+      continue
+    fi
+    matrix_jobs+=("{distro_arch:${distro_arch},branch:${branch},sha:${sha}}")
+  done
+done
+```
+
+The build job then runs only on `matrix_jobs`. With unchanged scripts: 0 images built (cron is essentially free). With one changed branch: exactly 11 images (one per distro × arch for that branch) — the other 22 cells skip.
+
+The `push`-trigger code path (Dockerfile or workflow edits in this repo) carries `force=true` to bypass the skip-if-tag-exists check — those edits legitimately invalidate previously-built images even when the script SHA is unchanged.
+
+**What is intentionally NOT in Phase 2**:
+
+- Webhook from mongo repo on script change → real-time push trigger. Deferred to Phase 3 L1.5 because it requires either a GitHub App or a cross-repo PAT (same secret-management work as Phase 3 codegen auto-PR), so we land both pieces at once when that infrastructure is in place.
+- Codegen of `psmdb_rbe_containers.bzl` and `ondemand-pools.yaml` from a canonical YAML. That's Phase 3 — Phase 2 keeps the existing dual-edit cycle (mongo `psmdb_rbe_containers.bzl` × 3 branches + jenkins-pipelines `ondemand-pools.yaml`); only the script source moves.
+
+**Migration mode**: single atomic PR. Tested via `workflow_dispatch` before merge. Revert = single commit revert. The `runner-images.yaml` source-of-truth file from Phase 3 is **not** introduced here.
+
+### Phase 3 — Single-source-of-truth + codegen sync (FOLLOWS PHASE 2)
+
+**When to start**: after Phase 2 is stable for ≥2 consecutive successful image rotations validated end-to-end (i.e. we have empirical evidence the mongo-as-source flow works).
+
+**Problem after Phase 2 lands**:
+
+Image rotation still requires four manually-edited files to agree byte-for-byte on the image tag string (REAPI Platform property is matched exactly by bb-scheduler):
+
+- `IaC/buildbarn/ondemand/compose/config/ondemand-pools.yaml` — 1 file in jenkins-pipelines
+- `bazel/platforms/psmdb_rbe_containers.bzl` — 1 file × 3 branches in percona-server-mongodb (`master`, `v8.3`, `v8.0`)
+
+Manual sync across 4 file edits in 2 repos = error-prone and slow.
+
+**Proposed mechanism — single canonical YAML + Python codegen + auto-PR**:
+
+```
+jenkins-pipelines/
+├── IaC/buildbarn/runner-images.yaml      # canonical source of truth
+└── scripts/sync-runner-images.py         # codegen tool (~50 lines, stdlib only)
+```
+
+Canonical YAML shape:
+
+```yaml
+registry: ghcr.io/vorsel/psmdb-buildbarn-runners   # placeholder; updates per migration to Percona-controlled GHCR org
+branches:
+  master:
+    sha: <mongo-master-head>
+    distros: [amazon_linux_2023, debian12, rhel8, rhel9, ubuntu22, ubuntu24]
+  v8.3:
+    sha: <mongo-v8.3-head>
+    distros: [...]
+  v8.0:
+    sha: <mongo-v8.0-head>
+    distros: [...]
+```
+
+`sync-runner-images.py` reads this YAML and regenerates:
+
+- `IaC/buildbarn/ondemand/compose/config/ondemand-pools.yaml` (in cwd jenkins-pipelines)
+- `bazel/platforms/psmdb_rbe_containers.bzl` per mongo branch — `git checkout <branch>` in a mongo working tree → write generated `.bzl` → `git commit -m "PSMDB-2034 buildbarn: bump runner image to <sha> (autogen)"`
+
+**Automation level — staged**:
+
+| Level | Description | Status |
+|---|---|---|
+| L0 (today) | Fully manual edit of 4 files. | Phase 1+2 default |
+| L1 (target initial) | GHA in jenkins-pipelines opens auto-PR for jenkins-pipelines side after image build. Operator runs sync-script locally to update mongo branches, opens 3 PRs by hand. No cross-repo PAT/secrets needed. | First Phase 3 milestone |
+| L1.5 (mongo→jenkins-pipelines webhook) | GHA in **percona-server-mongodb** (one workflow per release branch, triggered on `push` to `percona-packaging/scripts/psmdb_builder.sh`) sends `repository_dispatch` event of type `psmdb-builder-changed` to jenkins-pipelines, with `client_payload: {branch, sha}`. jenkins-pipelines workflow listens to that event and rebuilds the affected 11 variants in real time — eliminates the ≤24 h cron latency from R5 and the need for `workflow_dispatch` after every script-touching merge. Requires PAT or GitHub App with `repository_dispatch` write scope on jenkins-pipelines. Cron stays as a safety net (catches missed webhooks). | After L1 has stabilized; bundled with L2's secret-management work |
+| L2 (target stable) | GHA additionally clones percona-server-mongodb (using PAT or GitHub App) and opens 3 auto-PRs against mongo branches. | Once L1 has stabilized over ~3 rotations |
+
+**L1 → L2 escalation criteria**:
+
+- Operator workflow on L1 has been used for ≥3 successful rotations with no manual override
+- Cross-repo write access is available — either PAT in `PSMDB_AUTOSYNC_TOKEN` secret, or a GitHub App `psmdb-buildbarn-bot` installed on both repos (preferred)
+- Branch protection on mongo `v8.0`/`v8.3`/`master` is configured to require ≥1 reviewer on auto-PRs to prevent merge-before-jenkins-pipelines-PR race
+
+**Race conditions specific to Phase 3**:
+
+| Race | Mitigation |
+|---|---|
+| Mongo PR merged before jenkins-pipelines PR (in L2) — runtime sees Bazel sending new image tag while bb-scheduler still has the old pool registered → `FAILED_PRECONDITION` until jenkins-pipelines PR merges | jenkins-pipelines auto-PR title prefixed `[BLOCKER]`, mongo auto-PR description explicitly says `DO NOT MERGE BEFORE jenkins-pipelines PR <link>`. Not fully bullet-proof — branch protection + reviewer convention is the operational backstop. |
+| Concurrent rotations clobber each other's auto-PR branch | `concurrency: group: runner-images-sync, cancel-in-progress: false` (carried over from Phase 2) |
+| Hand-edit of generated `.bzl` or `ondemand-pools.yaml` | Generated files carry a `# AUTO-GENERATED — do not hand-edit. Source: jenkins-pipelines/IaC/buildbarn/runner-images.yaml` header. Next sync overwrites silently; reviewer expected to flag a hand-edit during PR review. |
+
+**Acceptance gate (Phase 3 → DONE)**:
+
+- Operator triggers rotation by editing one line (`sha:` value in `runner-images.yaml`)
+- Running `python3 scripts/sync-runner-images.py --psmdb-checkout <path> --commit --write` regenerates all 4 downstream files; no further manual edits
+- A minimum of 2 consecutive successful rotations through the new flow
+
+**Status**: design only; implementation deferred until Phase 2 stabilizes. The architecture analysis (cross-repo PAT vs GitHub App, race conditions, automation levels) is documented above so the implementer doesn't have to redo it.
+
+---
 
 ## Strategy: run `install_deps()` from per-version BuildBarn-tuned copies
 

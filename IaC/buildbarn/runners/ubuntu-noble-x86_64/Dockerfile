@@ -31,10 +31,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
-ARG JENKINS_PIPELINES_REPO=https://github.com/vorsel/jenkins-pipelines.git
-ARG JENKINS_PIPELINES_BRANCH=PSMDB-2034_buildbarn_setup
-ARG PSMDB_VERSION=8.3
-ARG PSMDB_BUILDER_SCRIPT_PATH=IaC/buildbarn/runners/psmdb_builder_8_3.sh
+ARG MONGO_REPO=https://github.com/vorsel/percona-server-mongodb.git
+ARG MONGO_BRANCH=master
+ARG PSMDB_VERSION
 
 # Fetch psmdb_builder.sh from the current branch of the IaC repo and
 # run it with --install_deps=1. CACHE_BUST forces wget re-run on every
@@ -42,7 +41,7 @@ ARG PSMDB_BUILDER_SCRIPT_PATH=IaC/buildbarn/runners/psmdb_builder_8_3.sh
 # up the latest commit of the script while experimenting.
 ARG CACHE_BUST=0
 RUN mkdir -p /tmp/build \
- && RAW_URL="$(echo ${JENKINS_PIPELINES_REPO} | sed -re 's|github.com|raw.githubusercontent.com|; s|\.git$||')/${JENKINS_PIPELINES_BRANCH}/${PSMDB_BUILDER_SCRIPT_PATH}" \
+ && RAW_URL="$(echo ${MONGO_REPO} | sed -re 's|github.com|raw.githubusercontent.com|; s|\.git$||')/${MONGO_BRANCH}/percona-packaging/scripts/psmdb_builder.sh" \
  && echo "CACHE_BUST=${CACHE_BUST} fetching ${RAW_URL}" \
  && wget -q "${RAW_URL}" -O /tmp/psmdb_builder.sh \
  && chmod +x /tmp/psmdb_builder.sh \
@@ -55,7 +54,7 @@ LABEL org.percona.psmdb.os="ubuntu-noble"
 LABEL org.percona.psmdb.glibc="2.39"
 LABEL org.percona.psmdb.arch="x86_64"
 LABEL org.percona.psmdb.version=$PSMDB_VERSION
-LABEL org.percona.psmdb.builder_script="${PSMDB_BUILDER_SCRIPT_PATH} install_deps()"
+LABEL org.percona.psmdb.builder_script="percona-packaging/scripts/psmdb_builder.sh install_deps()"
 
 # No CMD / ENTRYPOINT: BuildBarn's docker-compose.yml overrides the command
 # to run bb_runner after runner-installer drops the binary into /bb.
