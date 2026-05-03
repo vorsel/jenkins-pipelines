@@ -71,19 +71,29 @@ static_resources:
               "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
               providers:
                 # Dex is the sole issuer at this stage. id_tokens minted
-                # for `bazel-cli` (Device Code flow) carry:
+                # for Bazel-side clients carry:
                 #   iss = https://bb-psmdb.ddns.net:5556
-                #   aud = ["bazel-cli"]
+                #   aud = ["bazel-cli"]      (Device Code flow — humans)
+                #   aud = ["bazel-jenkins"]  (Token Exchange flow — CI;
+                #                             see dex.yaml `bazel-jenkins`
+                #                             staticClient and the
+                #                             `jenkins-percona` connector)
                 # We pin BOTH so that a Dex token meant for bb-browser
                 # or bb-scheduler-admin (different `aud`) cannot be
                 # replayed against the gRPC endpoint — a defense-in-
                 # depth against the not-actually-bad-but-let's-not-
                 # confuse-them scenario where someone copy-pastes
                 # their browser session cookie's id_token here.
+                #
+                # Jenkins-issued OIDC tokens (iss = .../psmdb.cd...
+                # /oidc, aud = ["psmdb-rbe"]) are NEVER accepted here;
+                # they only exist for the one-shot exchange at Dex's
+                # /token. Trust universe stays single-rooted on Dex.
                 dex_provider:
                   issuer: https://bb-psmdb.ddns.net:5556
                   audiences:
                   - bazel-cli
+                  - bazel-jenkins
                   # Refresh the JWKS in the background every 600s.
                   # Dex rotates signing keys every 6h and keeps the
                   # past 24h of public keys in `/keys` for offline
@@ -204,6 +214,7 @@ static_resources:
                   issuer: https://bb-psmdb.ddns.net:5556
                   audiences:
                   - bazel-cli
+                  - bazel-jenkins
                   remote_jwks:
                     http_uri:
                       uri: https://bb-psmdb.ddns.net:5556/keys

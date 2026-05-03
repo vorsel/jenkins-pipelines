@@ -88,6 +88,17 @@ oauth2:
   # client secret ever leaks.
   passwordConnector: ""
   alwaysShowLoginScreen: false
+  # Step 5c — Jenkins CI auth via OAuth 2.0 Token Exchange (RFC 8693).
+  # Once `grantTypes:` is set Dex disables the defaults, so EVERY grant
+  # we still rely on must be enumerated explicitly. Adding a new grant
+  # here without the existing four breaks every browser login flow plus
+  # bazel-cli device-code login (i.e. all human paths) on `docker
+  # compose restart dex`.
+  grantTypes:
+  - authorization_code                                  # bb-browser, bb-scheduler-admin, bb-portal browser logins
+  - refresh_token                                       # silent re-issue + idle-rotation for the three UIs above
+  - urn:ietf:params:oauth:grant-type:device_code        # bazel-cli (Device Authorization Grant) — human dev login
+  - urn:ietf:params:oauth:grant-type:token-exchange     # bazel-jenkins (RFC 8693) — CI auth from Jenkins-issued JWT
 
 # Token TTLs. See decisions log §5 in buildbarn-auth-tls-plan.md.
 #
@@ -156,6 +167,60 @@ connectors:
     # GitHub's API, so a deleted team membership still kicks in
     # within minutes regardless.
     useLoginAsID: false
+
+# Step 5c — Jenkins as an upstream OIDC IdP for CI token exchange.
+#
+# Jenkins runs the OpenID Connect Provider plugin
+# (https://plugins.jenkins.io/oidc-provider/) which exposes
+#   /oidc/.well-known/openid-configuration  (discovery)
+#   /oidc/jwks                              (RS256 public key)
+# anonymously on https://psmdb.cd.percona.com — anonymous read for those
+# two paths is granted by the nginx allow-list maintained via the
+# `manage-nginx-allow-list` job (the central VM's Hetzner Floating IP
+# 95.217.242.120 is on it).
+#
+# Pipelines mint short-lived (~60 min) RS256 id_tokens via
+# `withCredentials([string(credentialsId: 'PSMDB-RBE-OIDC', ...)])` and
+# POST them to https://bb-psmdb.ddns.net:5556/token with
+# grant_type=urn:ietf:params:oauth:grant-type:token-exchange and
+# connector_id=jenkins-percona (this connector). Dex verifies the
+# signature, lifts `sub` (the job URL) into the federated identity, and
+# mints a Dex-side id_token whose aud=bazel-jenkins (the staticClient
+# below). Bazel then uses ONLY the Dex-issued token in --remote_header,
+# never the Jenkins one — Envoy on :8981 / :1985 trusts only Dex's JWKS
+# (see reapi-proxy/envoy.yaml dex_provider), so the trust universe stays
+# single-rooted.
+- type: oidc
+  id: jenkins-percona
+  name: 'Jenkins Percona'
+  config:
+    # Must match `iss` in tokens emitted by the OIDC Provider plugin
+    # exactly, byte-for-byte. The plugin defaults to <jenkins-host>/oidc
+    # (no trailing slash); changing the issuer URI in the plugin without
+    # updating this line silently breaks `/token` exchange with
+    # `oidc: id token issued by a different provider`.
+    issuer: https://psmdb.cd.percona.com/oidc
+    # Map Jenkins's `sub` claim (which is the job URL,
+    # e.g. https://psmdb.cd.percona.com/job/percona-server-for-mongodb-8.3/)
+    # into Dex's userID. Audit logs and Dex-issued tokens carry this as
+    # the federated identity, so a request traced through bb-portal
+    # points back at the exact Jenkins job that requested it. Tighten
+    # later (e.g. via groups claim mapping) if we want subject-prefix
+    # ACLs in BB or Envoy.
+    userNameKey: sub
+    # Override the connector default scopes (`["profile", "email"]`).
+    # Jenkins's OIDC Provider plugin doesn't emit `email` and we have
+    # no use for it — the federated identity is the job URL via `sub`.
+    # Leaving the default in would cause Dex to enforce
+    # `hasEmailScope` (see connector/oidc/oidc.go) and reject every
+    # exchange with `missing email claim, not found "email" key`.
+    scopes:
+    - openid
+    # Token-exchange flow doesn't need a redirect URI nor a clientID/
+    # clientSecret pair on the connector itself — the `bazel-jenkins`
+    # staticClient handles the auth at /token. Leaving these unset is
+    # explicitly supported per
+    # https://dexidp.io/docs/guides/token-exchange/ §"Configuring dex".
 
 # Static OAuth clients — i.e. the Buildbarn web services that will
 # delegate login to Dex once Step 4 wires them up. Defining them
@@ -234,6 +299,36 @@ staticClients:
   redirectURIs:
   - urn:ietf:wg:oauth:2.0:oob
   - /device/callback
+
+# Step 5c — Jenkins CI client for the Token Exchange grant
+# (RFC 8693, see https://dexidp.io/docs/guides/token-exchange/).
+#
+# Token exchange is the OIDC equivalent of GCP Workload Identity
+# Federation / AWS Web Identity Federation: instead of stashing a
+# long-lived Dex refresh token in Jenkins credentials (and dealing with
+# the rotation drama imposed by `reuseInterval: 5s` above), each
+# pipeline mints a fresh ~60-min Jenkins-side id_token via the OIDC
+# Provider plugin and exchanges it at /token for a Dex-side id_token
+# carrying `aud: ["bazel-jenkins"]` and `sub` lifted from the Jenkins
+# token (the job URL). Bazel uses the Dex-side token in
+# --remote_header; the Jenkins-side one is one-shot and discarded.
+#
+# `public: true` — Jenkins pipelines pass any client_secret through
+# `withCredentials` plumbing into a curl invocation visible to the
+# build agent process, which is the textbook definition of a public
+# client per https://dexidp.io/docs/configuration/custom-scopes-claims-clients/#public-clients.
+# Dex's token-exchange code path validates auth via the static-client
+# id alone (no secret check) when `public: true`.
+#
+# No real redirect URI applies to token exchange (no browser callback),
+# but Dex's static-client validator still requires `redirectURIs:` be
+# non-empty — same wart as bazel-cli above. The OOB placeholder
+# satisfies the validator without implying any browser flow.
+- id: bazel-jenkins
+  name: 'Bazel RBE Jenkins'
+  public: true
+  redirectURIs:
+  - urn:ietf:wg:oauth:2.0:oob
 
 # Logging — JSON to stdout so docker compose / journald pick it up
 # uniformly with the other services on this host.
