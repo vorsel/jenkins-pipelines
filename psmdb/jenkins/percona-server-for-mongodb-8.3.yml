@@ -1,14 +1,14 @@
 - job:
-    name: hetzner-psmdb83-autobuild-RELEASE
+    name: hetzner-psmdb83-autobuild-RELEASE-RBE
     project-type: pipeline
     description: |
         Do not edit this job through the web!
     pipeline-scm:
       scm:
         - git:
-            url: https://github.com/Percona-Lab/jenkins-pipelines.git
+            url: https://github.com/vorsel/jenkins-pipelines.git
             branches:
-            - 'hetzner'
+            - 'PSMDB-2055_psmdb83_build_use_bazel_rbe__v8.3'
             wipe-workspace: false
       lightweight-checkout: true
       script-path: psmdb/jenkins/percona-server-for-mongodb-8.3.groovy
