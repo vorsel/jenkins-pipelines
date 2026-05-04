@@ -1,18 +1,25 @@
 # PSMDB-2034: enable Envoy admin endpoint for runtime stats / circuit-breaker
-# observability. Bound to 127.0.0.1 inside the container only — the host port
-# mapping in docker-compose.yml binds the same 127.0.0.1:9901 on the central
-# host so the admin UI is reachable as `curl localhost:9901/...` from an SSH
-# session, but never from the public internet (no auth on this endpoint, so
-# loopback-only is the security boundary).
+# observability.
+#
+# IMPORTANT: bind 0.0.0.0 INSIDE the container, not 127.0.0.1.
+# Docker port mapping `127.0.0.1:9901:9901` (see docker-compose.yml) forwards
+# packets from the host's loopback into the container's *bridge* interface
+# (eth0, 172.x.x.x), NOT the container's loopback. If Envoy listens only on
+# the container's lo, those packets land on eth0 with no listener and the
+# connection silently drops — `curl localhost:9901/...` returns empty
+# without an error. Listening on 0.0.0.0 inside the container is safe
+# because the host-side port binding (127.0.0.1:9901, NOT 0.0.0.0:9901) is
+# what enforces "loopback-only on the host" — public NICs never see this
+# port from outside.
 #
 # Useful queries during/after a multi-stage Bazel run:
 #   curl -s localhost:9901/clusters | grep -E "circuit_breakers|cx_overflow|rq_overflow|rq_pending_overflow"
-#   curl -s localhost:9901/stats?filter=upstream_cx_active
-#   curl -s localhost:9901/stats?filter=upstream_rq_pending_active
+#   curl -s 'localhost:9901/stats?filter=upstream_cx_active'
+#   curl -s 'localhost:9901/stats?filter=upstream_rq_pending_active'
 admin:
   address:
     socket_address:
-      address: 127.0.0.1
+      address: 0.0.0.0
       port_value: 9901
 
 static_resources:
