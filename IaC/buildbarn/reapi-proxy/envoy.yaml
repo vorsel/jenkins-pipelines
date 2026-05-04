@@ -1,3 +1,20 @@
+# PSMDB-2034: enable Envoy admin endpoint for runtime stats / circuit-breaker
+# observability. Bound to 127.0.0.1 inside the container only — the host port
+# mapping in docker-compose.yml binds the same 127.0.0.1:9901 on the central
+# host so the admin UI is reachable as `curl localhost:9901/...` from an SSH
+# session, but never from the public internet (no auth on this endpoint, so
+# loopback-only is the security boundary).
+#
+# Useful queries during/after a multi-stage Bazel run:
+#   curl -s localhost:9901/clusters | grep -E "circuit_breakers|cx_overflow|rq_overflow|rq_pending_overflow"
+#   curl -s localhost:9901/stats?filter=upstream_cx_active
+#   curl -s localhost:9901/stats?filter=upstream_rq_pending_active
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+
 static_resources:
   listeners:
   - name: grpc_listener
@@ -239,6 +256,18 @@ static_resources:
     connect_timeout: 5s
     type: STRICT_DNS
     lb_policy: ROUND_ROBIN
+    # PSMDB-2034: same thresholds as buildbarn_frontend — see comment there.
+    # Capabilities() is a one-call-per-invocation handshake, so the absolute
+    # rate is way lower, but parallel matrix runs can still trigger 17
+    # simultaneous /Capabilities/ RPCs which is well within defaults; we
+    # bump anyway for symmetry with the other clusters.
+    circuit_breakers:
+      thresholds:
+      - priority: DEFAULT
+        max_connections: 100000
+        max_pending_requests: 100000
+        max_requests: 100000
+        max_retries: 1000
     typed_extension_protocol_options:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -258,6 +287,25 @@ static_resources:
     connect_timeout: 5s
     type: STRICT_DNS
     lb_policy: ROUND_ROBIN
+    # PSMDB-2034: lift Envoy default circuit-breaker thresholds.
+    # Defaults are 1024 across the board (max_connections,
+    # max_pending_requests, max_requests) and get overflowed by parallel
+    # PSMDB Jenkins matrix builds: each invocation runs --jobs=72-190
+    # (psmdb_buildfarm config), and the matrix can run up to 17 stages in
+    # parallel against this cluster. 17 * 72 ≈ 1224 simultaneous
+    # findMissingBlobs/getActionResult/etc. RPCs vs 1024-default →
+    # `UNAVAILABLE: ... reset reason: overflow` mid-build (BB community
+    # ref: buildbarn-deployments PR#187 "Bazel client overload"). Setting
+    # high ceilings is safe because bb-storage already has its own
+    # admission/queue management — Envoy is just a perimeter, not the
+    # bottleneck. Watch via `curl localhost:9901/clusters | grep overflow`.
+    circuit_breakers:
+      thresholds:
+      - priority: DEFAULT
+        max_connections: 100000
+        max_pending_requests: 100000
+        max_requests: 100000
+        max_retries: 1000
     typed_extension_protocol_options:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -318,6 +366,18 @@ static_resources:
     connect_timeout: 5s
     type: STRICT_DNS
     lb_policy: ROUND_ROBIN
+    # PSMDB-2034: BES streams stay open for the lifetime of the Bazel
+    # invocation (minutes to hours). 17 parallel stages → 17 long-lived
+    # bidirectional streams plus burstier batch event publishes; same
+    # 100k ceiling reasoning as buildbarn_frontend. Without this the BES
+    # listener on :1985 also overflows under matrix load.
+    circuit_breakers:
+      thresholds:
+      - priority: DEFAULT
+        max_connections: 100000
+        max_pending_requests: 100000
+        max_requests: 100000
+        max_retries: 1000
     typed_extension_protocol_options:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions

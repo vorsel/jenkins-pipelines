@@ -446,6 +446,14 @@ services:
       # Plan §"Step 1 → Decision B" — Envoy is the single auth boundary
       # for both Bazel-execution and BES traffic.
       - "1985:1985"
+      # PSMDB-2034: Envoy admin endpoint on loopback only. The matching
+      # `admin:` block in envoy.yaml binds 127.0.0.1:9901 inside the
+      # container; we mirror that to the host's loopback so an SSH'd
+      # operator can run `curl localhost:9901/clusters` to inspect
+      # circuit-breaker counters (cx_overflow, rq_pending_overflow, …)
+      # during a Bazel matrix run. Public bind would be a footgun — admin
+      # has no auth and exposes /quitquitquit / /healthcheck/fail.
+      - "127.0.0.1:9901:9901"
     volumes:
       - /var/lib/buildbarn/reapi-proxy/envoy.yaml:/etc/envoy/envoy.yaml:ro
       # Cert dir maintained by the certbot deploy-hook (10-buildbarn.sh):
