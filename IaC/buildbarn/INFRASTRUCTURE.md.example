@@ -137,6 +137,248 @@ envoy-proxy.
 
 ---
 
+## 9. Planned migration: dedicated Hetzner project (`psmdb-bazel-rbe`)
+
+> Status: planned. New Hetzner project already created (id 14460169).
+> Cutover sequence below is to be executed AFTER PSMDB-2055 v8.3 build is
+> green on the current shared project and the matching cherry-picks are
+> merged across `master`, `v8.3`, and `v8.0`.
+
+### 9.1 Why split
+
+- Hetzner Cloud API rate-limit is **per-project, default 3600 req/hr**,
+  refilling at 1 req/sec
+  (https://docs.hetzner.cloud/reference/cloud#description/rate-limiting).
+- The current shared project hosts 6 Jenkins instances (psmdb +
+  5 others) plus the BuildBarn control plane (scaler, ondemand workers,
+  central preflight). Observed quota drain to **2 / 3600 within seconds**
+  during multi-stage parallel builds — once exhausted, the next
+  `hcloud server create` fails for ~tens of minutes regardless of which
+  team triggered the burst. Cross-team blast radius.
+- Volume quota is **also per-project** and currently 850 / 1024 GB used
+  in the shared project, which makes any in-place rsync-based volume
+  migration impossible (no headroom for a parallel 750 GB volume).
+
+Splitting BB into its own project gives us:
+- Independent 3600 req/hr budget — net effective ~2× capacity.
+- Independent volume quota — full 1024 GB available for CAS growth.
+- Operational isolation — bursts from any of the 5 unrelated Jenkins
+  instances no longer starve the BB control plane, and vice versa.
+
+### 9.2 Hetzner constraints (sanity-checked before planning)
+
+| Asset | Cross-project? | Migration path |
+|---|---|---|
+| Project | n/a | New project `psmdb-bazel-rbe` (id 14460169) created. |
+| API token | per-project | Generate fresh in the new project. |
+| SSH keys | per-project | Re-upload public keys under the same names. |
+| Private network | per-project | Create new network in the new project (CIDR may stay `10.0.0.0/16`; nothing connects across). |
+| Floating IP | per-project | Allocate a fresh FIP in `hel1`. |
+| Volume (xfs CAS, 750 GB) | NOT cross-project | Cold rebuild of CAS — see §9.3 below. |
+| Server | per-project | Spin up fresh `bb-psmdb-ondemand` in new project. |
+| TLS cert | DNS-bound | Re-issue Let's Encrypt cert on the new central before DNS cutover. |
+| DNS hostname (`bb-psmdb.ddns.net`) | external (No-IP) | Single A-record swap to new FIP — Bazel/CI configs untouched. |
+
+### 9.3 Volume strategy: cold rebuild
+
+CAS volume cannot be moved (volumes are project-local; Hetzner has no
+"snapshot" feature for detachable volumes — only for server boot disks
+— and Volume Backup is also project-local).
+
+Path of least resistance:
+1. Create a fresh empty 750 GB xfs volume in the new project under name
+   `psmdb-buildbarn-cas-ondemand`.
+2. Run `create-central.sh` with the new project's auth — comes up empty.
+3. First Bazel build pre-warms CAS (~3 hours, one-time cost — measured
+   against the cold-cache 25-min runs we observed before the warm
+   cache was established).
+4. Subsequent builds resume normal speed (cache hit rates climb back
+   into the 60-90 % band after a single full release matrix).
+
+Old volume is detached but **kept** in the shared project for 1–2 weeks
+as rollback insurance, then deleted (frees 750 GB of the 850/1024 GB
+shared quota for other teams).
+
+### 9.4 Cutover sequence (operator runbook)
+
+1. Wait for PSMDB-2055 build to finish on shared project; confirm
+   green baseline.
+2. Merge PSMDB-2034 / PSMDB-2054 changes across `master`, `v8.3`, `v8.0`
+   (cherry-picks already prepared on test branches).
+3. **In the new project (no impact on shared / production)**:
+   - Create Hetzner API token; store under
+     `~/.config/psmdb-rbe/hcloud.token` (mode `0600`).
+   - Upload SSH public keys: `bb-psmdb-laptop` (operator's pubkey).
+     `bb-psmdb-ondemand-central` is generated and uploaded
+     automatically by `create-central.sh::ensure_central_ssh_key()`.
+   - Create private network `psmdb-bazel-rbe` (CIDR `10.0.0.0/16`).
+   - Allocate Floating IP in `hel1` with label `bb-psmdb-central`.
+   - Create empty 750 GB xfs volume `psmdb-buildbarn-cas-ondemand`
+     in `hel1` (`hcloud volume create --location hel1 --size 750
+     --format xfs --name psmdb-buildbarn-cas-ondemand`).
+4. Apply `create-central.sh` lookup-by-name patch (see §10).
+5. Create operator-local `~/.config/psmdb-rbe/cluster.env` (see §10).
+6. Re-issue TLS cert for the new central host. Two options:
+   a. **Stage cert before DNS cutover** — temporarily point
+      `bb-psmdb.ddns.net` at the NEW FIP for ~5 minutes during the
+      LE HTTP-01 challenge, then revert until the rest of the stack
+      is verified, then re-cutover. Single bb-portal.ddns.net
+      change.
+   b. **Cutover atomically** — repoint DNS once, run
+      `init-tls.sh` (or `certbot certonly --webroot ...`) on the
+      new central, accept the brief outage window between DNS
+      flip and certbot completion (~2–5 min).
+7. Run `source ~/.config/psmdb-rbe/cluster.env && ./create-central.sh`.
+   Expect fresh-volume bootstrap path; CAS empty, scaler in dry-run by
+   default.
+8. Smoke-test in dry-run mode (one manual `spawn-worker.sh`, one Bazel
+   build with `--remote_cache` only, no executor); flip
+   `SCALER_DRY_RUN=false`.
+9. Repoint `bb-psmdb.ddns.net` A-record to new FIP (No-IP UI). Wait
+   TTL (~5 min). Verify Bazel client → Envoy works end-to-end.
+10. Trigger a full Jenkins matrix build on PSMDB-2055 v8.3 to validate.
+11. **Rollback ready** for 1–2 weeks: shutdown old central
+    (`hcloud server poweroff bb-psmdb-ondemand` in shared project).
+    Old volume left attached. DNS revert is a single A-record swap.
+12. After 2 weeks of stable operation: delete old VM and volume in
+    shared project.
+
+### 9.5 Refactor as separate Git repo (follow-up)
+
+Once §9.4 is stable, the natural next step is to extract
+`IaC/buildbarn/` into its own repository (working name
+`psmdb-buildbarn` or `percona-buildbarn`):
+
+- One repo = one Hetzner project = one operational unit.
+- Lookup-by-name pattern from §10 already supports it (no hardcoded IDs
+  to port).
+- `jenkins-pipelines` keeps only the Jenkins Groovy / YAML; the BB
+  cluster gets its own versioning, its own CI (env validation,
+  jsonnet linting), its own release tags.
+
+Out of scope for the migration ticket itself — track separately.
+
+## 10. Operator-local cluster config (lookup-by-name pattern)
+
+Hetzner numeric IDs (`VOLUME_ID`, `NETWORK_ID`, `SSH_KEY_IDS`) are
+**project-local** and not safe to commit. Replaced by name-based
+lookup + operator-local override file. Names ARE safe to commit
+(they're stable and human-readable; the IDs they resolve to live in
+the active hcloud auth context).
+
+### 10.1 Repo-side: `create-central.sh` resolution order
+
+```
+For each of VOLUME_ID / NETWORK_ID / SSH_KEY_IDS:
+  1. If the env var is already set (from cluster.env or a one-shot
+     export), use it as-is.
+  2. Otherwise: hcloud describe by name (VOLUME_NAME / NETWORK_NAME
+     / each entry in SSH_KEY_NAMES) within the currently-authenticated
+     Hetzner project. Fail loudly if anything fails to resolve.
+
+Names committed in script:
+  VOLUME_NAME    = psmdb-buildbarn-cas-ondemand
+  NETWORK_NAME   = psmdb-bazel-rbe
+  SSH_KEY_NAMES  = bb-psmdb-laptop bb-psmdb-ondemand-central
+```
+
+This makes the script project-portable: same code, same names, the
+hcloud token determines which project's IDs are picked up.
+
+### 10.2 Operator-side: `~/.config/psmdb-rbe/cluster.env`
+
+Operator-local, never committed. Sourced before each
+`create-central.sh` run:
+
+```
+source ~/.config/psmdb-rbe/cluster.env
+cd jenkins-pipelines/IaC/buildbarn/ondemand/scripts
+./create-central.sh
+```
+
+Template:
+
+```bash
+# psmdb-bazel-rbe (Hetzner project 14460169) — operator-local config.
+# NEVER commit. NEVER share via Slack/email.
+
+# Hetzner auth — pick ONE of these three:
+export HCLOUD_TOKEN_FILE="$HOME/.config/psmdb-rbe/hcloud.token"   # preferred (file mode 0600)
+# export HCLOUD_CONTEXT_NAME=psmdb-bazel-rbe                       # alt: hcloud cli.toml context
+# export HCLOUD_TOKEN="..."                                         # least preferred (env leaks)
+
+# Public network identity
+export PUBLIC_HOSTNAME=bb-psmdb.ddns.net
+export LE_EMAIL=builds-noreply@percona.com
+
+# GitHub OAuth App (Dex GitHub connector). Same App as the shared-project
+# deployment — only the callback URL differs (already covered: registered
+# under the same hostname).
+export GITHUB_OAUTH_CLIENT_ID="..."
+export GITHUB_OAUTH_CLIENT_SECRET="..."
+
+# Optional ID overrides — uncomment ONLY if name resolution doesn't suit
+# (e.g. duplicate names across projects on the same hcloud token; rare).
+# export VOLUME_ID=...
+# export NETWORK_ID=...
+# export SSH_KEY_IDS="..."
+```
+
+Recommended permissions:
+
+```
+chmod 700 ~/.config/psmdb-rbe
+chmod 600 ~/.config/psmdb-rbe/hcloud.token
+chmod 600 ~/.config/psmdb-rbe/cluster.env
+```
+
+## 11. Known capacity / rate-limit observations
+
+Documented evidence supporting §9 split decision and adjacent backlog
+items. Update when new data points arrive.
+
+### 11.1 aarch64 stage start latency in PSMDB-2055 builds
+
+Long aarch64 stage warm-up times (5–20 min before the worker starts
+executing actions) traced to two compounding factors:
+- **Hetzner API rate-limit pressure** — aarch64 worker spawn requests
+  competed with polling traffic from other Jenkins instances in the
+  shared project; remaining quota dropped low enough that
+  `hcloud server create` calls were briefly stalled.
+- **Hetzner aarch64 capacity transient unavailability in `hel1`** —
+  several spawn attempts returned "no capacity" until Hetzner freed
+  the requested type, independent of our quota.
+
+Both worsen under shared rate-limit; expected to soften noticeably
+after §9 split (own quota) but not fully resolved
+(aarch64 capacity is upstream of any quota fix).
+
+### 11.2 Central host memory pressure
+
+Snapshots taken under load:
+- 15 GiB physical RAM, 93 % utilized at idle.
+- 16.1 GiB peak under PSMDB-2055 multi-stage parallel build (swap
+  involvement; envoy-proxy observed swapping briefly).
+- `storage-0` / `storage-1` (bb-storage shards) consume the largest
+  slice — both keep CAS index in mmap'd memory.
+
+Justification basis for a future host bump-up. Track separately —
+not blocking the project split.
+
+### 11.3 Envoy circuit-breaker headroom
+
+After §"PSMDB-2034 envoy: lift circuit breakers" patch (max_connections
+/ max_pending_requests / max_requests / max_retries → 100 000), all
+overflow counters stay at zero under 17 parallel Jenkins stages with
+`--jobs=72` each. Verified via `:9901/stats?filter=overflow`.
+
+Notable surprise during observation: `cluster.dex_jwks.upstream_cx_active`
+held at ~263 connections — far higher than expected from infrequent
+JWKS rotation. Worth a follow-up to confirm Envoy isn't leaking
+short-lived JWKS connections, but no functional impact.
+
+---
+
 When updating the live runbook, also update:
 - `IaC/buildbarn/ondemand/compose/.env.example` if a new variable was added
 - `IaC/buildbarn/buildbarn-auth-tls-plan.md` if the auth/TLS posture
