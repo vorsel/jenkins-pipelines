@@ -42,6 +42,31 @@ String runnerImage(String distroArch) {
 }
 
 def withRBE(Closure body) {
+    // PSMDB-2055: augment user-supplied PSMDB_RBE_BAZEL_FLAGS with CI metadata
+    // (bb-portal close-out item from buildbarn-portal-plan.md §"/builds page").
+    //
+    // bb-portal-backend creates a Build entity (visible at
+    // https://bb-psmdb.ddns.net:7986/builds) ONLY when a BES event in the
+    // invocation carries one of: BUILD_URL (Jenkins), CI_PIPELINE_URL
+    // (GitLab) or the GitHub Actions trio. Without this metadata the
+    // invocation still shows up in /invocations but is orphaned — no
+    // grouping by Jenkins job, no per-job historical view.
+    //
+    // We pass the data via Bazel `--build_metadata=KEY=VALUE` (rather than
+    // `--client_env=BUILD_URL` which would also leak BUILD_URL into every
+    // remote action's env, polluting cache keys). build_metadata flows into
+    // BES BuildMetadata events, which is exactly what bb-portal-backend
+    // greps for. ROLE=CI marks the invocation as automated so /invocations
+    // can filter human vs CI runs.
+    def baseFlags = (params.PSMDB_RBE_BAZEL_FLAGS ?: '').trim()
+    def ciMetadata = [
+        "--build_metadata=BUILD_URL=${env.BUILD_URL}",
+        "--build_metadata=BUILD_NUMBER=${env.BUILD_NUMBER}",
+        "--build_metadata=JOB_NAME=${env.JOB_NAME}",
+        "--build_metadata=ROLE=CI"
+    ].join(' ')
+    def augmentedFlags = "${baseFlags} ${ciMetadata}".trim()
+
     withCredentials([
         string(
             credentialsId: params.PSMDB_RBE_OIDC_CREDENTIALS_ID,
@@ -51,7 +76,7 @@ def withRBE(Closure body) {
         withEnv([
             "PSMDB_RBE_OIDC_ISSUER=${params.PSMDB_RBE_OIDC_ISSUER}",
             "PSMDB_RBE_OIDC_CONNECTOR_ID=${params.PSMDB_RBE_OIDC_CONNECTOR_ID}",
-            "PSMDB_RBE_BAZEL_FLAGS=${params.PSMDB_RBE_BAZEL_FLAGS}"
+            "PSMDB_RBE_BAZEL_FLAGS=${augmentedFlags}"
         ]) {
             body()
         }
