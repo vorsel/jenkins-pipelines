@@ -183,7 +183,7 @@ connectors:
 # `withCredentials([string(credentialsId: 'PSMDB-RBE-OIDC', ...)])` and
 # POST them to https://bb-psmdb.ddns.net:5556/token with
 # grant_type=urn:ietf:params:oauth:grant-type:token-exchange and
-# connector_id=jenkins-percona (this connector). Dex verifies the
+# connector_id=jenkins-psmdb-rbe (this connector). Dex verifies the
 # signature, lifts `sub` (the job URL) into the federated identity, and
 # mints a Dex-side id_token whose aud=bazel-jenkins (the staticClient
 # below). Bazel then uses ONLY the Dex-issued token in --remote_header,
@@ -191,7 +191,7 @@ connectors:
 # (see reapi-proxy/envoy.yaml dex_provider), so the trust universe stays
 # single-rooted.
 - type: oidc
-  id: jenkins-percona
+  id: jenkins-psmdb-rbe
   name: 'Jenkins Percona'
   config:
     # Must match `iss` in tokens emitted by the OIDC Provider plugin
