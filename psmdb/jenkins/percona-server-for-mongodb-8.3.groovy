@@ -162,10 +162,6 @@ pipeline {
             description: 'Repo component to push packages to',
             name: 'COMPONENT')
         choice(
-            name: 'BUILD_PACKAGES',
-            choices: ['true', 'false'],
-            description: 'Build packages and tarballs (default: true)')
-        choice(
             name: 'TESTS',
             choices: ['yes', 'no'],
             description: 'Run functional tests on packages and tarballs after building')
@@ -225,9 +221,6 @@ pipeline {
     }
     stages {
         stage('Create PSMDB source tarball') {
-            when {
-                expression { return params.BUILD_PACKAGES == 'true' }
-            }
             agent {
                 label params.CLOUD == 'AWS' ? 'docker' : 'docker-x64'
             }
@@ -268,9 +261,6 @@ pipeline {
             }
         }
         stage('Build PSMDB generic source packages') {
-            when {
-                expression { return params.BUILD_PACKAGES == 'true' }
-            }
             parallel {
                 stage('Build PSMDB generic source rpm') {
                     agent {
@@ -310,9 +300,6 @@ pipeline {
             }  //parallel
         } // stage
         stage('Build PSMDB RPMs/DEBs/Binary tarballs') {
-            when {
-                expression { return params.BUILD_PACKAGES == 'true' }
-            }
             parallel {
                 // PSMDB-2055: every stage below invokes bazel (rpmbuild's %build,
                 // debian/rules, or psmdb_builder.sh build_tarball) so all are
@@ -597,9 +584,6 @@ pipeline {
         }
 
         stage('Upload packages and tarballs from S3') {
-            when {
-                expression { return params.BUILD_PACKAGES == 'true' }
-            }
             agent {
                 label params.CLOUD == 'AWS' ? 'docker-64gb' : 'docker-x64'
             }
@@ -613,18 +597,12 @@ pipeline {
         }
 
         stage('Sign packages') {
-            when {
-                expression { return params.BUILD_PACKAGES == 'true' }
-            }
             steps {
                 signRPM()
                 signDEB()
             }
         }
         stage('Push to public repository') {
-            when {
-                expression { return params.BUILD_PACKAGES == 'true' }
-            }
             steps {
                 // sync packages
                 script {
@@ -633,9 +611,6 @@ pipeline {
             }
         }
         stage('Push Tarballs to TESTING download area') {
-            when {
-                expression { return params.BUILD_PACKAGES == 'true' }
-            }
             steps {
                 script {
                     try {
@@ -650,10 +625,7 @@ pipeline {
         }
         stage('Run testing job') {
             when {
-                allOf {
-                    expression { return params.BUILD_PACKAGES == 'true' }
-                    expression { return params.TESTS == 'yes' }
-                }
+                expression { return params.TESTS == 'yes' }
             }
             steps {
                 script {
