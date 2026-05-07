@@ -9,18 +9,23 @@
 //   reviewers can pull from without GitHub-Container-Registry credentials.
 //   We already have hub.docker.com Jenkins credentials in `hub.docker.com`
 //   (see psmdb/psmdb-docker.groovy / psmdb-docker-arm.groovy) and a
-//   `perconalab` namespace, so this pipeline pushes the same images to:
+//   `perconalab` namespace with a single `psmdb-rbe` repository, so this
+//   pipeline pushes all six distros into that one repo using a tag-based
+//   matrix:
 //
-//     docker.io/perconalab/psmdb-rbe-<distro>:<version>-<sha>          (immutable)
-//     docker.io/perconalab/psmdb-rbe-<distro>:<version>                (moving)
-//     docker.io/perconalab/psmdb-rbe-<distro>:<version>-<sha>-<arch>   (per-arch leaf)
+//     docker.io/perconalab/psmdb-rbe:<distro>-<version>-<sha>          (immutable)
+//     docker.io/perconalab/psmdb-rbe:<distro>-<version>                (moving)
+//     docker.io/perconalab/psmdb-rbe:<distro>-<version>-<sha>-<arch>   (per-arch leaf)
 //
-// `<arch>` ∈ {amd64, arm64}; the `<distro>` axis collapses into the repo
-// name (Docker Hub does not allow path-segmented repos like ghcr.io does).
+// `<arch>` ∈ {amd64, arm64}; both the `<distro>` and `<version>` axes
+// collapse into the tag (Docker Hub does not allow path-segmented repos
+// like ghcr.io does, AND auto-creating per-distro repos requires an
+// extra DH-API permission scope we don't have on the perconalab token).
 // `<version>-<sha>` is identical to the GHA tagging convention so that
 // `bazel/platforms/psmdb_rbe_containers.bzl` can flip `container-url`
-// from one registry to the other in a single ops bump without changing
-// the action-cache shape.
+// from one registry to the other in a single ops bump (the only
+// reshape is `host/<owner>/psmdb-buildbarn-runners/<distro>:<v>-<s>`
+// → `host/<owner>/psmdb-rbe:<distro>-<v>-<s>`).
 //
 // Topology — TWO PARALLEL ARCH LEGS, NOT 36 PARALLEL CELLS:
 //
@@ -158,8 +163,8 @@ def runArchLeg(String archShort, String archSuffix, String platform) {
 
         for (d in distros) {
             for (v in versions) {
-                def imageBase      = "${env.IMAGE_NAMESPACE}/${env.IMAGE_PREFIX}${d}"
-                def perArchTag     = "${v}-${shaMap[v]}-${archShort}"
+                def imageBase      = "${env.IMAGE_NAMESPACE}/${env.IMAGE_NAME}"
+                def perArchTag     = "${d}-${v}-${shaMap[v]}-${archShort}"
                 def fullPerArchRef = "${env.REGISTRY}/${imageBase}:${perArchTag}"
                 def branch         = branchMap[v]
                 def sha            = shaMap[v]
@@ -297,7 +302,7 @@ pipeline {
     environment {
         REGISTRY        = 'docker.io'
         IMAGE_NAMESPACE = 'perconalab'
-        IMAGE_PREFIX    = 'psmdb-rbe-'
+        IMAGE_NAME      = 'psmdb-rbe'
         DH_CRED_ID      = 'hub.docker.com'
     }
 
@@ -429,16 +434,17 @@ pipeline {
 
                         for (d in distros) {
                             for (v in versions) {
-                                def imageBase     = "${env.IMAGE_NAMESPACE}/${env.IMAGE_PREFIX}${d}"
+                                def imageBase     = "${env.IMAGE_NAMESPACE}/${env.IMAGE_NAME}"
                                 def sha           = shaMap[v]
-                                def immutableTag  = "${v}-${sha}"
+                                def immutableTag  = "${d}-${v}-${sha}"
+                                def movingTag     = "${d}-${v}"
                                 def fullImmutable = "${env.REGISTRY}/${imageBase}:${immutableTag}"
                                 def amd64Ref      = "${env.REGISTRY}/${imageBase}:${immutableTag}-amd64"
                                 def arm64Ref      = "${env.REGISTRY}/${imageBase}:${immutableTag}-arm64"
 
                                 def tagArgs = "-t '${fullImmutable}'"
                                 if (params.PUSH_MOVING) {
-                                    def fullMoving = "${env.REGISTRY}/${imageBase}:${v}"
+                                    def fullMoving = "${env.REGISTRY}/${imageBase}:${movingTag}"
                                     tagArgs += " -t '${fullMoving}'"
                                 }
 
@@ -456,7 +462,7 @@ pipeline {
 
                                 echo "Pushed ${fullImmutable} (archs: ${archs})"
                                 if (params.PUSH_MOVING) {
-                                    echo "Moving alias also pushed: ${env.REGISTRY}/${imageBase}:${v}"
+                                    echo "Moving alias also pushed: ${env.REGISTRY}/${imageBase}:${movingTag}"
                                 }
                             }
                         }
