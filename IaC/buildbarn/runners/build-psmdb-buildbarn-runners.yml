@@ -3,8 +3,11 @@
     project-type: pipeline
     description: |
         Builds PSMDB BuildBarn runner container images and pushes them to
-        docker.io/perconalab/psmdb-rbe-<distro>:<version>-<sha> (immutable)
-        and docker.io/perconalab/psmdb-rbe-<distro>:<version> (moving).
+        a single Docker Hub repository docker.io/perconalab/psmdb-rbe with
+        a tag-based (distro × version × arch) matrix:
+          :<distro>-<version>-<sha>           (immutable, multi-arch)
+          :<distro>-<version>                 (moving alias)
+          :<distro>-<version>-<sha>-<arch>    (per-arch leaf)
 
         Mirrors the GHA workflow .github/workflows/build-psmdb-buildbarn-runners.yml
         but targets Docker Hub so upstream PSMDB-2034 reviewers can pull the
@@ -22,7 +25,7 @@
     pipeline-scm:
       scm:
         - git:
-            url: https://github.com/Percona-Lab/jenkins-pipelines.git
+            url: https://github.com/vorsel/jenkins-pipelines.git
             branches:
             - 'hetzner'
             wipe-workspace: false
