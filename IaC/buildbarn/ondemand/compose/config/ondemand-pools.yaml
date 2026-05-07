@@ -103,23 +103,24 @@ global:
 
   # Hetzner project-wide defaults that every pool inherits.
   #
-  # `hcloud_ssh_key_ids` — numeric ids of named SSH keys uploaded to
-  # Hetzner. Every id listed here gets its pubkey injected into the
-  # new worker's /root/.ssh/authorized_keys at VM-create time (Hetzner
-  # has no API to add SSH keys AFTER creation, so the list is fixed
-  # per-VM-lifecycle).
+  # `hcloud_ssh_key_ids` and `hcloud_network_id` are project-scoped
+  # numeric IDs that are *only* meaningful inside the Hetzner project
+  # the central is deployed into. Hardcoding them here used to seem
+  # convenient (one less env var) but bit us during the PSMDB-2034
+  # cross-project migration: stale IDs from the OLD project leaked
+  # through to the new project's bake, and the scaler logged
+  # "SSH key not found (not_found, …)" for every spawn until the
+  # operator manually fixed the on-disk YAML on the central host.
   #
-  # An additional id is auto-appended at bake time by
-  # scripts/create-central.sh:sync_configs → python yaml round-trip:
-  # the numeric id of the Hetzner named key `bb-psmdb-ondemand-central`,
-  # which carries the central's own /root/.ssh/id_ed25519.pub. This is
-  # what lets the central ssh into workers over the private network
-  # (required once we drop public IPs from workers).
-  hcloud_ssh_key_ids:
-    - 24333399         # htz.cd.key — operator's daily-driver key
-    - 111196538        # htz.cd.bb-psmdb-ondemand — per-fleet key
-    # bb-psmdb-ondemand-central id is APPENDED here at bake time.
-  hcloud_network_id: 11374636            # psmdb.cd.percona.com private net (also recorded in INFRASTRUCTURE.md)
+  # Both fields are now HARD-OVERWRITTEN at bake time by
+  # scripts/create-central.sh:sync_configs from the operator's
+  # cluster.env ($SSH_KEY_IDS and $NETWORK_ID), plus the central's
+  # own key id resolved by ensure_central_ssh_key(). The values
+  # below are placeholders kept only so `python3 -c yaml.safe_load`
+  # doesn't choke on a missing key during local sanity checks. They
+  # are NOT used by anything at runtime.
+  hcloud_ssh_key_ids: []                 # OVERWRITTEN by create-central.sh from $SSH_KEY_IDS + central key
+  hcloud_network_id: null                # OVERWRITTEN by create-central.sh from $NETWORK_ID
   hcloud_os_image: debian-13             # host OS for workers; decoupled from runner distro
 
   # Region try-chain. hel1 first because the central lives there → lowest

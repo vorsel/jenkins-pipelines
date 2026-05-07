@@ -10,7 +10,17 @@
 #      both SSH keys installed, attached to the project's private network
 #      (NETWORK_ID — live value in `INFRASTRUCTURE.md`), on Debian 13.
 #   3. Attach the 750 GB xfs volume (ID 105484418) if not already attached.
+#   3.5 (optional) Reassign Floating IP $FLOATING_IP_ID to the new server
+#       at the API level. This is the cross-project / cross-VM cutover step
+#       — when the FIP is assigned to a different (e.g. old) server, that
+#       server stops receiving traffic on the FIP from this point onward.
 #   4. Install Docker on the host (via get.docker.com) and rsync, if missing.
+#   4.5 (optional) Add the Floating IP as an alias on eth0 (`ip addr add`)
+#       and persist it via /etc/network/interfaces.d/60-floating-ip.
+#       Required because Hetzner FIPs are NOT L2-routed to the VM — the
+#       kernel only accepts incoming traffic for IPs configured locally.
+#       PUBLIC_IP is flipped from the VM's primary public address to the
+#       FIP after this step succeeds.
 #   5. Mount the volume at /var/lib/buildbarn and add an fstab entry.
 #   6. Detect volume state:
 #        * empty/fresh     → bootstrap from scratch
@@ -30,6 +40,10 @@
 #
 # Set MODE=attach|wipe-attach|abort to skip the interactive prompt. Useful for
 # CI / scripted recoveries.
+#
+# Cross-project warm-CAS migration: export PRESERVE_ENV_FROM=<path-to-old-.env>
+# to carry forward BB_PORTAL_DB_PASSWORD and the OIDC/cookie secrets onto a
+# fresh central — see the variable's doc-block below for full rationale.
 
 set -euo pipefail
 
@@ -68,6 +82,60 @@ set -euo pipefail
 # and stored under /var/lib/buildbarn/certs/. See buildbarn-auth-tls-plan.md
 # §4 for the full TLS layout.
 : "${PUBLIC_HOSTNAME:=}"
+
+# Optional .env backup path. When set, sync_configs() rsyncs this file
+# onto the central host as $REMOTE_COMPOSE/.env BEFORE bake_env runs,
+# so bake_env's _env_get pulls forward every preserved secret instead
+# of regenerating it (BB_PORTAL_DB_PASSWORD, BB_*_OIDC_SECRET,
+# BB_*_COOKIE_SEED, GITHUB_OAUTH_*, ...).
+#
+# Mandatory in cross-project warm-CAS migrations: the portal-db
+# Postgres PGDATA travels with the volume, but Postgres' initdb only
+# stamps POSTGRES_PASSWORD on a fresh PGDATA — a regenerated password
+# would lock bb-portal-backend out of the preserved database. Same
+# argument (less catastrophic, but still annoying) for the OIDC/cookie
+# secrets: regen would log every operator out of the BB UIs at cutover.
+#
+# Source the file from the OLD central before tearing it down:
+#
+#   ssh root@<old-central> 'cat /var/lib/buildbarn/compose/.env' \
+#     > "$HOME/.config/psmdb-rbe/old-central.env"
+#   chmod 600 "$HOME/.config/psmdb-rbe/old-central.env"
+#   export PRESERVE_ENV_FROM="$HOME/.config/psmdb-rbe/old-central.env"
+#
+# Empty (default) = behave as before: bake_env regenerates everything
+# that wasn't already on the new VM's $REMOTE_COMPOSE/.env.
+: "${PRESERVE_ENV_FROM:=}"
+
+# Optional Hetzner Floating IP id. When set, the script will:
+#
+#   1. (re)assign this FIP to $SERVER_NAME via the Hetzner API
+#      (ensure_floating_ip — runs after attach_volume);
+#   2. configure the FIP as an alias on the VM's eth0 and persist it
+#      via /etc/network/interfaces.d/60-floating-ip
+#      (configure_floating_ip_on_host — runs after bootstrap_host);
+#   3. flip $PUBLIC_IP from the VM's primary public address to the
+#      FIP, so every later rssh / rrsync / smoke call uses the
+#      stable address.
+#
+# Step 2 exists because Hetzner FIPs are NOT L2-routed to the assigned
+# VM's NIC — the guest kernel only accepts incoming traffic for IPs
+# locally configured on an interface. (Earlier versions of this
+# script's docs claimed otherwise; that was wrong.)
+#
+# Idempotent at the API level — three observed states:
+#   * already on $SERVER_NAME            → no-op
+#   * unassigned                         → assign
+#   * assigned to a DIFFERENT server     → unassign + reassign
+#                                          (cross-project cutover step:
+#                                          old server goes dark on this
+#                                          IP, new server takes over)
+#
+# Empty (default) = leave FIP handling to the operator (manual
+# `hcloud floating-ip assign` plus manual `ip addr add` and an
+# /etc/network drop-in). Useful when the FIP is shared with another
+# stack on the same project, or there's no FIP at all.
+: "${FLOATING_IP_ID:=}"
 
 # -----------------------------------------------------------------------------
 # Repo paths (resolved relative to this script so the tool can be invoked from
@@ -269,6 +337,45 @@ preflight() {
   ok "GitHub OAuth client ID captured (${#GITHUB_OAUTH_CLIENT_ID} chars)"
   ok "GitHub OAuth client secret captured (${#GITHUB_OAUTH_CLIENT_SECRET} chars)"
 
+  # Optional .env backup file used to preserve secrets across a fresh-VM
+  # deployment (cross-project warm-CAS migration is the canonical use
+  # case; see PRESERVE_ENV_FROM doc near the top of this file).
+  if [[ -n "$PRESERVE_ENV_FROM" ]]; then
+    [[ -r "$PRESERVE_ENV_FROM" ]] \
+      || die "PRESERVE_ENV_FROM not readable: $PRESERVE_ENV_FROM"
+    # 0600 is what bake_env writes itself; reject anything looser to
+    # match the same posture before secrets touch the wire.
+    local mode
+    mode=$(stat -f '%Lp' "$PRESERVE_ENV_FROM" 2>/dev/null \
+        || stat -c '%a'   "$PRESERVE_ENV_FROM")
+    [[ "$mode" == "600" ]] \
+      || die "PRESERVE_ENV_FROM mode must be 600 (got $mode): chmod 600 $PRESERVE_ENV_FROM"
+    # Loose KEY=VALUE shape check — reject obviously corrupt files
+    # (e.g. accidentally pointed at $HOME/.bashrc) before we'd ship
+    # them onto the central. Empty file is a foot-gun: every secret
+    # would still regenerate, defeating the point of pointing at the
+    # variable at all.
+    [[ -s "$PRESERVE_ENV_FROM" ]] \
+      || die "PRESERVE_ENV_FROM is empty: $PRESERVE_ENV_FROM"
+    if ! grep -qE '^[A-Z_][A-Z0-9_]*=' "$PRESERVE_ENV_FROM"; then
+      die "PRESERVE_ENV_FROM doesn't look like a .env file (no KEY=VALUE lines): $PRESERVE_ENV_FROM"
+    fi
+    # Sanity-warn if BB_PORTAL_DB_PASSWORD is missing — that's the one
+    # secret whose regeneration silently breaks bb-portal-db on a warm
+    # CAS migration (Postgres PGDATA on the volume keeps the OLD
+    # password, bake_env would mint a NEW one). Don't fail hard:
+    # operators recovering from a partial backup may legitimately
+    # have a trimmed file.
+    if ! grep -qE '^BB_PORTAL_DB_PASSWORD=' "$PRESERVE_ENV_FROM"; then
+      warn "PRESERVE_ENV_FROM has no BB_PORTAL_DB_PASSWORD line —"
+      warn "bb-portal-db will refuse the freshly-generated password if PGDATA"
+      warn "was preserved on the volume. Add the line or expect a portal outage."
+    fi
+    ok "PRESERVE_ENV_FROM=$PRESERVE_ENV_FROM (mode=$mode, $(wc -l < "$PRESERVE_ENV_FROM") lines)"
+  else
+    ok "PRESERVE_ENV_FROM not set — bake_env will (re)generate any missing secrets"
+  fi
+
   # The Dex compose file references the ./dex/ subdir — fail early if a
   # half-checked-out repo skipped it.
   [[ -f "$COMPOSE_SRC/dex/dex.yaml" ]] \
@@ -334,6 +441,101 @@ preflight() {
     || die "Hetzner network $NETWORK_ID not found"
   ok "Hetzner private network $NETWORK_ID present"
 
+  # The Network alone is not enough — scaler.create_server attaches
+  # workers to it and needs the network to have at least one Subnet
+  # to draw a private IP from. Two failure modes here, both observed:
+  #
+  #   1. Zero subnets → every spawn fails `no_subnet_available`.
+  #      Caught us during the PSMDB-2034 cross-project migration:
+  #      runbook Phase 1 listed `network create` but not the
+  #      `network add-subnet` follow-up. Hetzner UI also shows the
+  #      network as "ready" without a subnet, hiding the gap.
+  #
+  #   2. Subnets exist but their combined useable IP space is
+  #      smaller than max_total_nodes from ondemand-pools.yaml.
+  #      Hetzner UI defaults to /28 (16 raw IPs, ~11 useable after
+  #      network/gateway/broadcast/internal reservations) which
+  #      runs out around 10 workers — invisible until matrix burst,
+  #      where it surfaces as a slow trickle of `no_subnet_available`
+  #      mid-build. Heuristic: budget ≥1.5x max_total_nodes to leave
+  #      headroom for the central + slow-decommission overlap +
+  #      Hetzner's per-subnet reservations.
+  #
+  # Both fail loudly here instead.
+  local pools_yaml="$COMPOSE_SRC/config/ondemand-pools.yaml"
+  python3 - "$NETWORK_ID" "$pools_yaml" <<'PY'
+import json, os, subprocess, sys, yaml
+
+network_id, pools_path = sys.argv[1:3]
+
+# Subnet inventory via hcloud (already verified above).
+net = json.loads(subprocess.check_output(
+    ["hcloud", "network", "describe", network_id, "-o", "json"]))
+subnets = net.get("subnets") or []
+if not subnets:
+    print(f"  ✗ Hetzner network {network_id} has 0 subnets — "
+          f"workers cannot get private IPs.", file=sys.stderr)
+    print(f"  Fix: hcloud network add-subnet {network_id} --type cloud "
+          f"--network-zone eu-central --ip-range {net['ip_range']}",
+          file=sys.stderr)
+    sys.exit(1)
+
+# Useable IP estimate per subnet. Hetzner reserves 4 IPs per subnet
+# (network, gateway, two more for internal services), so useable =
+# 2**(32-prefix) - 4 with a floor of 0.
+def useable(ip_range):
+    prefix = int(ip_range.split("/")[1])
+    return max(0, (1 << (32 - prefix)) - 4)
+
+total = sum(useable(s["ip_range"]) for s in subnets)
+breakdown = ", ".join(f"{s['ip_range']}({useable(s['ip_range'])})" for s in subnets)
+
+# Capacity budget = global.max_total_nodes from ondemand-pools.yaml
+# (the hard cap the scaler enforces; see scaler.py: cfg.global_.max_total_nodes).
+with open(pools_path) as fh:
+    pools = yaml.safe_load(fh) or {}
+max_total = int((pools.get("global") or {}).get("max_total_nodes", 0))
+
+# 1.5x headroom for central + decommission overlap + Hetzner's
+# per-subnet reservation slack we don't model precisely.
+budget = max(1, int(max_total * 1.5)) if max_total else 0
+
+print(f"  network ip_range={net['ip_range']}, subnets={len(subnets)} "
+      f"[{breakdown}], useable={total}, max_total_nodes={max_total}, "
+      f"budget={budget}")
+
+if budget and total < budget:
+    print(f"  ✗ subnet capacity {total} < budgeted {budget} "
+          f"(=1.5*max_total_nodes). Workers will hit "
+          f"`no_subnet_available` during matrix bursts.",
+          file=sys.stderr)
+    print(f"  Fix: add a non-overlapping second subnet, e.g. for a "
+          f"/24 network (256 IPs total) and an existing /28:",
+          file=sys.stderr)
+    print(f"    hcloud network add-subnet {network_id} --type cloud "
+          f"--network-zone eu-central --ip-range "
+          f"{net['ip_range'].split('/')[0].rsplit('.', 1)[0]}.128/25",
+          file=sys.stderr)
+    sys.exit(1)
+PY
+  ok "Hetzner network capacity OK for current pools.yaml budget"
+
+  # Optional Floating IP — caller opted in to auto-assign by setting
+  # $FLOATING_IP_ID. Confirm the resource exists in this project before
+  # going any further; cheap, and saves a confusing failure deep into
+  # the run when ensure_floating_ip can't describe it.
+  if [[ -n "$FLOATING_IP_ID" ]]; then
+    local fip_json fip_address
+    fip_json=$(hcloud floating-ip describe "$FLOATING_IP_ID" -o json 2>/dev/null) \
+      || die "Floating IP $FLOATING_IP_ID not found in project — clear FLOATING_IP_ID or fix the id"
+    fip_address=$(jq -r '.ip' <<<"$fip_json")
+    [[ -n "$fip_address" && "$fip_address" != "null" ]] \
+      || die "Floating IP $FLOATING_IP_ID has no usable address"
+    ok "Floating IP ${FLOATING_IP_ID} (${fip_address}) present"
+  else
+    ok "FLOATING_IP_ID not set — skipping FIP auto-assign"
+  fi
+
   # Volume must exist and be xfs-formatted. hcloud doesn't tell us the fs
   # directly in `describe`, but it does tell us the format if we created it
   # with --format xfs. If someone created it manually without --format, we'll
@@ -365,6 +567,16 @@ preflight() {
 # -----------------------------------------------------------------------------
 PUBLIC_IP=""
 PRIVATE_IP=""
+# Set by configure_floating_ip_on_host once $PUBLIC_IP is flipped to the FIP —
+# kept around so summary() can still print the VM's primary address as a
+# fallback SSH endpoint (useful if FIP alias breaks and the operator needs to
+# log in directly to debug).
+PUBLIC_IP_PRIMARY=""
+
+# Stashed by ensure_floating_ip and consumed by configure_floating_ip_on_host.
+# Holds the FIP literal (e.g. "95.217.242.120") so we don't have to re-query
+# the Hetzner API just to read what we already saw at API-assign time.
+FLOATING_IP_ADDRESS=""
 
 ensure_server() {
   step "Server"
@@ -416,6 +628,71 @@ attach_volume() {
   log "attaching volume $VOLUME_ID to $SERVER_NAME (automount disabled — we'll handle fstab ourselves) …"
   hcloud volume attach --server "$SERVER_NAME" --automount=false "$VOLUME_ID"
   ok "volume attached"
+}
+
+# -----------------------------------------------------------------------------
+# Floating IP — assign $FLOATING_IP_ID to $SERVER_NAME via the Hetzner API.
+#
+# Three observed states map to three behaviours (see top-of-file
+# FLOATING_IP_ID doc-block for context):
+#
+#   already on $SERVER_NAME       → no-op
+#   unassigned                    → assign
+#   assigned to a DIFFERENT server → unassign + reassign (cutover)
+#
+# IMPORTANT: assigning the FIP at the API level alone is NOT enough to
+# make incoming traffic to the FIP reach the VM. Contrary to common
+# misconception, Hetzner FIPs are NOT routed at L2 to the assigned
+# server's NIC — the kernel rejects packets addressed to an IP that
+# isn't configured on any local interface ("Destination Host
+# Unreachable"). The matching guest-OS configuration step
+# (`ip addr add <FIP>/32 dev eth0` + a persistent ifupdown alias) is
+# done in configure_floating_ip_on_host() AFTER bootstrap_host has run.
+#
+# Hence this function intentionally does NOT touch $PUBLIC_IP. SSH /
+# rsync continue to operate against the VM's primary public IP until
+# the alias is in place; only then does configure_floating_ip_on_host
+# flip $PUBLIC_IP to the FIP.
+# -----------------------------------------------------------------------------
+ensure_floating_ip() {
+  if [[ -z "$FLOATING_IP_ID" ]]; then
+    return 0
+  fi
+  step "Floating IP"
+
+  local fip_json fip_address fip_server_id our_server_id their_name
+  fip_json=$(hcloud floating-ip describe "$FLOATING_IP_ID" -o json) \
+    || die "could not describe Floating IP $FLOATING_IP_ID"
+  fip_address=$(jq -r '.ip' <<<"$fip_json")
+  fip_server_id=$(jq -r '.server // empty' <<<"$fip_json")
+  our_server_id=$(hcloud server describe "$SERVER_NAME" -o json | jq -r '.id')
+
+  if [[ -z "$fip_server_id" || "$fip_server_id" == "null" ]]; then
+    log "Floating IP $fip_address (id $FLOATING_IP_ID) currently unassigned — attaching to $SERVER_NAME"
+    hcloud floating-ip assign "$FLOATING_IP_ID" "$SERVER_NAME"
+  elif [[ "$fip_server_id" == "$our_server_id" ]]; then
+    ok "Floating IP $fip_address already on $SERVER_NAME"
+  else
+    # Cross-project / cross-VM cutover step. Unassigning is a one-call
+    # API mutation; the previous owner stops receiving traffic on this
+    # IP immediately. We log loudly because this is the irreversible
+    # bit of the migration — old central is dark on $fip_address from
+    # this point until somebody manually reassigns.
+    their_name=$(hcloud server describe "$fip_server_id" -o json 2>/dev/null \
+                 | jq -r '.name // "(unknown)"')
+    warn "Floating IP $fip_address currently assigned to $their_name (id $fip_server_id) —"
+    warn "this is the cutover step: unassigning, then reassigning to $SERVER_NAME."
+    warn "$their_name will be unreachable on $fip_address from this point."
+    hcloud floating-ip unassign "$FLOATING_IP_ID"
+    hcloud floating-ip assign   "$FLOATING_IP_ID" "$SERVER_NAME"
+  fi
+
+  ok "Floating IP $fip_address → $SERVER_NAME (API-level)"
+  ok "OS-level alias will be configured by configure_floating_ip_on_host after bootstrap_host"
+
+  # Stash the FIP address for the OS-config step. We deliberately do
+  # NOT touch $PUBLIC_IP here — see the function-header comment.
+  FLOATING_IP_ADDRESS="$fip_address"
 }
 
 # -----------------------------------------------------------------------------
@@ -476,16 +753,214 @@ if ! docker compose version >/dev/null 2>&1; then
   apt-get install -y docker-compose-plugin
 fi
 
-# rsync is required so we can push configs from the operator's laptop;
-# xfsprogs so wipe-attach can mkfs.xfs the volume; jq for operator
-# convenience; python3-yaml for bake_env()'s predeclared.libsonnet
-# generator (parses ondemand-pools.yaml → emits jsonnet-compatible JSON).
+# Distro packages.
+#
+# Build-time / scripted dependencies:
+#   * rsync       — push configs from the operator's laptop.
+#   * xfsprogs    — wipe-attach paths through mkfs.xfs the data volume.
+#   * jq          — operator convenience + a few inline pipelines below.
+#   * python3-yaml — bake_env()'s predeclared.libsonnet generator
+#                    (parses ondemand-pools.yaml → jsonnet-compatible
+#                    JSON) and the in-place pools.yaml rewriter.
+#
+# Operational diagnostics (cheap to install, expensive to be without
+# at 02:00 when something's on fire):
+#   * dnsutils    — dig/nslookup for DNS troubleshooting (bb-psmdb.ddns.net,
+#                   Hetzner endpoint resolution).
+#   * iotop, htop — process-level CPU + IO inspection.
+#   * tcpdump     — TCP/TLS handshake captures (debugged the PSMDB-2034
+#                   SslHandshakeTimeout wave with this).
+#   * lsof        — "what's holding this fd / port / mountpoint" — the
+#                   reason `umount /var/lib/buildbarn` failed during
+#                   the PSMDB-2034 drain on the OLD central.
+#   * vim, less   — interactive editing/paging on the central; vim-tiny
+#                   ships by default but the full vim is friendlier.
+#   * mtr-tiny    — single-pane ICMP/UDP path quality (workers ↔ central
+#                   intra-AZ latency spot-checks).
 apt-get update
-apt-get install -y rsync jq xfsprogs python3-yaml
+apt-get install -y \
+    rsync jq xfsprogs python3-yaml \
+    dnsutils iotop htop tcpdump lsof vim less mtr-tiny
 
 systemctl enable --now docker
+
+# CLI tools NOT in Debian repos. Both are static Go binaries shipped as
+# tarballs from upstream GitHub releases; we drop them in /usr/local/bin
+# (not managed by apt — fine, they self-update via re-running this
+# script after `rm /usr/local/bin/<tool>`).
+#
+#   * hcloud      — Hetzner Cloud CLI. Useful at the host level for
+#                   ad-hoc resolution of SSH key / network / server
+#                   IDs without spelunking the REST API by hand. The
+#                   PSMDB-2034 hotfix script had to fall back to
+#                   `curl + python3 -c json` because hcloud was missing
+#                   here — install it once and that goes away. The
+#                   asset name (`hcloud-linux-<arch>.tar.gz`) does NOT
+#                   include the version, so the GitHub `latest/download`
+#                   redirect is sufficient — no version pin needed.
+#   * grpcurl     — gRPC equivalent of curl. Indispensable for poking
+#                   bb-scheduler / bb-storage / Envoy without a Bazel
+#                   client (e.g. `grpcurl -insecure $HOST:7982
+#                   list buildbarn.buildqueuestate.BuildQueueState`).
+#                   Asset name embeds the version, so we pin and bump
+#                   manually — bump = single line below + redeploy.
+ARCH=$(dpkg --print-architecture)   # amd64 | arm64
+
+if ! command -v hcloud >/dev/null 2>&1; then
+  echo "  installing hcloud CLI ($ARCH) …"
+  curl -fsSL "https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-${ARCH}.tar.gz" \
+    | tar -xzf - -C /usr/local/bin hcloud
+  chmod 0755 /usr/local/bin/hcloud
+  echo "  ✓ hcloud installed: $(hcloud version 2>&1 | head -n1)"
+else
+  echo "  ✓ hcloud already present: $(hcloud version 2>&1 | head -n1)"
+fi
+
+GRPCURL_VERSION=1.9.3
+if ! command -v grpcurl >/dev/null 2>&1; then
+  echo "  installing grpcurl v$GRPCURL_VERSION ($ARCH) …"
+  curl -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${ARCH}.tar.gz" \
+    | tar -xzf - -C /usr/local/bin grpcurl
+  chmod 0755 /usr/local/bin/grpcurl
+  echo "  ✓ grpcurl installed: $(grpcurl --version 2>&1)"
+else
+  echo "  ✓ grpcurl already present: $(grpcurl --version 2>&1)"
+fi
+
+# PSMDB-2034: kernel-level burst tolerance for TLS handshakes.
+#
+# Envoy's grpc_listener / bes_grpc_listener both set tcp_backlog_size:
+# 4096 (envoy.yaml), but the kernel caps any listen(2) backlog at the
+# minimum of (tcp_backlog_size, net.core.somaxconn) — defaults differ
+# by Debian release; on Debian 13 net.core.somaxconn ships as 4096
+# but historically can drop back to 128 on certain images. We pin
+# both somaxconn and the SYN backlog explicitly so the listener
+# config takes the shape it asks for under matrix burst load.
+#
+# Drop-in is a single file (NOT edits to /etc/sysctl.conf, which can
+# vary across cloud-init renderings); idempotent on re-runs.
+SYSCTL=/etc/sysctl.d/99-bb-psmdb-tcp-burst.conf
+if [[ ! -f "$SYSCTL" ]]; then
+  cat > "$SYSCTL" <<EOF
+# Managed by create-central.sh::bootstrap_host. Sized for matrix-load
+# Bazel bursts (~11 stages × ~72 jobs × 3 channels = ~2300 simultaneous
+# TCP SYNs into Envoy on :8981 / :1985).
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+# Reduce TIME_WAIT churn — gRPC clients open and close streams faster
+# than tcp_fin_timeout's default 60s reclaims them, so without these
+# tuned values the source-port pool can drain on the central side
+# during long matrix runs.
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 30
+EOF
+  sysctl --system >/dev/null
+  echo "  ✓ wrote $SYSCTL and reloaded sysctl"
+else
+  # Already present from a previous run — re-apply in case sysctl was
+  # reverted by a kernel upgrade or manual `sysctl -w` session.
+  sysctl --system >/dev/null
+  echo "  ✓ $SYSCTL already present (re-applied)"
+fi
 REMOTE
   ok "host packaged prepared"
+}
+
+# -----------------------------------------------------------------------------
+# Configure the Floating IP as an alias on the host's primary NIC.
+#
+# Runs AFTER bootstrap_host (so SSH is up via primary IP, ifupdown is
+# present, and we can persist the alias). Idempotent:
+#
+#   * `ip addr add <FIP>/32 dev eth0` returns 2 if the alias already
+#     exists — caught with `|| true` and logged at debug level.
+#   * `/etc/network/interfaces.d/60-floating-ip` is rewritten every
+#     run; contents are deterministic so re-runs are no-ops as far as
+#     ifupdown is concerned.
+#
+# Only after the alias is in place do we flip $PUBLIC_IP to the FIP
+# and re-prime known_hosts so subsequent rssh / rrsync / smoke calls
+# go through the stable address.
+#
+# Skipped entirely when $FLOATING_IP_ID is empty (no opt-in).
+# -----------------------------------------------------------------------------
+configure_floating_ip_on_host() {
+  if [[ -z "$FLOATING_IP_ID" ]]; then
+    return 0
+  fi
+  [[ -n "$FLOATING_IP_ADDRESS" ]] \
+    || die "configure_floating_ip_on_host: FLOATING_IP_ADDRESS is empty (ensure_floating_ip didn't run?)"
+  step "Floating IP — host alias"
+
+  # Add the alias inside a here-doc so a single rssh round-trip handles
+  # both the immediate `ip addr add` and the persistent /etc/network
+  # drop-in. Using ifupdown's interfaces.d/ over systemd-networkd /
+  # netplan because Hetzner's Debian 13 cloud image ships with ifupdown
+  # configuring eth0 — anything else would be a parallel network
+  # management plane fighting over the same interface.
+  rssh "FLOATING_IP_ADDRESS='$FLOATING_IP_ADDRESS' bash -se" <<'REMOTE'
+set -euo pipefail
+
+# Immediate (RAM-only) — `ip addr add` returns 2 when the address is
+# already there; treat that as success.
+if ! ip addr show eth0 | grep -q "inet $FLOATING_IP_ADDRESS"; then
+  ip addr add "${FLOATING_IP_ADDRESS}/32" dev eth0
+  echo "  ✓ ip addr add ${FLOATING_IP_ADDRESS}/32 dev eth0"
+else
+  echo "  ✓ alias ${FLOATING_IP_ADDRESS}/32 already on eth0"
+fi
+
+# Persistent — drop a small ifupdown stanza so the alias re-attaches on
+# reboot. Mode 0644 (no secrets here, just an IP literal). The double
+# colon in the iface name (`eth0:fip0`) is the legacy ifupdown alias
+# syntax — also recognised by the `ifquery` smoke check below.
+mkdir -p /etc/network/interfaces.d
+cat > /etc/network/interfaces.d/60-floating-ip <<EOF
+# Hetzner Floating IP $FLOATING_IP_ADDRESS — managed by create-central.sh.
+# Required because Hetzner FIPs are not L2-routed to the assigned VM's
+# NIC; the kernel only accepts incoming traffic for IPs configured
+# locally. See INFRASTRUCTURE.md §9 for the full rationale.
+auto eth0:fip0
+iface eth0:fip0 inet static
+    address $FLOATING_IP_ADDRESS
+    netmask 255.255.255.255
+EOF
+chmod 644 /etc/network/interfaces.d/60-floating-ip
+echo "  ✓ persisted /etc/network/interfaces.d/60-floating-ip"
+
+# Sanity: confirm ifupdown can parse the file and the alias is up.
+# `ifquery` prints the parsed config; failure here is a typo /
+# unmatched physical iface and we'd rather find that now than at
+# the next reboot.
+if command -v ifquery >/dev/null 2>&1; then
+  ifquery eth0:fip0 >/dev/null \
+    && echo "  ✓ ifquery eth0:fip0 OK"
+fi
+REMOTE
+  ok "Floating IP $FLOATING_IP_ADDRESS aliased on eth0 (immediate + persistent)"
+
+  # Now flip PUBLIC_IP to the FIP. Save the primary first for the
+  # summary banner. From this point on every rssh / rrsync / smoke
+  # call goes via the FIP — so we also re-prime known_hosts so the
+  # first SSH on the new endpoint doesn't hang on host-key prompt.
+  PUBLIC_IP_PRIMARY="$PUBLIC_IP"
+  PUBLIC_IP="$FLOATING_IP_ADDRESS"
+  ok "PUBLIC_IP overridden: $PUBLIC_IP_PRIMARY → $PUBLIC_IP (FIP)"
+
+  # Prime known_hosts for the FIP. We accept-new the host key the
+  # same way wait_for_ssh does for the primary; same VM, same key,
+  # so this just registers a second hostname for it. ssh-keygen -R
+  # first to guarantee no stale FIP entry from a previous failed run
+  # (e.g. an aborted run where someone Ctrl-C'd).
+  ssh-keygen -R "$PUBLIC_IP" -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
+  ssh -i "$SSH_PRIV_KEY" \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+      -o BatchMode=yes \
+      -o ConnectTimeout=5 \
+      "root@$PUBLIC_IP" true \
+    || die "FIP $PUBLIC_IP not reachable over SSH after alias config — check 'ip addr show eth0' on the VM and /etc/network/interfaces.d/60-floating-ip"
+  ok "FIP-side SSH primed (known_hosts updated)"
 }
 
 # -----------------------------------------------------------------------------
@@ -843,6 +1318,37 @@ REMOTE
 
   ok "configs synced"
 
+  # 3.5) Optional: pre-seed remote .env from a local backup so bake_env's
+  #      _env_get pulls forward existing secrets instead of regenerating
+  #      them. Mandatory in cross-project warm-CAS migrations (the
+  #      portal-db Postgres PGDATA travels with the volume but Postgres
+  #      doesn't re-stamp POSTGRES_PASSWORD on existing PGDATA — see
+  #      PRESERVE_ENV_FROM doc near the top of this file).
+  #
+  #      Runs AFTER the rsync above (step 3 ships compose/ with
+  #      --exclude=.env, so .env on the central is whatever was there
+  #      before — empty on a fresh VM, populated on a re-run) and
+  #      BEFORE the bake_env heredoc (step 4) which reads .env via
+  #      _env_get. End result: bake_env sees our seed file and
+  #      preserves every key it carries.
+  if [[ -n "$PRESERVE_ENV_FROM" ]]; then
+    log "pre-seed remote .env from $PRESERVE_ENV_FROM"
+    # rrsync = rsync -a --delete; -a includes -p (preserve perms). Local
+    # file is already 0600 (preflight verifies) so the remote inherits the
+    # same mode without any --chmod flag — handy because Apple's stock
+    # macOS rsync (2.6.9) doesn't recognise the `--chmod=F<octal>` short
+    # form at all and would die with "invalid argument" here.
+    #
+    # Belt-and-braces chmod via ssh right after, so a future change to
+    # the local file's perms (or a copy through a renderer that drops
+    # them) doesn't leak HCLOUD_TOKEN/OAuth secrets to a 0644 file.
+    rrsync \
+      "$PRESERVE_ENV_FROM" \
+      "root@$PUBLIC_IP:$REMOTE_COMPOSE/.env"
+    rssh "chmod 600 '$REMOTE_COMPOSE/.env'"
+    ok "remote .env seeded (mode 0600) — bake_env will preserve secrets via _env_get"
+  fi
+
   # 4) Write .env with current IPs + HCLOUD_TOKEN; sed the browserUrl
   #    placeholder in common.libsonnet; patch ondemand-pools.yaml with the
   #    central's own IPs (the YAML ships with `null` placeholders so a raw
@@ -857,6 +1363,8 @@ REMOTE
     "PUBLIC_HOSTNAME='$PUBLIC_HOSTNAME'" \
     "HCLOUD_TOKEN='$HCLOUD_TOKEN'" \
     "CENTRAL_SSH_KEY_ID='$CENTRAL_SSH_KEY_ID'" \
+    "SSH_KEY_IDS='$SSH_KEY_IDS'" \
+    "NETWORK_ID='$NETWORK_ID'" \
     "GITHUB_OAUTH_CLIENT_ID='$GITHUB_OAUTH_CLIENT_ID'" \
     "GITHUB_OAUTH_CLIENT_SECRET='$GITHUB_OAUTH_CLIENT_SECRET'" \
     "bash -se" <<'REMOTE'
@@ -1048,12 +1556,18 @@ fi
 #   * scheduler_public_url / scheduler_private_ip — repo copy ships with
 #     `null` placeholders so a clean `git checkout` doesn't carry stale
 #     IPs; fill them with the current central's public+private now.
-#   * hcloud_ssh_key_ids — append the central's own SSH key id (resolved
-#     by ensure_central_ssh_key() earlier). Idempotent: if the id is
-#     already in the list (e.g. on a redeploy where it was injected by
-#     the previous run and then rsync'd back from repo — shouldn't
-#     happen because we rsync FROM repo, but belt-and-suspenders) we
-#     don't add a duplicate.
+#   * hcloud_ssh_key_ids — HARD-OVERWRITE with the operator's $SSH_KEY_IDS
+#     (from cluster.env) plus the central's own key resolved by
+#     ensure_central_ssh_key(). Repo defaults are intentionally stale
+#     example IDs — they exist for documentation only and any "append"
+#     behaviour would silently mix in IDs from whatever project the
+#     example was last sourced against. PSMDB-2034 cross-project
+#     migration regression: scaler logged "SSH key not found" for every
+#     spawn because old-project ids 24333399/111196538 (committed in
+#     repo) leaked through to the new project's bake. Overwrite cleanly.
+#   * hcloud_network_id — same story. Repo default is the OLD project's
+#     network id, useless in any other project. Overwrite from
+#     $NETWORK_ID (cluster.env).
 #
 # We use yaml round-trip here instead of line-anchored sed because list
 # mutation is awkward in sed and we already need python3-yaml on this
@@ -1062,21 +1576,42 @@ fi
 # repo file for docs, the baked copy is an artifact consumed by the
 # scaler which only cares about structure.
 POOLS="$REMOTE_COMPOSE/config/ondemand-pools.yaml"
-python3 - "$POOLS" "https://$PUBLIC_HOSTNAME:7982" "$PRIVATE_IP" "$CENTRAL_SSH_KEY_ID" <<'PY'
+python3 - "$POOLS" "https://$PUBLIC_HOSTNAME:7982" "$PRIVATE_IP" "$CENTRAL_SSH_KEY_ID" "$SSH_KEY_IDS" "$NETWORK_ID" <<'PY'
 import sys, yaml
-path, pub_url, priv_ip, key_id_str = sys.argv[1:5]
-key_id = int(key_id_str)
+path, pub_url, priv_ip, central_key_str, ssh_key_ids_str, network_id_str = sys.argv[1:7]
+central_key_id = int(central_key_str)
+# $SSH_KEY_IDS is whitespace-separated in cluster.env (matches the
+# script-level default at the top of create-central.sh). Empty string =
+# no operator keys (only the central's own key gets injected — workers
+# would still be reachable from the central, just not from operator
+# laptops; sensible default for headless CI).
+operator_key_ids = [int(x) for x in ssh_key_ids_str.split() if x.strip()]
+network_id = int(network_id_str)
+
 with open(path) as fh:
     doc = yaml.safe_load(fh) or {}
 g = doc.setdefault("global", {})
 g["scheduler_public_url"] = pub_url
 g["scheduler_private_ip"] = priv_ip
-keys = g.setdefault("hcloud_ssh_key_ids", [])
-if key_id not in keys:
-    keys.append(key_id)
+g["hcloud_network_id"] = network_id
+
+# Hard-overwrite the SSH key list. Order: operator keys first
+# (so the laptop can SSH in for debugging without depending on the
+# central as a jump host), then central's own key (used by the
+# central → worker control plane). Dedup while preserving order so
+# a re-run doesn't grow the list past the few entries we actually
+# want.
+seen = set()
+all_keys = []
+for kid in operator_key_ids + [central_key_id]:
+    if kid not in seen:
+        seen.add(kid)
+        all_keys.append(kid)
+g["hcloud_ssh_key_ids"] = all_keys
+
 with open(path, "w") as fh:
     yaml.safe_dump(doc, fh, default_flow_style=False, sort_keys=False)
-print(f"  ✓ ondemand-pools.yaml patched: public_url, private_ip, hcloud_ssh_key_ids (+{key_id})")
+print(f"  ✓ ondemand-pools.yaml patched: public_url={pub_url}, private_ip={priv_ip}, network_id={network_id}, hcloud_ssh_key_ids={all_keys}")
 PY
 
 # Generate config/predeclared.libsonnet from ondemand-pools.yaml. This is
@@ -1351,7 +1886,9 @@ smoke() {
   fi
 
   # Step 5: Dex JWKS endpoint must publish at least one signing key.
-  # Envoy's jwt_authn filter on :8981 fetches this every 600s; if the
+  # Envoy's jwt_authn filter on :8981 / :1985 caches JWKS for 60s
+  # (PSMDB-2034 narrowed from 600s to shrink the post-rotation
+  # stale-cache window — see envoy.yaml grpc_listener block). If the
   # set is empty (e.g. dex storage volume wiped without a fresh
   # bootstrap), every Bazel RPC is rejected with "Jwt verification
   # fails" until Dex re-mints a key. Catching it here means we don't
@@ -1567,6 +2104,28 @@ summary() {
     \$PUBLIC_IP can rotate. Browsing https://<floating-ip>:7982/ also
     fails TLS validation because the cert SAN is the hostname, not the
     IP — always use the hostname.
+EOF
+
+  # Floating IP / primary block — split out of the main heredoc so we can
+  # branch on whether ensure_floating_ip overrode PUBLIC_IP. Bash's
+  # nested-heredoc + $() expansion combo doesn't parse cleanly inside an
+  # outer heredoc, hence the second cat <<EOF here.
+  if [[ -n "$PUBLIC_IP_PRIMARY" ]]; then
+    cat <<EOF
+
+  Floating IP / primary IP:
+    \$PUBLIC_IP        : $PUBLIC_IP  (Floating IP $FLOATING_IP_ID — used by all script ops)
+    Primary fallback : $PUBLIC_IP_PRIMARY  (VM's eth0 public IPv4 — direct SSH if FIP routing breaks)
+EOF
+  else
+    cat <<EOF
+
+  Public IP:
+    \$PUBLIC_IP        : $PUBLIC_IP  (VM primary — FLOATING_IP_ID not set, no FIP indirection)
+EOF
+  fi
+
+  cat <<EOF
 
   Private (psmdb.cd.percona.com network):
     Worker gRPC      : grpc://$PRIVATE_IP:8983        (ondemand workers only)
@@ -1606,8 +2165,10 @@ main() {
   preflight
   ensure_server
   attach_volume
-  wait_for_ssh
-  bootstrap_host
+  ensure_floating_ip            # API-level only; no $PUBLIC_IP override here
+  wait_for_ssh                  # via primary IP — FIP alias not configured yet
+  bootstrap_host                # installs docker + ifupdown helpers
+  configure_floating_ip_on_host # OS-level alias + persist + flip $PUBLIC_IP→FIP
   mount_volume
 
   local state

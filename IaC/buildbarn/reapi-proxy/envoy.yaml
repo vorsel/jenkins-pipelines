@@ -29,6 +29,39 @@ static_resources:
       socket_address:
         address: 0.0.0.0
         port_value: 8981
+    # PSMDB-2034: TLS-handshake resilience under burst load.
+    #
+    # The default Linux SOMAXCONN-derived TCP listen backlog (128 on
+    # Debian 13's net.core.somaxconn = 4096 — yes, kernel default is
+    # 4096, but listen() in C stdlib still passes 128 unless we ask
+    # for more) saturates instantly during a Jenkins matrix burst:
+    # ~11 stages × ~72 jobs/stage × 3 channels (executor + cache + BES)
+    # = ~2300 simultaneous TCP SYNs. Anything that arrives after the
+    # backlog is full gets a SYN drop; the client retries with
+    # exponential backoff, but Bazel's grpc-java has a 10s
+    # SslHandshakeTimeoutException ceiling and bails before the retry
+    # cycle catches up.
+    #
+    # Three-pronged fix:
+    #   1. tcp_backlog_size — explicit listen(2) backlog ceiling.
+    #      Envoy passes this to socket(2)/listen(2); kernel still
+    #      caps at net.core.somaxconn (which we set to 65535 in
+    #      bootstrap_host's sysctl tuning), so 4096 here is honoured
+    #      end-to-end.
+    #   2. reuse_port=true — the listener opens N sockets bound with
+    #      SO_REUSEPORT and the kernel hashes incoming SYNs across
+    #      them, one per Envoy worker thread. Without this, a single
+    #      socket fans out to all workers via a userspace mutex,
+    #      which is the actual TLS-handshake bottleneck under burst
+    #      load on multi-core boxes.
+    #   3. connection_balance_config: exact_balance — when reuse_port
+    #      is on, this rebalances accepted connections across workers
+    #      so a momentarily-busy worker doesn't starve while a peer
+    #      sits idle. Cheap; comparable to nginx's least_conn.
+    tcp_backlog_size: 4096
+    reuse_port: true
+    connection_balance_config:
+      exact_balance: {}
     filter_chains:
     # TLS termination for Bazel clients reaching the cluster from the
     # public internet. Cert is the Let's Encrypt cert for
@@ -118,18 +151,37 @@ static_resources:
                   audiences:
                   - bazel-cli
                   - bazel-jenkins
-                  # Refresh the JWKS in the background every 600s.
+                  # Refresh the JWKS in the background every 60s.
+                  #
                   # Dex rotates signing keys every 6h and keeps the
-                  # past 24h of public keys in `/keys` for offline
-                  # verification of in-flight tokens; 10-minute cache
-                  # is well under that window so a fresh `kid` is
-                  # always available before the previous one expires.
+                  # past 24h of public keys in `/keys`, so any kid
+                  # that was active in the last day is still valid
+                  # for verification. The narrow failure mode is the
+                  # window between (a) Dex rotating to kid_v2 and
+                  # (b) Envoy refreshing its cached JWKS — during
+                  # that window Bazel sends a token signed by kid_v2
+                  # that Envoy doesn't yet know, and the request
+                  # gets HTTP 401 ("Jwks doesn't have key to match
+                  # kid"). PSMDB-2034 build #15 hit this exactly
+                  # 2m22s after Dex rotated at 00:22:32 UTC, with
+                  # Envoy's then-cached JWKS taken pre-rotation.
+                  #
+                  # Width of that window is `cache_duration`. With
+                  # 600s (10m) the failure probability per build was
+                  # 600/21600 ≈ 2.8% (one in 36). With 60s we drop
+                  # to ~0.28%, AND Bazel's --remote_retries=5 with
+                  # --remote_retry_max_delay=30s yields a cumulative
+                  # backoff of ~60s — comfortably enough for Envoy
+                  # to refresh JWKS during the retry window and
+                  # mask the failure entirely on the client side.
+                  # Cost: 1 GET /keys per minute against the local
+                  # Dex container, negligible.
                   remote_jwks:
                     http_uri:
                       uri: https://bb-psmdb.ddns.net:5556/keys
                       cluster: dex_jwks
                       timeout: 5s
-                    cache_duration: 600s
+                    cache_duration: 60s
                   # `forward: true` keeps the Authorization header
                   # attached when Envoy forwards to BB. We don't
                   # actually consume it on the BB side today (BB
@@ -178,6 +230,15 @@ static_resources:
       socket_address:
         address: 0.0.0.0
         port_value: 1985
+    # Same resilience knobs as grpc_listener above — see that block for
+    # the full burst-load rationale. BES streams open at the same instant
+    # as the executor/cache channels (`--bes_backend=…` is honoured for
+    # the duration of the build), so this listener takes the same SYN
+    # spike at burst start.
+    tcp_backlog_size: 4096
+    reuse_port: true
+    connection_balance_config:
+      exact_balance: {}
     filter_chains:
     - transport_socket:
         name: envoy.transport_sockets.tls
@@ -239,12 +300,14 @@ static_resources:
                   audiences:
                   - bazel-cli
                   - bazel-jenkins
+                  # cache_duration: 60s — see grpc_listener block for
+                  # full rationale (Dex rotation vs JWKS cache window).
                   remote_jwks:
                     http_uri:
                       uri: https://bb-psmdb.ddns.net:5556/keys
                       cluster: dex_jwks
                       timeout: 5s
-                    cache_duration: 600s
+                    cache_duration: 60s
                   forward: true
                   from_headers:
                   - name: authorization

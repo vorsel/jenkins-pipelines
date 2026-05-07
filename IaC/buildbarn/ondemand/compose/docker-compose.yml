@@ -434,6 +434,28 @@ services:
     # privkey.pem (mode 600 root:root on the host volume). The container is
     # isolated; nothing on the host changes.
     user: "0:0"
+    # PSMDB-2034: lift the soft fd-limit. The envoyproxy/envoy image
+    # inherits Docker's default 1024 soft / 524288 hard, and on a busy
+    # central (cpx62, 16 worker threads) the proxy hovers around ~750 fd
+    # at idle and crosses 1024 the moment a 17-stage Jenkins matrix
+    # bursts in synchronously. EMFILE on socket(2) surfaces in Bazel
+    # client logs as:
+    #   UNAVAILABLE: upstream connect error or disconnect/reset before
+    #   headers. reset reason: local connection failure, transport
+    #   failure reason: socket creation failure
+    # which we observed multiple times in builds #12 and #13 of
+    # hetzner-psmdb83-autobuild-RELEASE-RBE on the new cluster. Same
+    # exhaustion also stalls accept(2) for incoming TLS, surfacing
+    # client-side as SslHandshakeTimeoutException after 10s — i.e. one
+    # root cause, two symptoms.
+    #
+    # 65535 soft is a standard headroom for high-concurrency proxies;
+    # the kernel's per-process hard ceiling on this host is 524288 and
+    # we keep that as the upper bound rather than touching nr_open.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 524288
     ports:
       # Public TLS endpoint for Bazel clients. Cert is the Let's Encrypt
       # cert for bb-psmdb.ddns.net (see envoy.yaml). Plain gRPC clients
