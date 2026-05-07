@@ -806,6 +806,19 @@ systemctl enable --now docker
 #                   manually — bump = single line below + redeploy.
 ARCH=$(dpkg --print-architecture)   # amd64 | arm64
 
+# grpcurl tarballs follow a different arch convention than `dpkg
+# --print-architecture` reports — upstream publishes:
+#   * grpcurl_<v>_linux_x86_64.tar.gz   (NOT linux_amd64.tar.gz)
+#   * grpcurl_<v>_linux_arm64.tar.gz
+# while the .deb / .rpm assets DO use the amd64/arm64 spelling. Confused
+# us once on a fresh bake — the script tried `linux_amd64.tar.gz` and
+# 404'd. Map dpkg arch → grpcurl tarball arch explicitly.
+case "$ARCH" in
+  amd64) GRPCURL_ARCH=x86_64 ;;
+  arm64) GRPCURL_ARCH=arm64  ;;
+  *)     echo "FATAL: unsupported dpkg arch '$ARCH' (expected amd64|arm64)" >&2; exit 1 ;;
+esac
+
 if ! command -v hcloud >/dev/null 2>&1; then
   echo "  installing hcloud CLI ($ARCH) …"
   curl -fsSL "https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-${ARCH}.tar.gz" \
@@ -818,8 +831,8 @@ fi
 
 GRPCURL_VERSION=1.9.3
 if ! command -v grpcurl >/dev/null 2>&1; then
-  echo "  installing grpcurl v$GRPCURL_VERSION ($ARCH) …"
-  curl -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${ARCH}.tar.gz" \
+  echo "  installing grpcurl v$GRPCURL_VERSION ($GRPCURL_ARCH) …"
+  curl -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${GRPCURL_ARCH}.tar.gz" \
     | tar -xzf - -C /usr/local/bin grpcurl
   chmod 0755 /usr/local/bin/grpcurl
   echo "  ✓ grpcurl installed: $(grpcurl --version 2>&1)"
