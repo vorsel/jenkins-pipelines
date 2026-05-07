@@ -87,6 +87,43 @@ String parseGithubOwnerRepo(String url) {
     return m.group(1)
 }
 
+// Ensure modern Docker CE with the buildx CLI plugin is installed on
+// the current node.
+//
+// Why: Hetzner docker-x64 / docker-aarch64 agents ship a stripped-down
+// Docker (Debian 12 docker.io package, no buildx plugin). The native
+// `docker buildx create --name ...` then fails with
+//   `unknown flag: --name`
+// because the `buildx` subcommand simply does not exist. We need
+// buildx for `--platform linux/<arch> --push` (single-arch leaf push)
+// and for `imagetools create` (manifest-list stitching in the merge
+// stage), so we paper over the agent provisioning gap inline here.
+//
+// `get.docker.com` is the official Docker install script; it detects
+// Debian, replaces the OS-vendor docker.io package with docker-ce +
+// docker-ce-cli + containerd.io + docker-buildx-plugin +
+// docker-compose-plugin, and exits 0. Idempotent — second run is a
+// no-op apt upgrade. We gate the whole thing on `docker buildx
+// version` so subsequent leg runs (or already-modern agents) skip the
+// install entirely.
+def ensureDockerBuildx() {
+    sh '''
+        set -eu
+        if docker buildx version >/dev/null 2>&1; then
+            echo "docker buildx already present:"
+            docker buildx version
+            exit 0
+        fi
+        echo "docker buildx not found — installing modern Docker CE via get.docker.com"
+        if [ "$(id -u)" -eq 0 ]; then
+            curl -fsSL https://get.docker.com | sh
+        else
+            curl -fsSL https://get.docker.com | sudo sh
+        fi
+        docker buildx version
+    '''
+}
+
 // One node ⇒ one buildx builder ⇒ shared layer cache across all the
 // (distro × version) cells that run on this node. We create the
 // builder once at the start of a leg and tear it down in finally.
@@ -99,6 +136,8 @@ def runArchLeg(String archShort, String archSuffix, String platform) {
     def builderName = "psmdb-rbe-${env.BUILD_NUMBER}-${archShort}"
 
     checkout scm
+
+    ensureDockerBuildx()
 
     try {
         withCredentials([usernamePassword(
@@ -369,6 +408,11 @@ pipeline {
             agent { label 'docker-x64' }
             steps {
                 script {
+                    // Jenkins may schedule the merge stage on a different
+                    // docker-x64 node than the one that ran the amd64 leg
+                    // — make sure buildx is available here too.
+                    ensureDockerBuildx()
+
                     def distros  = env.SEL_DISTROS.split(/\s+/) as List
                     def versions = env.SEL_VERSIONS.split(/\s+/) as List
                     def shaMap   = readJSON(text: env.SHA_MAP_JSON)
