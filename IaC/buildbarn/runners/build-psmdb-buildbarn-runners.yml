@@ -1,0 +1,30 @@
+- job:
+    name: hetzner-psmdb-buildbarn-runners
+    project-type: pipeline
+    description: |
+        Builds PSMDB BuildBarn runner container images and pushes them to
+        docker.io/perconalab/psmdb-rbe-<distro>:<version>-<sha> (immutable)
+        and docker.io/perconalab/psmdb-rbe-<distro>:<version> (moving).
+
+        Mirrors the GHA workflow .github/workflows/build-psmdb-buildbarn-runners.yml
+        but targets Docker Hub so upstream PSMDB-2034 reviewers can pull the
+        images without GHCR credentials.
+
+        Topology: two parallel arch legs ("amd64 leg" on docker-x64,
+        "arm64 leg" on docker-aarch64), each running the full
+        (distro × version) sub-matrix sequentially on its single node.
+        Pinning each arch to one node avoids stalling 18 simultaneous
+        ARM nodes from Hetzner while still keeping amd64 ‖ arm64.
+
+        Manifest list stitching happens in the final stage on docker-x64.
+
+        Do not edit this job through the web!
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/Percona-Lab/jenkins-pipelines.git
+            branches:
+            - 'hetzner'
+            wipe-workspace: false
+      lightweight-checkout: true
+      script-path: IaC/buildbarn/runners/build-psmdb-buildbarn-runners.groovy

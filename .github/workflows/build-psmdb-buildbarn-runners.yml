@@ -5,10 +5,10 @@ name: build-psmdb-buildbarn-runners
 # Shape (Docker docs "distribute build across multiple runners"
 # https://docs.docker.com/build/ci/github-actions/multi-platform/):
 #
-#   1. `build` matrix → 33 jobs: psmdb_version × distro × platform, with one
-#      exclude for debian-bookworm/linux-arm64. Each job builds its single-arch
-#      image, pushes it to GHCR by-digest only (no tag yet) and uploads the
-#      sha256 digest as a workflow artifact.
+#   1. `build` matrix → 36 jobs: psmdb_version × distro × platform (3×6×2),
+#      no excludes — every distro is built for both linux/amd64 and linux/arm64.
+#      Each job builds its single-arch image, pushes it to GHCR by-digest only
+#      (no tag yet) and uploads the sha256 digest as a workflow artifact.
 #   2. `merge` matrix → 18 jobs: psmdb_version × distro. Downloads the per-arch
 #      digest artifacts for one (version, distro) pair and stitches them into a
 #      single multi-arch tag with `docker buildx imagetools create`.
@@ -19,17 +19,16 @@ name: build-psmdb-buildbarn-runners
 #   ghcr.io/<owner>/psmdb-buildbarn-runners/<distro>:<version>-<sha>   (immutable)
 #   ghcr.io/<owner>/psmdb-buildbarn-runners/<distro>:<version>          (moving)
 #
-# debian-bookworm is amd64-only (no aarch64 source dir on this branch). Its
-# manifest list will contain a single linux/amd64 entry — that's a valid
-# manifest list and intentional; the PSMDB Bazel side never schedules an
-# arm64 worker for the debian-bookworm pool.
-#
-# Per-arch Dockerfiles still live under
+# Per-arch Dockerfiles live under
 #   IaC/buildbarn/runners/<distro>-x86_64/Dockerfile
 #   IaC/buildbarn/runners/<distro>-aarch64/Dockerfile
 # (they only differ in LABEL metadata; the build body is identical). Keeping
 # both dirs as-is gives a clean checkout-and-build per arch with no Dockerfile
 # munging — deduplicating is out of scope for this PR.
+#
+# debian-bookworm is now multi-arch like the other 5 distros (the previous
+# amd64-only carve-out was removed once `debian-bookworm-aarch64/` was added
+# alongside `-x86_64/`).
 #
 # Routing-key implication on the PSMDB Bazel side: each distro now resolves to
 # ONE multi-arch URL in psmdb_rbe_containers.bzl. The arch dimension is no
@@ -111,8 +110,7 @@ jobs:
       fail-fast: false
       max-parallel: 10
       matrix:
-        # Cartesian product of psmdb_version × distro × platform, minus the
-        # debian-bookworm/arm64 cell (no aarch64 source dir). 6×3×2 − 1×3 = 33.
+        # Cartesian product of psmdb_version × distro × platform = 6×3×2 = 36.
         # The `include` entries below add per-platform attributes
         # (arch_suffix, runs_on, platform_pair); they do NOT introduce new
         # combinations.
@@ -130,9 +128,6 @@ jobs:
         platform:
           - linux/amd64
           - linux/arm64
-        exclude:
-          - distro: debian-bookworm
-            platform: linux/arm64
         include:
           - platform: linux/amd64
             arch_suffix: x86_64
@@ -512,7 +507,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Aggregate job surfaces a single "all green" status check suitable for
-  # branch protection; avoids requiring 33 build + 18 merge separate checks
+  # branch protection; avoids requiring 36 build + 18 merge separate checks
   # to stay in sync.
   report:
     name: report
