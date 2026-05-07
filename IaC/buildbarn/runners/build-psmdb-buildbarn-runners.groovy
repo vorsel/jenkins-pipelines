@@ -70,6 +70,23 @@ library changelog: false, identifier: "lib@hetzner", retriever: modernSCM([
     remote: 'https://github.com/Percona-Lab/jenkins-pipelines.git'
 ])
 
+import com.cloudbees.groovy.cps.NonCPS
+
+// Extract `<owner>/<repo>` from a GitHub URL.
+//
+// MUST be @NonCPS: the regex match produces a `java.util.regex.Matcher`,
+// which is NOT Serializable. If we let the Matcher live in a normal CPS
+// scope, the next pipeline step that triggers program persistence (e.g.
+// `sh`) blows up with `java.io.NotSerializableException: java.util.regex.Matcher`.
+// Wrapping the parse in @NonCPS keeps the Matcher confined to a non-CPS
+// stack frame that is never serialized; only the returned String escapes.
+@NonCPS
+String parseGithubOwnerRepo(String url) {
+    def m = url =~ /github\.com[:\/]([^\/]+\/[^\/]+?)(?:\.git)?$/
+    if (!m.find()) return null
+    return m.group(1)
+}
+
 // One node ⇒ one buildx builder ⇒ shared layer cache across all the
 // (distro × version) cells that run on this node. We create the
 // builder once at the start of a leg and tear it down in finally.
@@ -266,11 +283,10 @@ pipeline {
                     }
 
                     def repoUrl = params.MONGO_REPO
-                    def matcher = (repoUrl =~ /github\.com[:\/]([^\/]+\/[^\/]+?)(?:\.git)?$/)
-                    if (!matcher.find()) {
+                    def ownerRepo = parseGithubOwnerRepo(repoUrl)
+                    if (!ownerRepo) {
                         error "Cannot parse mongo repo URL: ${repoUrl}"
                     }
-                    def ownerRepo = matcher.group(1)
 
                     // Resolve mongo_sha ONCE per version. The path filter is
                     // psmdb_builder.sh, which is repo-wide — distro doesn't
