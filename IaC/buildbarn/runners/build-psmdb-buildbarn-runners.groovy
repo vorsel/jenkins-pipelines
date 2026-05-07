@@ -302,14 +302,29 @@ pipeline {
                         def branch = overrideBranch?.trim() ? overrideBranch.trim() : defBranch
                         branchMap[v] = branch
 
-                        def sha = sh(returnStdout: true, script: """
+                        // Pure-curl fetch; JSON parsing happens in Groovy via
+                        // readJSON below. Avoids hard-depending on `jq` being
+                        // installed on the docker-x64 agent (it is NOT, by
+                        // default — that's how this stage failed in build #N
+                        // before this fix).
+                        def jsonText = sh(returnStdout: true, script: """
                             set -eu
                             curl -fsSL --retry 3 --retry-delay 2 \
                                 -H 'Accept: application/vnd.github+json' \
-                                'https://api.github.com/repos/${ownerRepo}/commits?path=percona-packaging/scripts/psmdb_builder.sh&sha=${branch}&per_page=1' \
-                                | jq -r '.[0].sha'
+                                'https://api.github.com/repos/${ownerRepo}/commits?path=percona-packaging/scripts/psmdb_builder.sh&sha=${branch}&per_page=1'
                         """).trim()
-                        if (!sha || sha == 'null' || sha == '') {
+
+                        // GitHub returns either a JSON array of commits (success)
+                        // or a JSON object with `message` (404 / rate-limit / etc).
+                        def parsed = readJSON(text: jsonText)
+                        if (!(parsed instanceof List)) {
+                            error "GitHub API did not return a commits array for ${ownerRepo}@${branch} (psmdb_version=${v}): ${jsonText.take(200)}"
+                        }
+                        if (parsed.isEmpty()) {
+                            error "No commits found for ${ownerRepo}@${branch} touching percona-packaging/scripts/psmdb_builder.sh (psmdb_version=${v})"
+                        }
+                        def sha = parsed[0].sha
+                        if (!sha) {
                             error "Failed to resolve mongo_sha for ${ownerRepo}@${branch} (psmdb_version=${v})"
                         }
                         shaMap[v] = sha
