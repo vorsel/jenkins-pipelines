@@ -42,7 +42,7 @@
         - git:
             url: https://github.com/vorsel/jenkins-pipelines.git
             branches:
-            - 'hetzner'
+            - 'PSMDB-2034_buildbarn_setup'
             wipe-workspace: false
       lightweight-checkout: true
       script-path: IaC/buildbarn/runners/build-psmdb-buildbarn-runner-sandbox.groovy

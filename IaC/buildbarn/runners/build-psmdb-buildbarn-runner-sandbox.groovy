@@ -24,7 +24,10 @@
 // and the matching pool entries to ondemand-pools.yaml + the .bzl row in
 // the percona-server-mongodb fork.
 
-@Library('percona-jenkins-shared-library@hetzner') _
+library changelog: false, identifier: "lib@hetzner", retriever: modernSCM([
+    $class: 'GitSCMSource',
+    remote: 'https://github.com/Percona-Lab/jenkins-pipelines.git'
+])
 
 def ensureDockerBuildx() {
     sh '''
