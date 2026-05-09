@@ -109,19 +109,18 @@ LABEL org.percona.psmdb.builder_script="percona-packaging/scripts/psmdb_builder.
 """
 }
 
-@NonCPS
+// Uses the `sh` Pipeline step (sandbox-safe) instead of List.execute(),
+// which is rejected by Jenkins script-security on this master.
 def resolveBranchSha(String repoUrl, String branch) {
+    def out = sh(
+        script: "git ls-remote ${repoUrl} refs/heads/${branch}",
+        returnStdout: true
+    ).trim()
+    if (!out) {
+        error "Branch '${branch}' not found on ${repoUrl}"
+    }
     // git ls-remote prints "<sha>\trefs/heads/<branch>" — pluck the SHA.
-    def proc = ["git", "ls-remote", repoUrl, "refs/heads/${branch}"].execute()
-    proc.waitFor()
-    if (proc.exitValue() != 0) {
-        throw new RuntimeException("git ls-remote ${repoUrl} ${branch} failed: ${proc.err.text}")
-    }
-    def line = proc.in.text.trim().split('\n').find { it }
-    if (!line) {
-        throw new RuntimeException("Branch ${branch} not found on ${repoUrl}")
-    }
-    return line.split(/\s+/)[0]
+    return out.split('\n')[0].split(/\s+/)[0]
 }
 
 pipeline {
@@ -223,7 +222,7 @@ pipeline {
         stage('Render Dockerfile') {
             steps {
                 script {
-                    def archShort = params.ARCHS.contains(',') ? 'multi' : params.ARCHS.split('/').last()
+                    def archShort = params.ARCHS.contains(',') ? 'multi' : params.ARCHS.replaceAll(/.*\//, '')
                     def df = renderDockerfile(
                         params.BASE_IMAGE,
                         params.PKG_MANAGER,
