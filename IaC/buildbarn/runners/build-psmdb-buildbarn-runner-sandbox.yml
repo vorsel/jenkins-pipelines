@@ -1,0 +1,48 @@
+- job:
+    name: hetzner-psmdb-buildbarn-runner-sandbox
+    project-type: pipeline
+    description: |
+        One-off sandbox build for a single PSMDB BuildBarn runner image,
+        driven entirely by job parameters — no Dockerfile commit needed
+        in this repo.
+
+        Companion to the canonical matrix job
+        `hetzner-psmdb-buildbarn-runners` (which iterates over the
+        checked-in matrix of distros × versions × archs in
+        IaC/buildbarn/runners/). Use this sandbox job to:
+          * Smoke-test a brand-new base image (e.g. `ubuntu:26.04`,
+            `debian:trixie`, `oraclelinux:10`) before adding it to the
+            canonical Dockerfile matrix.
+          * Iterate quickly on a one-off psmdb_builder.sh patch from a
+            feature branch on the percona-server-mongodb fork.
+
+        Inputs:
+          MONGO_REPO          - PSMDB git URL  (default: vorsel fork)
+          MONGO_BRANCH        - branch holding the psmdb_builder.sh to bake
+          DISTRO_LABEL        - slug used in the image tag
+          BASE_IMAGE          - Docker FROM image
+          PKG_MANAGER         - apt | dnf
+          PSMDB_VERSION       - version slug (master | 8.0 | 8.3)
+          ARCHS               - linux/amd64,linux/arm64 (or single arch)
+          PUSH_TO_DOCKER_HUB  - default true; uncheck for local-only build
+          DH_CRED_ID          - Jenkins credentials id (Docker Hub login)
+
+        Output (when PUSH_TO_DOCKER_HUB=true):
+          docker.io/perconalab/psmdb-rbe:<distro>-<version>-<sha>  (immutable, multi-arch)
+          docker.io/perconalab/psmdb-rbe:<distro>-<version>        (moving alias)
+
+        Topology: single docker-x64 agent. Multi-arch builds use
+        QEMU emulation for arm64 — slower than the canonical job's
+        native two-leg topology but acceptable for one-off sandbox
+        runs.
+
+        Do not edit this job through the web!
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/vorsel/jenkins-pipelines.git
+            branches:
+            - 'hetzner'
+            wipe-workspace: false
+      lightweight-checkout: true
+      script-path: IaC/buildbarn/runners/build-psmdb-buildbarn-runner-sandbox.groovy
