@@ -554,6 +554,24 @@ pools:
   # ==========================================================================
   # oraclelinux-10 (Oracle Linux 10) — distro_or_os "rhel10" — PSMDB-1943
   # ==========================================================================
+  oraclelinux-10-x86_64__v8_0__1293cbf854b0:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-10-aarch64__v8_0__1293cbf854b0:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
   oraclelinux-10-x86_64__v8_3__78cbc90209dc:
     runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.3-78cbc90209dcdbc1353dac8cf32b93293bd15cbd"
     bazel_pool_value: x86_64
@@ -593,6 +611,24 @@ pools:
   # ==========================================================================
   # debian-trixie (Debian 13) — distro_or_os "debian13" — PSMDB-2028
   # ==========================================================================
+  debian-trixie-x86_64__v8_0__1293cbf854b0:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-trixie-aarch64__v8_0__1293cbf854b0:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
   debian-trixie-x86_64__v8_3__78cbc90209dc:
     runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.3-78cbc90209dcdbc1353dac8cf32b93293bd15cbd"
     bazel_pool_value: x86_64
@@ -632,6 +668,24 @@ pools:
   # ==========================================================================
   # ubuntu-resolute (Ubuntu 26.04 LTS) — distro_or_os "ubuntu26" — PSMDB-2073
   # ==========================================================================
+  ubuntu-resolute-x86_64__v8_0__1293cbf854b0:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-resolute-aarch64__v8_0__1293cbf854b0:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
   ubuntu-resolute-x86_64__v8_3__78cbc90209dc:
     runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.3-78cbc90209dcdbc1353dac8cf32b93293bd15cbd"
     bazel_pool_value: x86_64
