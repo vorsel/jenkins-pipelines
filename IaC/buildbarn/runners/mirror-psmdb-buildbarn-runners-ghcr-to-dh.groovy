@@ -54,20 +54,63 @@ def DISTROS = [
     "debian-trixie",
 ]
 
+// Three-stage probe so we cover all Jenkins docker-x64 agent flavors observed
+// in the field:
+//   1. modern docker-ce with docker-buildx-plugin already installed → fast path
+//   2. older agent with stock docker pkg only → install latest CE via
+//      get.docker.com (which apt-installs docker-buildx-plugin into
+//      /usr/libexec/docker/cli-plugins/)
+//   3. agent where stage 2 ran but `docker buildx` is still "unknown command"
+//      — this happens when a pre-existing standalone /usr/local/bin/docker
+//      shadows the apt-managed /usr/bin/docker on PATH, so the cli-plugins
+//      lookup never finds the buildx plugin. Fall back to a direct binary
+//      install into $HOME/.docker/cli-plugins which the docker CLI always
+//      probes, regardless of which docker binary is in front.
 def ensureDockerBuildx() {
     sh '''
         set -eu
+
         if docker buildx version >/dev/null 2>&1; then
-            echo "docker buildx already present:"
+            echo "[ensureDockerBuildx] stage 1 — buildx already available:"
             docker buildx version
             exit 0
         fi
-        echo "docker buildx not found — installing modern Docker CE via get.docker.com"
+
+        echo "[ensureDockerBuildx] stage 2 — installing modern Docker CE via get.docker.com"
         if [ "$(id -u)" -eq 0 ]; then
             curl -fsSL https://get.docker.com | sh
         else
             curl -fsSL https://get.docker.com | sudo sh
         fi
+        hash -r
+        if docker buildx version >/dev/null 2>&1; then
+            echo "[ensureDockerBuildx] stage 2 OK — buildx available after CE install:"
+            docker buildx version
+            exit 0
+        fi
+
+        echo "[ensureDockerBuildx] stage 3 — buildx still missing after CE install; diagnosing PATH:"
+        which -a docker || true
+        docker --version || true
+        ls -l /usr/libexec/docker/cli-plugins/ 2>/dev/null || true
+        ls -l /usr/lib/docker/cli-plugins/    2>/dev/null || true
+
+        echo "[ensureDockerBuildx] stage 3 — installing docker-buildx as a per-user CLI plugin"
+        arch="$(uname -m)"
+        case "${arch}" in
+            x86_64|amd64)  barch=amd64 ;;
+            aarch64|arm64) barch=arm64 ;;
+            *) echo "Unsupported arch: ${arch}"; exit 1 ;;
+        esac
+        # Pin to a recent stable buildx release. Bump as needed; release page:
+        # https://github.com/docker/buildx/releases
+        bver="v0.18.0"
+        mkdir -p "${HOME}/.docker/cli-plugins"
+        curl -fsSL \
+            "https://github.com/docker/buildx/releases/download/${bver}/buildx-${bver}.linux-${barch}" \
+            -o "${HOME}/.docker/cli-plugins/docker-buildx"
+        chmod +x "${HOME}/.docker/cli-plugins/docker-buildx"
+        echo "[ensureDockerBuildx] stage 3 — verifying:"
         docker buildx version
     '''
 }
