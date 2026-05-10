@@ -237,12 +237,26 @@ pipeline {
                                     return
                                 }
 
+                                // Two-step copy to avoid a Docker Hub race condition observed
+                                // when multiple `-t` flags are passed in a single
+                                // `imagetools create` invocation: buildx then opens
+                                // parallel `/blobs/uploads/<uuid>` sessions for each
+                                // tag, both pushing the same blobs concurrently, and
+                                // registry-1.docker.io rejects the second one with
+                                // `400 Bad Request` (succeeds only when timing happens
+                                // to be lucky). Step 1 cross-registry-copies all blobs
+                                // under the immutable tag; step 2 aliases the moving
+                                // tag from the immutable one inside the same DH repo
+                                // — no blob upload, just one extra manifest reference,
+                                // so no upload-session race is possible.
                                 sh """
                                     set -eu
-                                    docker buildx imagetools create \\
-                                        -t ${dhImmutable} \\
-                                        -t ${dhMoving} \\
-                                        ${src}
+                                    echo '[step 1/2] copy GHCR -> DH (immutable tag, pushes blobs)'
+                                    docker buildx imagetools create -t ${dhImmutable} ${src}
+
+                                    echo '[step 2/2] alias moving tag from immutable (no blob push)'
+                                    docker buildx imagetools create -t ${dhMoving} ${dhImmutable}
+
                                     echo "Verifying ${dhImmutable}:"
                                     docker buildx imagetools inspect ${dhImmutable} | head -n 40
                                 """
