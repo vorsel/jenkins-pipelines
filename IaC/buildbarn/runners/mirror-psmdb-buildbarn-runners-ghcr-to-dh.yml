@@ -1,0 +1,43 @@
+- job:
+    name: hetzner-psmdb-buildbarn-runners-ghcr-to-dh-mirror
+    project-type: pipeline
+    description: |
+        Mirrors PSMDB BuildBarn runner images from GHCR (built natively per-arch
+        by the GitHub Actions workflow .github/workflows/build-psmdb-buildbarn-runners.yml)
+        to Docker Hub under docker.io/perconalab/psmdb-rbe.
+
+        Source layout (GHCR, system of record):
+            ghcr.io/<owner>/psmdb-buildbarn-runners/<distro>:<version>-<sha>  (immutable, multi-arch)
+            ghcr.io/<owner>/psmdb-buildbarn-runners/<distro>:<version>        (moving alias)
+
+        Destination layout (Docker Hub, what PSMDB Bazel pins):
+            docker.io/perconalab/psmdb-rbe:<distro>-<version>-<sha>           (immutable, multi-arch)
+            docker.io/perconalab/psmdb-rbe:<distro>-<version>                 (moving alias)
+
+        Mirroring is done with `docker buildx imagetools create`, which rewires
+        the manifest list at the registry level — no per-arch pull/repush, the
+        amd64 + arm64 images carry over byte-identical.
+
+        Inputs:
+            VERSIONS_TO_MIRROR  - space-separated PSMDB version slugs (default: master 8.3 8.0)
+            GHCR_OWNER          - GHCR namespace owner; vorsel for fork tests, percona-lab for prod
+            GHCR_NAMESPACE      - GHCR repo namespace (default: psmdb-buildbarn-runners)
+            DH_CRED_ID          - Jenkins creds id with Docker Hub username/token
+            DRY_RUN             - if true, print plan only, no push
+
+        Distros are not parameterized — the job iterates over all 9 distros that
+        the GHA build matrix covers (oraclelinux 8/9/10, amazonlinux-2023,
+        ubuntu jammy/noble/resolute, debian bookworm/trixie). To re-tag a single
+        distro, use the sandbox job (hetzner-psmdb-buildbarn-runner-sandbox)
+        or run the underlying imagetools create command manually.
+
+        Do not edit this job through the web!
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/vorsel/jenkins-pipelines.git
+            branches:
+            - 'PSMDB-2034_buildbarn_setup'
+            wipe-workspace: false
+      lightweight-checkout: true
+      script-path: IaC/buildbarn/runners/mirror-psmdb-buildbarn-runners-ghcr-to-dh.groovy

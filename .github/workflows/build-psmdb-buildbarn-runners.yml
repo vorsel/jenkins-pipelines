@@ -5,11 +5,11 @@ name: build-psmdb-buildbarn-runners
 # Shape (Docker docs "distribute build across multiple runners"
 # https://docs.docker.com/build/ci/github-actions/multi-platform/):
 #
-#   1. `build` matrix → 36 jobs: psmdb_version × distro × platform (3×6×2),
+#   1. `build` matrix → 54 jobs: psmdb_version × distro × platform (3×9×2),
 #      no excludes — every distro is built for both linux/amd64 and linux/arm64.
 #      Each job builds its single-arch image, pushes it to GHCR by-digest only
 #      (no tag yet) and uploads the sha256 digest as a workflow artifact.
-#   2. `merge` matrix → 18 jobs: psmdb_version × distro. Downloads the per-arch
+#   2. `merge` matrix → 27 jobs: psmdb_version × distro. Downloads the per-arch
 #      digest artifacts for one (version, distro) pair and stitches them into a
 #      single multi-arch tag with `docker buildx imagetools create`.
 #   3. `report` aggregates build + merge into one status check suitable for
@@ -110,7 +110,7 @@ jobs:
       fail-fast: false
       max-parallel: 10
       matrix:
-        # Cartesian product of psmdb_version × distro × platform = 6×3×2 = 36.
+        # Cartesian product of psmdb_version × distro × platform = 9×3×2 = 54.
         # The `include` entries below add per-platform attributes
         # (arch_suffix, runs_on, platform_pair); they do NOT introduce new
         # combinations.
@@ -121,10 +121,13 @@ jobs:
         distro:
           - oraclelinux-8
           - oraclelinux-9
+          - oraclelinux-10
           - amazonlinux-2023
           - ubuntu-jammy
           - ubuntu-noble
+          - ubuntu-resolute
           - debian-bookworm
+          - debian-trixie
         platform:
           - linux/amd64
           - linux/arm64
@@ -317,10 +320,13 @@ jobs:
         distro:
           - oraclelinux-8
           - oraclelinux-9
+          - oraclelinux-10
           - amazonlinux-2023
           - ubuntu-jammy
           - ubuntu-noble
+          - ubuntu-resolute
           - debian-bookworm
+          - debian-trixie
 
     steps:
       - name: Skip if distro or version filtered out
