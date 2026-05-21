@@ -27,3 +27,8 @@ IaC/buildbarn/**/jwks*.json
 
 IaC/buildbarn/**/__pycache__/
 IaC/buildbarn/**/*.pyc
+
+# Personal design / refactor notes that live next to the file they describe.
+# Not part of the deliverable for any current PSMDB-XXXX — captured locally so
+# they're easy to find when revisiting the topic. Pattern: `*.refactor-notes.md`.
+IaC/buildbarn/**/*.refactor-notes.md
