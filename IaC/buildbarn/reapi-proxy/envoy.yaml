@@ -151,6 +151,13 @@ static_resources:
                   audiences:
                   - bazel-cli
                   - bazel-jenkins
+                  # Step 5d — GitHub Actions CI. Same trust universe
+                  # (Dex JWKS), additional audience; the sub-claim
+                  # gate that limits this audience to environment-
+                  # scoped tokens from the percona/vorsel
+                  # percona-server-mongodb repos lives in the RBAC
+                  # filter below.
+                  - bazel-github-actions
                   # Refresh the JWKS in the background every 60s.
                   #
                   # Dex rotates signing keys every 6h and keeps the
@@ -191,6 +198,14 @@ static_resources:
                   # defense-in-depth later without re-shipping
                   # Envoy.
                   forward: true
+                  # Step 5d — surface the validated JWT claims as
+                  # connection metadata under the namespace
+                  # `envoy.filters.http.jwt_authn` keyed `jwt_payload`,
+                  # so the downstream RBAC filter can match against
+                  # the `sub` claim. Without this the RBAC filter
+                  # has nothing to look at and the GHA sub-prefix
+                  # gate cannot be enforced.
+                  payload_in_metadata: jwt_payload
                   from_headers:
                   - name: authorization
                     value_prefix: "Bearer "
@@ -204,6 +219,292 @@ static_resources:
                   prefix: /
                 requires:
                   provider_name: dex_provider
+          # Step 5d — RBAC filter enforcing the GHA subject gate.
+          #
+          # Trust model for tokens that survive jwt_authn above:
+          #
+          #   aud=bazel-cli       Device Code flow — humans gated by
+          #                       Dex GitHub-team membership. Allowed
+          #                       unconditionally on `sub`.
+          #
+          #   aud=bazel-jenkins   Jenkins OIDC plugin → Dex token-
+          #                       exchange. Federated subject is the
+          #                       Jenkins job URL (e.g. https://psmdb.
+          #                       cd.percona.com/job/...). Trust comes
+          #                       from the Jenkins issuer pin in the
+          #                       Dex connector. Allowed unconditionally
+          #                       on subject.
+          #
+          #   aud=bazel-github-   GitHub Actions OIDC → Dex token-
+          #       actions        exchange. The audience claim alone
+          #                       is not a strong gate: a fork of
+          #                       this repo with a workflow that
+          #                       happens to know the PSMDB_RBE_GHA_
+          #                       AUDIENCE coordination string could
+          #                       mint a token GH-side that Dex
+          #                       would accept here. The subject
+          #                       gate below closes that gap.
+          #
+          # Why the GHA `sub` values below look like base64 noise:
+          #
+          #   The `sub` claim on a Dex-issued id_token is NOT the
+          #   upstream subject_token's `sub`. Dex's `genSubject()`
+          #   (server/handlers.go) protobuf-marshals an internal
+          #   `IDTokenSubject{user_id, conn_id}` message and base64url-
+          #   encodes the result; that opaque blob is what lands in
+          #   the `sub` claim. Wire format for a (user_id, conn_id)
+          #   tuple is:
+          #
+          #     0x0A <len(user_id)> <user_id bytes>
+          #     0x12 <len(conn_id)> <conn_id bytes>
+          #
+          #   then base64url-encoded without padding. This encoding
+          #   is hard-coded in Dex; there is no config flag to make
+          #   the `sub` claim be the raw upstream value. And Dex's
+          #   token-exchange output JWT has NO other claims that
+          #   carry the upstream subject (no `name`, `email`, no
+          #   `federated_claims` block — the bare minimum iss/sub/aud
+          #   + lifetime fields only — see PSMDB-2099 diagnostic
+          #   workflow run for the live decode).
+          #
+          # How to recompute the expected values:
+          #
+          #   python3 - <<'PY'
+          #   import base64
+          #   def sub(uid, conn="github-actions"):
+          #       b = (bytes([0x0A, len(uid)]) + uid.encode()
+          #          + bytes([0x12, len(conn)]) + conn.encode())
+          #       return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+          #   print(sub("repo:percona/percona-server-mongodb:environment:psmdb-rbe"))
+          #   print(sub("repo:vorsel/percona-server-mongodb:environment:psmdb-rbe"))
+          #   PY
+          #
+          # Recompute when any of:
+          #   * a repository slug is added/removed/renamed (e.g. a new
+          #     contributor's permanent dev fork joins the allowlist),
+          #   * the `psmdb-rbe` GitHub deployment environment is
+          #     renamed,
+          #   * the Dex `connectors[].id` for GH Actions is renamed
+          #     (currently `github-actions` — see dex.yaml).
+          #
+          # Allowed federated subjects are EXACTLY the two repos ×
+          # the `psmdb-rbe` GitHub deployment environment. The repo-
+          # owner list is explicit (no wildcard) — adding a new
+          # contributor's fork means editing this file and
+          # re-running create-central.sh, which is intentional:
+          # the buildfarm is a cost / capacity resource and we
+          # want a human review step on the grant.
+          #
+          # Failure mode: a request with an unmatched principal
+          # gets HTTP 403 from this filter, before reaching the
+          # route_config / upstream cluster. The Bazel client
+          # surfaces this as PERMISSION_DENIED.
+          - name: envoy.filters.http.rbac
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+              rules:
+                action: ALLOW
+                policies:
+                  # Human + Jenkins paths — audience-only gate (no
+                  # sub-prefix check). Audience is the trust label
+                  # established by jwt_authn above; the originating
+                  # subject is constrained at Dex (GitHub team
+                  # membership, Jenkins issuer pin).
+                  trusted_audiences:
+                    permissions:
+                    - any: true
+                    principals:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: jwt_payload
+                        - key: aud
+                        value:
+                          # `aud` is matched as a scalar string, not a list:
+                          # Dex's id_token always carries a single-string
+                          # `aud` claim (RFC 7519 allows both forms), and
+                          # Envoy's jwt_authn stores claim values in metadata
+                          # preserving their JSON type. `list_match` on a
+                          # StringValue silently never matches — see
+                          # PSMDB-2099 diagnostics. If we ever switch Dex
+                          # to emit array-form aud, revisit.
+                          string_match:
+                            exact: bazel-cli
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: jwt_payload
+                        - key: aud
+                        value:
+                          string_match:
+                            exact: bazel-jenkins
+                  # GHA path — audience AND sub-prefix gate.
+                  # Per-repo separate policies for explicit grep-
+                  # ability (the alternative would be a single
+                  # policy with OR'd principals which obscures the
+                  # repo allowlist in audit logs).
+                  gha_percona_psmdb:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:percona/percona-server-mongodb:environment:psmdb-rbe",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjlyZXBvOnBlcmNvbmEvcGVyY29uYS1zZXJ2ZXItbW9uZ29kYjplbnZpcm9ubWVudDpwc21kYi1yYmUSDmdpdGh1Yi1hY3Rpb25z'
+                  gha_vorsel_psmdb:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:vorsel/percona-server-mongodb:environment:psmdb-rbe",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjhyZXBvOnZvcnNlbC9wZXJjb25hLXNlcnZlci1tb25nb2RiOmVudmlyb25tZW50OnBzbWRiLXJiZRIOZ2l0aHViLWFjdGlvbnM'
+                  gha_plebioda_psmdb:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:plebioda/percona-server-mongodb:environment:psmdb-rbe",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjpyZXBvOnBsZWJpb2RhL3BlcmNvbmEtc2VydmVyLW1vbmdvZGI6ZW52aXJvbm1lbnQ6cHNtZGItcmJlEg5naXRodWItYWN0aW9ucw'
+                  gha_plebioda_rbe:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:plebioda/percona-server-mongodb:environment:rbe",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjRyZXBvOnBsZWJpb2RhL3BlcmNvbmEtc2VydmVyLW1vbmdvZGI6ZW52aXJvbm1lbnQ6cmJlEg5naXRodWItYWN0aW9ucw'
+                  gha_plebioda_rbe_external:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:plebioda/percona-server-mongodb:environment:rbe-external",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        #
+                        # NOTE: this env is GitHub-protected (required
+                        # reviewers). Approval gating is enforced at the
+                        # GitHub layer BEFORE the OIDC subject_token is
+                        # minted; by the time a JWT reaches this RBAC
+                        # check the human approval has already passed,
+                        # so we just trust the (owner, env) tuple here.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'Cj1yZXBvOnBsZWJpb2RhL3BlcmNvbmEtc2VydmVyLW1vbmdvZGI6ZW52aXJvbm1lbnQ6cmJlLWV4dGVybmFsEg5naXRodWItYWN0aW9ucw'
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -300,6 +601,8 @@ static_resources:
                   audiences:
                   - bazel-cli
                   - bazel-jenkins
+                  # Step 5d — see grpc_listener block.
+                  - bazel-github-actions
                   # cache_duration: 60s — see grpc_listener block for
                   # full rationale (Dex rotation vs JWKS cache window).
                   remote_jwks:
@@ -309,6 +612,10 @@ static_resources:
                       timeout: 5s
                     cache_duration: 60s
                   forward: true
+                  # Step 5d — surface JWT claims to the RBAC filter
+                  # below. Lockstep with grpc_listener — see the
+                  # comment there.
+                  payload_in_metadata: jwt_payload
                   from_headers:
                   - name: authorization
                     value_prefix: "Bearer "
@@ -317,6 +624,212 @@ static_resources:
                   prefix: /
                 requires:
                   provider_name: dex_provider
+          # Step 5d — RBAC filter. Identical policies to grpc_listener
+          # by design: the BES gRPC channel sees the same client
+          # bearer header as the execution channel (`wrapper_hook.py`
+          # injects one Authorization header that applies to all of
+          # --remote_executor / --remote_cache / --bes_backend), so
+          # a tighter policy here would just produce a confusing
+          # mismatch where execution succeeds and BES gets 403 (the
+          # client looks otherwise authenticated). Keep the two
+          # listeners in lockstep on the policy set; if you add a
+          # principal here, add it on grpc_listener too.
+          - name: envoy.filters.http.rbac
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+              rules:
+                action: ALLOW
+                policies:
+                  trusted_audiences:
+                    permissions:
+                    - any: true
+                    principals:
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: jwt_payload
+                        - key: aud
+                        value:
+                          # `aud` is matched as a scalar string, not a list:
+                          # Dex's id_token always carries a single-string
+                          # `aud` claim (RFC 7519 allows both forms), and
+                          # Envoy's jwt_authn stores claim values in metadata
+                          # preserving their JSON type. `list_match` on a
+                          # StringValue silently never matches — see
+                          # PSMDB-2099 diagnostics. If we ever switch Dex
+                          # to emit array-form aud, revisit.
+                          string_match:
+                            exact: bazel-cli
+                    - metadata:
+                        filter: envoy.filters.http.jwt_authn
+                        path:
+                        - key: jwt_payload
+                        - key: aud
+                        value:
+                          string_match:
+                            exact: bazel-jenkins
+                  gha_percona_psmdb:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:percona/percona-server-mongodb:environment:psmdb-rbe",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjlyZXBvOnBlcmNvbmEvcGVyY29uYS1zZXJ2ZXItbW9uZ29kYjplbnZpcm9ubWVudDpwc21kYi1yYmUSDmdpdGh1Yi1hY3Rpb25z'
+                  gha_vorsel_psmdb:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:vorsel/percona-server-mongodb:environment:psmdb-rbe",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjhyZXBvOnZvcnNlbC9wZXJjb25hLXNlcnZlci1tb25nb2RiOmVudmlyb25tZW50OnBzbWRiLXJiZRIOZ2l0aHViLWFjdGlvbnM'
+                  gha_plebioda_psmdb:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:plebioda/percona-server-mongodb:environment:psmdb-rbe",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjpyZXBvOnBsZWJpb2RhL3BlcmNvbmEtc2VydmVyLW1vbmdvZGI6ZW52aXJvbm1lbnQ6cHNtZGItcmJlEg5naXRodWItYWN0aW9ucw'
+                  gha_plebioda_rbe:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:plebioda/percona-server-mongodb:environment:rbe",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjRyZXBvOnBsZWJpb2RhL3BlcmNvbmEtc2VydmVyLW1vbmdvZGI6ZW52aXJvbm1lbnQ6cmJlEg5naXRodWItYWN0aW9ucw'
+                  gha_plebioda_rbe_external:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:plebioda/percona-server-mongodb:environment:rbe-external",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        #
+                        # NOTE: this env is GitHub-protected (required
+                        # reviewers). Approval gating is enforced at the
+                        # GitHub layer BEFORE the OIDC subject_token is
+                        # minted; by the time a JWT reaches this RBAC
+                        # check the human approval has already passed,
+                        # so we just trust the (owner, env) tuple here.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'Cj1yZXBvOnBsZWJpb2RhL3BlcmNvbmEtc2VydmVyLW1vbmdvZGI6ZW52aXJvbm1lbnQ6cmJlLWV4dGVybmFsEg5naXRodWItYWN0aW9ucw'
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

@@ -357,6 +357,12 @@ services:
       # Dex config. Read-only — secrets come in via the environment
       # so the YAML stays committable to the public repo.
       - ./dex/dex.yaml:/etc/dex/dex.yaml:ro
+      # Step 5e — vendored Dex 2.41.1 web/ tree with the customised
+      # login template (connector whitelist) and Percona branding.
+      # Path matches `frontend.dir` in dex.yaml. Read-only because Dex
+      # only reads from it on startup; live edits require a container
+      # restart anyway. See dex/dex.yaml § frontend: for the why.
+      - ./dex/web:/etc/dex/web:ro
       # Same Let's Encrypt cert that envoy-proxy / browser /
       # scheduler use, served via Dex's `web.tlsCert/tlsKey`.
       - /var/lib/buildbarn/certs:/etc/buildbarn/certs:ro
@@ -381,6 +387,11 @@ services:
       - BB_BROWSER_OIDC_SECRET=${BB_BROWSER_OIDC_SECRET}
       - BB_SCHED_OIDC_SECRET=${BB_SCHED_OIDC_SECRET}
       - BB_PORTAL_OIDC_SECRET=${BB_PORTAL_OIDC_SECRET}
+      # Substituted via DEX_EXPAND_ENV into the github-actions connector's
+      # `audiences:` list at dex.yaml load time. Operator-controlled
+      # coordination string (`openssl rand -hex 16` once per buildfarm),
+      # baked into .env by create-central.sh.
+      - PSMDB_RBE_GHA_AUDIENCE=${PSMDB_RBE_GHA_AUDIENCE}
     healthcheck:
       # Dex exposes /healthz on the same port as the discovery
       # endpoint. We curl with --insecure because docker's healthcheck

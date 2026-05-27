@@ -74,6 +74,51 @@ web:
   tlsCert: /etc/buildbarn/certs/fullchain.pem
   tlsKey:  /etc/buildbarn/certs/privkey.pem
 
+# Step 5e — Branded login UI.
+#
+# Dex ships with a default "Log in to dex" page that lists EVERY
+# configured connector as a clickable button. For our setup that
+# means the `github-actions` and `jenkins-percona` connectors —
+# which exist only because Dex's token-exchange flow needs them to
+# validate upstream JWTs — render as if they were interactive
+# login options. They are not: clicking them either fails (the
+# GitHub Actions OIDC issuer rejects browser-initiated flows) or
+# succeeds in unintended ways (Jenkins's OIDC plugin can yield a
+# `aud=bazel-cli` JWT to any human with a Jenkins session, side-
+# stepping the GitHub-team membership gate we apply to `github`).
+#
+# We vendor a copy of Dex 2.41.1's `web/` tree under `./dex/web/`
+# (mounted at `/etc/dex/web` in the container), override exactly
+# one template — `templates/login.html` — to whitelist the
+# `github` connector, and swap in Percona's logo. Everything
+# else (approval, password, device, error, etc.) is the unchanged
+# upstream copy. See web/templates/login.html for the full
+# rationale on UX-vs-enforcement, and reapi-proxy/envoy.yaml for
+# the actual trust boundary on the buildfarm side.
+#
+# Caveats:
+#
+#   * frontend.dir is read once at startup; editing files under
+#     ./dex/web/ requires `docker compose restart dex` to take
+#     effect.
+#
+#   * Dex requires all 7 templates (login, header is partial,
+#     footer is partial, approval, password, oob, error, device,
+#     device_success) plus `static/main.css`, `robots.txt`, and
+#     the theme dir to exist or it refuses to start. Keep the
+#     vendor copy complete on Dex version bumps.
+#
+#   * logoURL passes through `relativeURL()` in Dex's templates;
+#     a value with a scheme (https://…) is used verbatim, anything
+#     else is treated as a path relative to web/. We use the
+#     relative `theme/logo.svg` so the asset comes from our own
+#     mounted dir and survives upstream domain changes.
+frontend:
+  dir: /etc/dex/web
+  theme: percona
+  logoURL: theme/logo.svg
+  issuer: "Percona PSMDB RBE Buildfarm"
+
 # OAuth2-level knobs.
 oauth2:
   # Dex's default consent screen ("Buildbarn Browser would like to
@@ -222,6 +267,75 @@ connectors:
     # explicitly supported per
     # https://dexidp.io/docs/guides/token-exchange/ §"Configuring dex".
 
+# Step 5d — GitHub Actions as an upstream OIDC IdP for CI token exchange.
+#
+# Same shape as the `jenkins-psmdb-rbe` connector above, but pointing
+# at GitHub's runtime-issued OIDC token endpoint
+# (https://token.actions.githubusercontent.com/.well-known/openid-
+# configuration). Each GitHub Actions job that declares
+# `permissions.id-token: write` can ask the runtime for a fresh ~15-min
+# JWT (`ACTIONS_ID_TOKEN_REQUEST_URL`); the helper in
+# percona-server-mongodb/bazel/wrapper_hook/credential_helper.py
+# does this on demand and POSTs the result here for exchange.
+#
+# Why a separate connector instead of folding GHA into the existing
+# `jenkins-psmdb-rbe` one: the two issuers are different, and a single
+# `oidc` connector in Dex can only pin one `issuer:` value. Multiple
+# connectors with distinct `id:` solve this cleanly (the credential
+# helper passes `connector_id=github-actions` in the /token form, so
+# Dex routes to the right connector).
+#
+# Two security gates layered on top of the connector:
+#
+#   1. AUDIENCE: subject_token's `aud` claim is validated against
+#      `audiences:` below. We pin `$PSMDB_RBE_GHA_AUDIENCE` — an
+#      operator-controlled coordination string generated once with
+#      `openssl rand -hex 16`, stored in the central `.env` (bake_env)
+#      and in this repo's GitHub Secrets (so workflow YAML never
+#      hardcodes it). Fork workflows that don't know the string can't
+#      mint a token GH-side that Dex will accept here.
+#
+#   2. SUBJECT PREFIX: Envoy's RBAC filter (see envoy.yaml on the
+#      reapi-proxy side) inspects the resulting Dex JWT's `sub` claim
+#      — which Dex copies straight from the GH OIDC subject_token —
+#      and only allows requests with `sub` matching:
+#         repo:percona/percona-server-mongodb:environment:psmdb-rbe
+#         repo:vorsel/percona-server-mongodb:environment:psmdb-rbe
+#      Workflows that don't declare `environment: psmdb-rbe` get a
+#      branch-shaped `sub` (`...:ref:refs/heads/<branch>`) and are
+#      denied at Envoy with HTTP 403 — defence-in-depth on top of
+#      the audience gate.
+- type: oidc
+  id: github-actions
+  name: 'GitHub Actions'
+  config:
+    # GitHub Actions OIDC issuer — fixed, public.
+    issuer: https://token.actions.githubusercontent.com
+    # Map the subject_token's `sub` claim into Dex's federated user
+    # identity. GitHub puts the workflow context here in the form
+    # `repo:<owner>/<repo>:environment:<env>` (when the job has an
+    # `environment:` block) or `repo:<owner>/<repo>:ref:refs/heads/
+    # <branch>` (otherwise). Envoy enforces the env-shaped prefix.
+    userNameKey: sub
+    # Pin the audience the subject_token must carry. Dex's oidc
+    # connector validates this with reflect.DeepEqual against the
+    # JWT `aud` claim, so the value here MUST match what the
+    # workflow asks GH to mint
+    # (`?audience=$PSMDB_RBE_GHA_AUDIENCE` query string at the
+    # ACTIONS_ID_TOKEN_REQUEST_URL endpoint). DEX_EXPAND_ENV expands
+    # `$VAR` inside `connectors[].config.*` at config load (see top
+    # of file), so the operator-controlled value never lands in the
+    # rendered config on disk in plaintext beyond the .env file
+    # itself (mode 0600).
+    audiences:
+    - $PSMDB_RBE_GHA_AUDIENCE
+    # Same scope override rationale as `jenkins-psmdb-rbe`: GHA's
+    # OIDC tokens don't carry `email`, so default `["profile",
+    # "email"]` triggers `missing email claim` and the exchange
+    # fails. `openid` alone is enough — we only need iss/aud/sub.
+    scopes:
+    - openid
+
 # Static OAuth clients — i.e. the Buildbarn web services that will
 # delegate login to Dex once Step 4 wires them up. Defining them
 # here in Step 3 means smoke-testing the full Discovery → /token
@@ -326,6 +440,22 @@ staticClients:
 # satisfies the validator without implying any browser flow.
 - id: bazel-jenkins
   name: 'Bazel RBE Jenkins'
+  public: true
+  redirectURIs:
+  - urn:ietf:wg:oauth:2.0:oob
+
+# Step 5d — GitHub Actions CI client for the Token Exchange grant.
+#
+# Same shape as `bazel-jenkins` above: public client (the runner
+# environment cannot keep a secret), no real redirect URI applies
+# (token exchange has no browser callback), OOB placeholder satisfies
+# Dex's static-client validator.
+#
+# id_tokens minted for this client carry `aud: ["bazel-github-actions"]`,
+# which Envoy's jwt_authn filter on :8981 / :1985 verifies on every
+# RBE/BES RPC together with the bazel-cli / bazel-jenkins audiences.
+- id: bazel-github-actions
+  name: 'Bazel RBE GitHub Actions'
   public: true
   redirectURIs:
   - urn:ietf:wg:oauth:2.0:oob

@@ -337,6 +337,22 @@ preflight() {
   ok "GitHub OAuth client ID captured (${#GITHUB_OAUTH_CLIENT_ID} chars)"
   ok "GitHub OAuth client secret captured (${#GITHUB_OAUTH_CLIENT_SECRET} chars)"
 
+  # Step 5d — coordination string for the GitHub Actions OIDC tier
+  # (see dex.yaml `github-actions` connector and envoy.yaml RBAC
+  # policies). Operator generates this once per buildfarm with
+  # `openssl rand -hex 16` and stores it in their local .env beside
+  # the other operator-controlled secrets (HCLOUD_TOKEN, GITHUB_OAUTH_*).
+  # We treat it as a soft secret: the script never echoes the value,
+  # bake_env writes it to the central .env (mode 0600), and workflow
+  # authors reference it via `${{ secrets.PSMDB_RBE_GHA_AUDIENCE }}`
+  # so GitHub auto-masks it in workflow logs. The same value MUST
+  # also be stored as a GitHub repo/org secret named
+  # PSMDB_RBE_GHA_AUDIENCE on every repository whose workflows are
+  # expected to drive the buildfarm.
+  [[ -n "${PSMDB_RBE_GHA_AUDIENCE:-}" ]] \
+    || die "PSMDB_RBE_GHA_AUDIENCE env var is required"
+  ok "PSMDB_RBE_GHA_AUDIENCE captured (${#PSMDB_RBE_GHA_AUDIENCE} chars)"
+
   # Optional .env backup file used to preserve secrets across a fresh-VM
   # deployment (cross-project warm-CAS migration is the canonical use
   # case; see PRESERVE_ENV_FROM doc near the top of this file).
@@ -1380,6 +1396,7 @@ REMOTE
     "NETWORK_ID='$NETWORK_ID'" \
     "GITHUB_OAUTH_CLIENT_ID='$GITHUB_OAUTH_CLIENT_ID'" \
     "GITHUB_OAUTH_CLIENT_SECRET='$GITHUB_OAUTH_CLIENT_SECRET'" \
+    "PSMDB_RBE_GHA_AUDIENCE='$PSMDB_RBE_GHA_AUDIENCE'" \
     "bash -se" <<'REMOTE'
 set -euo pipefail
 
@@ -1482,6 +1499,9 @@ HCLOUD_TOKEN=$HCLOUD_TOKEN
 # App on github.com, re-export and re-run this script.
 GITHUB_OAUTH_CLIENT_ID=$GITHUB_OAUTH_CLIENT_ID
 GITHUB_OAUTH_CLIENT_SECRET=$GITHUB_OAUTH_CLIENT_SECRET
+# Step 5d — GitHub Actions OIDC audience coordination string. Read by
+# Dex's github-actions connector via DEX_EXPAND_ENV.
+PSMDB_RBE_GHA_AUDIENCE=$PSMDB_RBE_GHA_AUDIENCE
 # OIDC — per-Buildbarn-service client secrets. Generated once on first
 # run and pulled forward on every re-run (see PREV_*_SECRET above).
 BB_BROWSER_OIDC_SECRET=$BB_BROWSER_OIDC_SECRET
