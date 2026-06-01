@@ -275,25 +275,33 @@ static_resources:
           #       b = (bytes([0x0A, len(uid)]) + uid.encode()
           #          + bytes([0x12, len(conn)]) + conn.encode())
           #       return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
-          #   print(sub("repo:percona/percona-server-mongodb:environment:psmdb-rbe"))
-          #   print(sub("repo:vorsel/percona-server-mongodb:environment:psmdb-rbe"))
+          #   # One (owner, env) pair per RBAC principal below.
+          #   for owner, env in (
+          #       ("percona",  "rbe"), ("percona",  "rbe-external"),
+          #       ("vorsel",   "rbe"), ("vorsel",   "rbe-external"),
+          #       ("plebioda", "psmdb-rbe"),
+          #       ("plebioda", "rbe"), ("plebioda", "rbe-external"),
+          #   ):
+          #       print(owner, env,
+          #             sub(f"repo:{owner}/percona-server-mongodb:environment:{env}"))
           #   PY
           #
           # Recompute when any of:
           #   * a repository slug is added/removed/renamed (e.g. a new
           #     contributor's permanent dev fork joins the allowlist),
-          #   * the `psmdb-rbe` GitHub deployment environment is
-          #     renamed,
+          #   * a GitHub deployment environment name in the allowlist
+          #     is renamed (currently `rbe` / `rbe-external`, plus
+          #     `psmdb-rbe` on the plebioda dev fork),
           #   * the Dex `connectors[].id` for GH Actions is renamed
           #     (currently `github-actions` — see dex.yaml).
           #
-          # Allowed federated subjects are EXACTLY the two repos ×
-          # the `psmdb-rbe` GitHub deployment environment. The repo-
-          # owner list is explicit (no wildcard) — adding a new
-          # contributor's fork means editing this file and
-          # re-running create-central.sh, which is intentional:
-          # the buildfarm is a cost / capacity resource and we
-          # want a human review step on the grant.
+          # Allowed federated subjects are an EXPLICIT allowlist of
+          # (repo-owner, deployment-environment) pairs — one RBAC
+          # principal per pair, no wildcard. Adding a new contributor's
+          # fork (or a new env on an existing fork) means editing this
+          # file and re-running create-central.sh, which is
+          # intentional: the buildfarm is a cost / capacity resource
+          # and we want a human review step on the grant.
           #
           # Failure mode: a request with an unmatched principal
           # gets HTTP 403 from this filter, before reaching the
@@ -343,7 +351,7 @@ static_resources:
                   # ability (the alternative would be a single
                   # policy with OR'd principals which obscures the
                   # repo allowlist in audit logs).
-                  gha_percona_psmdb:
+                  gha_percona_rbe:
                     permissions:
                     - any: true
                     principals:
@@ -362,7 +370,7 @@ static_resources:
                         # url blob and not the readable repo path.
                         # Decoded: protobuf marshal of
                         #   IDTokenSubject{
-                        #     user_id: "repo:percona/percona-server-mongodb:environment:psmdb-rbe",
+                        #     user_id: "repo:percona/percona-server-mongodb:environment:rbe",
                         #     conn_id: "github-actions",
                         #   }
                         # then base64url-encoded without padding.
@@ -373,8 +381,8 @@ static_resources:
                             - key: sub
                             value:
                               string_match:
-                                exact: 'CjlyZXBvOnBlcmNvbmEvcGVyY29uYS1zZXJ2ZXItbW9uZ29kYjplbnZpcm9ubWVudDpwc21kYi1yYmUSDmdpdGh1Yi1hY3Rpb25z'
-                  gha_vorsel_psmdb:
+                                exact: 'CjNyZXBvOnBlcmNvbmEvcGVyY29uYS1zZXJ2ZXItbW9uZ29kYjplbnZpcm9ubWVudDpyYmUSDmdpdGh1Yi1hY3Rpb25z'
+                  gha_percona_rbe_external:
                     permissions:
                     - any: true
                     principals:
@@ -393,7 +401,45 @@ static_resources:
                         # url blob and not the readable repo path.
                         # Decoded: protobuf marshal of
                         #   IDTokenSubject{
-                        #     user_id: "repo:vorsel/percona-server-mongodb:environment:psmdb-rbe",
+                        #     user_id: "repo:percona/percona-server-mongodb:environment:rbe-external",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        #
+                        # NOTE: this env is GitHub-protected (required
+                        # reviewers). Approval gating is enforced at the
+                        # GitHub layer BEFORE the OIDC subject_token is
+                        # minted; by the time a JWT reaches this RBAC
+                        # check the human approval has already passed,
+                        # so we just trust the (owner, env) tuple here.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjxyZXBvOnBlcmNvbmEvcGVyY29uYS1zZXJ2ZXItbW9uZ29kYjplbnZpcm9ubWVudDpyYmUtZXh0ZXJuYWwSDmdpdGh1Yi1hY3Rpb25z'
+                  gha_vorsel_rbe:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:vorsel/percona-server-mongodb:environment:rbe",
                         #     conn_id: "github-actions",
                         #   }
                         # then base64url-encoded without padding.
@@ -404,7 +450,45 @@ static_resources:
                             - key: sub
                             value:
                               string_match:
-                                exact: 'CjhyZXBvOnZvcnNlbC9wZXJjb25hLXNlcnZlci1tb25nb2RiOmVudmlyb25tZW50OnBzbWRiLXJiZRIOZ2l0aHViLWFjdGlvbnM'
+                                exact: 'CjJyZXBvOnZvcnNlbC9wZXJjb25hLXNlcnZlci1tb25nb2RiOmVudmlyb25tZW50OnJiZRIOZ2l0aHViLWFjdGlvbnM'
+                  gha_vorsel_rbe_external:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:vorsel/percona-server-mongodb:environment:rbe-external",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        #
+                        # NOTE: this env is GitHub-protected (required
+                        # reviewers). Approval gating is enforced at the
+                        # GitHub layer BEFORE the OIDC subject_token is
+                        # minted; by the time a JWT reaches this RBAC
+                        # check the human approval has already passed,
+                        # so we just trust the (owner, env) tuple here.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjtyZXBvOnZvcnNlbC9wZXJjb25hLXNlcnZlci1tb25nb2RiOmVudmlyb25tZW50OnJiZS1leHRlcm5hbBIOZ2l0aHViLWFjdGlvbnM'
                   gha_plebioda_psmdb:
                     permissions:
                     - any: true
@@ -668,7 +752,7 @@ static_resources:
                         value:
                           string_match:
                             exact: bazel-jenkins
-                  gha_percona_psmdb:
+                  gha_percona_rbe:
                     permissions:
                     - any: true
                     principals:
@@ -687,7 +771,7 @@ static_resources:
                         # url blob and not the readable repo path.
                         # Decoded: protobuf marshal of
                         #   IDTokenSubject{
-                        #     user_id: "repo:percona/percona-server-mongodb:environment:psmdb-rbe",
+                        #     user_id: "repo:percona/percona-server-mongodb:environment:rbe",
                         #     conn_id: "github-actions",
                         #   }
                         # then base64url-encoded without padding.
@@ -698,8 +782,8 @@ static_resources:
                             - key: sub
                             value:
                               string_match:
-                                exact: 'CjlyZXBvOnBlcmNvbmEvcGVyY29uYS1zZXJ2ZXItbW9uZ29kYjplbnZpcm9ubWVudDpwc21kYi1yYmUSDmdpdGh1Yi1hY3Rpb25z'
-                  gha_vorsel_psmdb:
+                                exact: 'CjNyZXBvOnBlcmNvbmEvcGVyY29uYS1zZXJ2ZXItbW9uZ29kYjplbnZpcm9ubWVudDpyYmUSDmdpdGh1Yi1hY3Rpb25z'
+                  gha_percona_rbe_external:
                     permissions:
                     - any: true
                     principals:
@@ -718,7 +802,45 @@ static_resources:
                         # url blob and not the readable repo path.
                         # Decoded: protobuf marshal of
                         #   IDTokenSubject{
-                        #     user_id: "repo:vorsel/percona-server-mongodb:environment:psmdb-rbe",
+                        #     user_id: "repo:percona/percona-server-mongodb:environment:rbe-external",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        #
+                        # NOTE: this env is GitHub-protected (required
+                        # reviewers). Approval gating is enforced at the
+                        # GitHub layer BEFORE the OIDC subject_token is
+                        # minted; by the time a JWT reaches this RBAC
+                        # check the human approval has already passed,
+                        # so we just trust the (owner, env) tuple here.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjxyZXBvOnBlcmNvbmEvcGVyY29uYS1zZXJ2ZXItbW9uZ29kYjplbnZpcm9ubWVudDpyYmUtZXh0ZXJuYWwSDmdpdGh1Yi1hY3Rpb25z'
+                  gha_vorsel_rbe:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:vorsel/percona-server-mongodb:environment:rbe",
                         #     conn_id: "github-actions",
                         #   }
                         # then base64url-encoded without padding.
@@ -729,7 +851,45 @@ static_resources:
                             - key: sub
                             value:
                               string_match:
-                                exact: 'CjhyZXBvOnZvcnNlbC9wZXJjb25hLXNlcnZlci1tb25nb2RiOmVudmlyb25tZW50OnBzbWRiLXJiZRIOZ2l0aHViLWFjdGlvbnM'
+                                exact: 'CjJyZXBvOnZvcnNlbC9wZXJjb25hLXNlcnZlci1tb25nb2RiOmVudmlyb25tZW50OnJiZRIOZ2l0aHViLWFjdGlvbnM'
+                  gha_vorsel_rbe_external:
+                    permissions:
+                    - any: true
+                    principals:
+                    - and_ids:
+                        ids:
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: aud
+                            value:
+                              string_match:
+                                exact: bazel-github-actions
+                        # See the giant comment on the rbac filter
+                        # above for why this matches an opaque base64-
+                        # url blob and not the readable repo path.
+                        # Decoded: protobuf marshal of
+                        #   IDTokenSubject{
+                        #     user_id: "repo:vorsel/percona-server-mongodb:environment:rbe-external",
+                        #     conn_id: "github-actions",
+                        #   }
+                        # then base64url-encoded without padding.
+                        #
+                        # NOTE: this env is GitHub-protected (required
+                        # reviewers). Approval gating is enforced at the
+                        # GitHub layer BEFORE the OIDC subject_token is
+                        # minted; by the time a JWT reaches this RBAC
+                        # check the human approval has already passed,
+                        # so we just trust the (owner, env) tuple here.
+                        - metadata:
+                            filter: envoy.filters.http.jwt_authn
+                            path:
+                            - key: jwt_payload
+                            - key: sub
+                            value:
+                              string_match:
+                                exact: 'CjtyZXBvOnZvcnNlbC9wZXJjb25hLXNlcnZlci1tb25nb2RiOmVudmlyb25tZW50OnJiZS1leHRlcm5hbBIOZ2l0aHViLWFjdGlvbnM'
                   gha_plebioda_psmdb:
                     permissions:
                     - any: true
