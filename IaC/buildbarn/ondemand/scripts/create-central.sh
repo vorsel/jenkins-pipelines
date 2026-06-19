@@ -756,6 +756,23 @@ bootstrap_host() {
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+# Disable Hetzner's regional mirror before ANY apt-get runs. mirror.hetzner.com
+# periodically serves mid-sync indexes — 404 / "File has unexpected size ...
+# Mirror sync in progress?" on trixie-backports — which makes `apt-get update`
+# exit non-zero and, under the `set -e` above, aborts this whole step. The
+# stock Hetzner Debian 13 image already ships deb.debian.org in debian.sources,
+# so we disable the Hetzner drop-ins rather than rewrite them (rewriting
+# duplicates debian.sources → "configured multiple times" flood). Guard on
+# debian.sources so we never strip all sources; idempotent. NB: re-running this
+# script also cleans up a host where the mirror files were previously rewritten
+# (disable-by-filename catches them regardless of their current URL).
+if [ -s /etc/apt/sources.list.d/debian.sources ]; then
+  for f in /etc/apt/sources.list.d/*hetzner*.sources /etc/apt/sources.list.d/*hetzner*.list; do
+    [ -e "$f" ] || continue
+    mv -f "$f" "$f.disabled"
+  done
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "  installing docker via get.docker.com …"
   curl -fsSL https://get.docker.com | sh

@@ -17,6 +17,26 @@
 fqdn: __WORKER_HOSTNAME__
 hostname: __WORKER_HOSTNAME__
 
+# Disable Hetzner's regional mirror BEFORE any apt module runs.
+# mirror.hetzner.com periodically serves mid-sync indexes — 404 / "File has
+# unexpected size ... Mirror sync in progress?" on trixie-backports — which
+# fails `apt update` and the get.docker.com installer, leaving the VM without
+# docker. The stock Hetzner Debian 13 image already ships deb.debian.org
+# (globally load-balanced) in debian.sources, so we disable the Hetzner
+# drop-ins rather than rewrite them (rewriting duplicates debian.sources and
+# floods apt with "configured multiple times"). Guard on debian.sources so we
+# never strip all sources. bootcmd runs in the init stage (before
+# package_update / packages / runcmd) on every boot; idempotent.
+bootcmd:
+  - |
+    set -e
+    if [ -s /etc/apt/sources.list.d/debian.sources ]; then
+      for f in /etc/apt/sources.list.d/*hetzner*.sources /etc/apt/sources.list.d/*hetzner*.list; do
+        [ -e "$f" ] || continue
+        mv -f "$f" "$f.disabled"
+      done
+    fi
+
 package_update: true
 package_upgrade: false
 packages:
@@ -68,18 +88,36 @@ runcmd:
   - sysctl -w fs.aio-max-nr=1048576
   - sysctl -w fs.file-max=6815744
 
-  # Docker. We use get.docker.com for parity with the central node's
-  # bootstrap; the script is maintained by Docker Inc. and handles
-  # Debian/Ubuntu/Amazon Linux uniformly.
-  - curl -fsSL https://get.docker.com | sh
-  - systemctl enable --now docker
+  # Docker, fail-closed. We use get.docker.com for parity with the central
+  # node's bootstrap; the script is maintained by Docker Inc. and handles
+  # Debian/Ubuntu/Amazon Linux uniformly. runcmd entries don't abort on
+  # failure, so a broken install used to fall through to the .ok sentinel and
+  # let spawn-worker.sh rsync a stack onto a VM with no docker. Wrap it in one
+  # POSIX-sh block (no `pipefail`, hence download-then-exec) that retries and
+  # only touches the sentinel once docker is confirmed active.
+  - |
+    set -e
+    fail() { echo "cloud-init bootstrap FAILED: $1" >&2; touch /run/bb-worker.cloud-init.failed; exit 1; }
 
-  # Workdir; scripts/spawn-worker.sh rsyncs the compose stack into here.
-  - mkdir -p /opt/buildbarn/config /opt/buildbarn/volumes
+    ok=0
+    for attempt in 1 2 3; do
+      if curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && sh /tmp/get-docker.sh; then
+        ok=1; break
+      fi
+      echo "docker install attempt $attempt failed; retry in 15s" >&2
+      sleep 15
+    done
+    [ "$ok" = 1 ] || fail "docker install failed after 3 attempts"
 
-  # Sentinel for spawn-worker.sh to detect "cloud-init finished". `cloud-init
-  # status --wait` is the canonical way, but having a dedicated file means
-  # the script can add a fast path if cloud-init is slow.
-  - touch /run/bb-worker.cloud-init.ok
+    systemctl enable --now docker || fail "could not enable docker.service"
+    systemctl is-active --quiet docker || fail "docker.service not active after enable"
+
+    # Workdir; scripts/spawn-worker.sh rsyncs the compose stack into here.
+    mkdir -p /opt/buildbarn/config /opt/buildbarn/volumes
+
+    # Sentinel for spawn-worker.sh to detect "cloud-init finished". `cloud-init
+    # status --wait` is the canonical way, but having a dedicated file means
+    # the script can add a fast path if cloud-init is slow.
+    touch /run/bb-worker.cloud-init.ok
 
 final_message: "bb-psmdb-worker cloud-init done in $UPTIME s"

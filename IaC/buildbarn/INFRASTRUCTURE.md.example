@@ -435,7 +435,7 @@ export HCLOUD_TOKEN_FILE="$HOME/.config/psmdb-rbe/hcloud.token"  # preferred (fi
 # hcloud floating-ip describe bb-psmdb-central -o format='{{.ID}}'
 export NETWORK_ID=12197477                  # psmdb-bazel-rbe (10.30.246.0/24)
 export SSH_KEY_IDS="111911127"              # bb-psmdb-ssh (operator's pubkey)
-export FLOATING_IP_ID=129643630             # bb-psmdb-central → 95.217.244.101
+export FLOATING_IP_ID=129643630             # bb-psmdb-central → 95.217.242.120
 export VOLUME_ID=105484418                  # CAS volume — same numeric ID after cross-project transfer
 
 # ---------- Server config ----------

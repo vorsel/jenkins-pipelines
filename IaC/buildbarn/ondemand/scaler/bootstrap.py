@@ -158,6 +158,29 @@ def render_user_data(
 fqdn: {worker_hostname}
 hostname: {worker_hostname}
 
+# Disable Hetzner's regional mirror BEFORE any apt module runs. mirror.hetzner.com
+# periodically serves mid-sync indexes — 404 / "File has unexpected size ...
+# Mirror sync in progress?" on trixie-backports — which fails `apt update`,
+# fails the get.docker.com installer's own apt-get update, and leaves the VM a
+# non-registering zombie the scaler can't distinguish from a healthy worker.
+# The stock Hetzner Debian 13 image already ships deb.debian.org (globally
+# load-balanced, never desynced in any incident we've seen) in debian.sources,
+# so we simply disable the Hetzner drop-ins rather than rewrite them — rewriting
+# their URL to deb.debian.org duplicates debian.sources and floods apt with
+# "configured multiple times" warnings. Guard on debian.sources so we never
+# strip the box of all sources. bootcmd runs in the init stage (before
+# package_update / packages / runcmd) on every boot; idempotent (renamed files
+# no longer match the *.sources / *.list globs).
+bootcmd:
+  - |
+    set -e
+    if [ -s /etc/apt/sources.list.d/debian.sources ]; then
+      for f in /etc/apt/sources.list.d/*hetzner*.sources /etc/apt/sources.list.d/*hetzner*.list; do
+        [ -e "$f" ] || continue
+        mv -f "$f" "$f.disabled"
+      done
+    fi
+
 package_update: true
 package_upgrade: false
 packages:
@@ -222,21 +245,51 @@ runcmd:
   - sysctl -w fs.aio-max-nr=1048576
   - sysctl -w fs.file-max=6815744
 
-  # Docker, same shared installer as the central.
-  - curl -fsSL https://get.docker.com | sh
-  - systemctl enable --now docker
+  # Docker install + stack bring-up, fail-closed. Each runcmd entry runs
+  # independently and a failure does NOT abort the rest, so historically a
+  # broken docker install still fell through to `touch .ready` and advertised
+  # a dead worker. Wrap the whole critical path in one POSIX-sh block that
+  # only touches the readiness sentinel after a container is confirmed
+  # running; on any failure it drops a .failed sentinel instead. (POSIX sh —
+  # no `pipefail` — so we download-then-exec the docker script rather than
+  # piping curl into sh, otherwise a curl failure would be masked by sh's
+  # exit code.)
+  - |
+    set -e
+    fail() {{ echo "bb-worker bootstrap FAILED: $1" >&2; touch /run/bb-worker.failed; exit 1; }}
 
-  # Runtime dirs that bb-worker / runner-installer won't auto-create.
-  - mkdir -p /opt/buildbarn/volumes/worker/build /opt/buildbarn/volumes/worker/cache /opt/buildbarn/volumes/bb
+    # get.docker.com runs its own `apt-get update`, which can still catch a
+    # transient hiccup even with deb.debian.org pinned — retry a few times.
+    ok=0
+    for attempt in 1 2 3; do
+      if curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && sh /tmp/get-docker.sh; then
+        ok=1; break
+      fi
+      echo "docker install attempt $attempt failed; retry in 15s" >&2
+      sleep 15
+    done
+    [ "$ok" = 1 ] || fail "docker install failed after 3 attempts"
 
-  # Bring the stack up. No `pull` step — `up` pulls what's missing, which is
-  # faster on a fresh VM (all three images are absent).
-  - cd /opt/buildbarn && docker compose up -d
+    systemctl enable --now docker || fail "could not enable docker.service"
 
-  # Sentinel for the scaler (or an operator) to verify cloud-init reached the
-  # end successfully — we use this instead of `cloud-init status --wait`
-  # because a failure inside runcmd still produces status=done.
-  - touch /run/bb-worker.ready
+    # Runtime dirs that bb-worker / runner-installer won't auto-create.
+    mkdir -p /opt/buildbarn/volumes/worker/build /opt/buildbarn/volumes/worker/cache /opt/buildbarn/volumes/bb
+
+    # Bring the stack up. No `pull` step — `up` pulls what's missing, which is
+    # faster on a fresh VM (all three images are absent).
+    cd /opt/buildbarn
+    docker compose up -d || fail "docker compose up failed"
+
+    # `up -d` exits 0 even when a container immediately crash-loops or exits,
+    # so verify at least one container is actually running before signalling
+    # ready. This is what keeps the scaler from counting a dead VM as capacity.
+    sleep 5
+    [ -n "$(docker compose ps -q 2>/dev/null)" ] || {{ docker compose ps >&2 || true; fail "no running container after 'compose up -d'"; }}
+
+    # Sentinel for the scaler (or an operator) to verify cloud-init reached the
+    # end successfully — we use this instead of `cloud-init status --wait`
+    # because a failure inside runcmd still produces status=done.
+    touch /run/bb-worker.ready
 
 final_message: "bb-psmdb-worker (scaler-spawned) cloud-init done in $UPTIME s"
 """
