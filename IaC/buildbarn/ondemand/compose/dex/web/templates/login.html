@@ -1,0 +1,48 @@
+{{ template "header.html" . }}
+
+{{/*
+  Whitelist of connector IDs that make sense to invoke from a browser.
+  Dex stores connector configs once per connector, regardless of how
+  the connector is meant to be reached: the same `oidc` connector that
+  validates the GitHub Actions / Jenkins token-exchange subject tokens
+  also gets rendered as a clickable button on this page if we don't
+  filter. Those buttons would only ever fail (or, worse, work in
+  unintended ways — Jenkins Percona's OIDC plugin can be coaxed into
+  an interactive flow that lets a human get an `aud=bazel-cli` JWT
+  while bypassing the Dex GitHub-team membership check at the front
+  door).
+
+  Whitelisting (rather than blacklisting the two known-bad IDs) keeps
+  this default-deny: when someone later adds a fourth `oidc` connector
+  for the next token-exchange peer, it stays hidden until that file is
+  updated alongside it. Visible bug at deploy beats silent exposure.
+
+  Note: this is UX, not enforcement. A user who knows the connector ID
+  can still craft `/auth?client_id=…&connector_id=jenkins-percona` by
+  hand. The real trust boundary lives at the upstream IdP (GitHub team
+  membership for `github`; Jenkins user auth for `jenkins-percona`;
+  GitHub Actions sub claim for `github-actions`) plus the Envoy RBAC
+  sub-prefix gate on the buildfarm side. See reapi-proxy/envoy.yaml
+  Step 5d comments for the full trust model.
+*/}}
+{{ $interactive := list "github" }}
+
+<div class="theme-panel">
+  <h2 class="theme-heading">Log in to {{ issuer }} </h2>
+  <div>
+    {{ range $c := .Connectors }}
+      {{ if has $c.ID $interactive }}
+      <div class="theme-form-row">
+        <a href="{{ $c.URL }}" target="_self">
+          <button class="dex-btn theme-btn-provider">
+            <span class="dex-btn-icon dex-btn-icon--{{ $c.Type }}"></span>
+            <span class="dex-btn-text">Log in with {{ $c.Name }}</span>
+          </button>
+        </a>
+      </div>
+      {{ end }}
+    {{ end }}
+  </div>
+</div>
+
+{{ template "footer.html" . }}
