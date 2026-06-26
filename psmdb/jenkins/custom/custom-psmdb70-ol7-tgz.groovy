@@ -10,7 +10,7 @@ void buildStage(String DOCKER_OS, String STAGE_PARAM) {
             ls -laR ./
             rm -rf test/*
             mkdir -p test
-            wget \$(echo ${GIT_REPO} | sed -re 's|github.com|raw.githubusercontent.com|; s|\\.git\$||')/${GIT_BRANCH}/percona-packaging/scripts/psmdb_builder.sh -O psmdb_builder.sh
+            wget \$(echo ${BS_GIT_REPO} | sed -re 's|github.com|raw.githubusercontent.com|; s|\\.git\$||')/${BS_GIT_BRANCH}/percona-packaging/scripts/psmdb_builder.sh -O psmdb_builder.sh
             pwd -P
             ls -laR
             export build_dir=\$(pwd -P)
