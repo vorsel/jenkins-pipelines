@@ -775,12 +775,21 @@ linker bottleneck), revisit option (1) first — it's an order of
 magnitude smaller change than (2) and removes the `coefficient`
 issue at the source instead of routing around it.
 
+### AWS Graviton fallback (PoC)
+
+When `cax31` is exhausted in every Hetzner region (the recurring
+hours-long aarch64 hang — §11.1), the scaler can fall back to AWS
+Graviton (`c7g`) workers that reach the central over a WireGuard
+tunnel. Disabled by default (`aws.enabled: false`). Design, prereqs,
+and setup runbook: [`../aws-graviton-fallback.md`](../aws-graviton-fallback.md).
+Stand up the hub with [`scripts/setup-wireguard-hub.sh`](scripts/setup-wireguard-hub.sh).
+
 ### Follow-ups still open
 
 - [ ] If GHA capacity for `cax31` becomes a bottleneck, generalise
   the scaler's region round-robin to a `(server_type, region)`
   round-robin so a stuck `cax31` order can fall back to
-  `cax21` / `cax41`.
+  `cax21` / `cax41` (and then to AWS — see the Graviton fallback above).
 - [ ] If we ever need debian-bookworm on arm64, add a
   `debian-bookworm-aarch64` source dir + matrix entry in the GHA
   workflow first; the manifest list will then carry both arches and

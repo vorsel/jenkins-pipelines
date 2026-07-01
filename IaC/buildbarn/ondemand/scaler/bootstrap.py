@@ -311,6 +311,174 @@ final_message: "bb-psmdb-worker (scaler-spawned) cloud-init done in $UPTIME s"
     return bootstrap_yaml
 
 
+def render_aws_user_data(
+    *,
+    worker_src: Path,
+    worker_hostname: str,
+    central_private_ip: str,
+    central_public_url: str,
+    pool_name: str,
+    runner_image: str,
+    bazel_pool_value: str,
+    container_image: str,
+    wg_private_key: str,
+    wg_tunnel_ip: str,
+    wg_hub_pubkey: str,
+    wg_hub_endpoint: str,
+    wg_allowed_ips: str,
+) -> str:
+    """Cloud-init for an AWS Graviton fallback worker.
+
+    Same worker docker-compose stack as the Hetzner path — the worker still
+    dials `central_private_ip:8980/8983`. The ONLY difference is a WireGuard
+    prologue: the worker brings up wg0 (Address = its tunnel IP, Peer = the
+    central hub) and `AllowedIPs` routes the central's private IP THROUGH the
+    tunnel. So worker.jsonnet / common.libsonnet are byte-identical to the
+    Hetzner case — packets to the private IP just take the wg hop. The scaler
+    must have registered this worker's PUBLIC key on the hub BEFORE the
+    instance boots (see scaler.py + wireguard.py).
+
+    Targets a Canonical Ubuntu arm64 AMI: WireGuard is in-kernel, wg-quick
+    ships with wireguard-tools, and get.docker.com supports Ubuntu uniformly.
+    No Hetzner-mirror disabling (that was Debian/Hetzner-image specific).
+    """
+    for field, val in (
+        ("container_image", container_image), ("runner_image", runner_image),
+        ("bazel_pool_value", bazel_pool_value), ("wg_private_key", wg_private_key),
+        ("wg_tunnel_ip", wg_tunnel_ip), ("wg_hub_pubkey", wg_hub_pubkey),
+        ("wg_hub_endpoint", wg_hub_endpoint), ("wg_allowed_ips", wg_allowed_ips),
+    ):
+        if not val:
+            raise ValueError(f"pool '{pool_name}' AWS spawn: empty {field} — refusing to render")
+
+    subs = {
+        "__CENTRAL_PRIVATE_IP__": central_private_ip,
+        "__CENTRAL_PUBLIC_URL__": central_public_url,
+        "__POOL_NAME__": pool_name,
+        "__WORKER_HOSTNAME__": worker_hostname,
+        "__RUNNER_IMAGE__": runner_image,
+        "__BAZEL_POOL_VALUE__": bazel_pool_value,
+        "__CONTAINER_IMAGE__": container_image,
+    }
+    compose_yml = _read_worker_file(worker_src, "docker-compose.yml", subs)
+    common_libs = _read_worker_file(worker_src, "config/common.libsonnet", subs)
+    worker_js   = _read_worker_file(worker_src, "config/worker.jsonnet", subs)
+    runner_js   = _read_worker_file(worker_src, "config/runner.jsonnet", subs)
+
+    wg_conf = (
+        "[Interface]\n"
+        f"Address = {wg_tunnel_ip}/32\n"
+        f"PrivateKey = {wg_private_key}\n\n"
+        "[Peer]\n"
+        f"PublicKey = {wg_hub_pubkey}\n"
+        f"Endpoint = {wg_hub_endpoint}\n"
+        f"AllowedIPs = {wg_allowed_ips}\n"
+        "PersistentKeepalive = 25\n"
+    )
+
+    bootstrap_yaml = f"""#cloud-config
+# Rendered by scaler/bootstrap.py:render_aws_user_data for a single AWS spawn.
+# Graviton (arm64) fallback worker reaching the central over WireGuard.
+
+fqdn: {worker_hostname}
+hostname: {worker_hostname}
+
+package_update: true
+package_upgrade: false
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - jq
+  - wireguard
+  - wireguard-tools
+
+write_files:
+  - path: /etc/wireguard/wg0.conf
+    permissions: '0600'
+    content: |
+{indent(wg_conf, "      ")}
+
+  - path: /opt/buildbarn/docker-compose.yml
+    permissions: '0644'
+    content: |
+{indent(compose_yml, "      ")}
+
+  - path: /opt/buildbarn/config/common.libsonnet
+    permissions: '0644'
+    content: |
+{indent(common_libs, "      ")}
+
+  - path: /opt/buildbarn/config/worker.jsonnet
+    permissions: '0644'
+    content: |
+{indent(worker_js, "      ")}
+
+  - path: /opt/buildbarn/config/runner.jsonnet
+    permissions: '0644'
+    content: |
+{indent(runner_js, "      ")}
+
+runcmd:
+  # 1) Tunnel FIRST — the worker is useless until it can reach the central's
+  #    private :8980/:8983 over wg. wg-quick installs the AllowedIPs routes.
+  - |
+    set -e
+    fail() {{ echo "bb-worker(aws) bootstrap FAILED: $1" >&2; touch /run/bb-worker.failed; exit 1; }}
+    systemctl enable --now wg-quick@wg0 || fail "wg-quick@wg0 failed to start"
+    # Verify the tunnel can actually reach the central before paying for a
+    # docker pull. 30s budget — handshake + first route should be sub-second.
+    ok=0
+    for _ in $(seq 1 30); do
+      if ping -c1 -W1 {central_private_ip} >/dev/null 2>&1; then ok=1; break; fi
+      sleep 1
+    done
+    [ "$ok" = 1 ] || echo "WARN: central {central_private_ip} not yet pingable over wg — continuing anyway" >&2
+
+  # NB: no repo.ci.percona.com pin here. RBE workers only run remote compile
+  # actions + talk to the central's CAS/scheduler; repo.ci is reached by the
+  # Jenkins agent that launches `bazel build`, links, and pushes packages —
+  # NOT by these workers. So the tunnel routes only the central's private IP.
+
+  # Swap + kernel tuning, same posture as the Hetzner worker.
+  - |
+    if ! swapon --show | grep -q /swapfile; then
+      fallocate -l 32G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+      echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    fi
+  - sysctl -w net.ipv4.tcp_fin_timeout=15
+  - sysctl -w fs.inotify.max_user_watches=10000000
+  - sysctl -w fs.aio-max-nr=1048576
+  - sysctl -w fs.file-max=6815744
+
+  # 2) Docker + stack bring-up, fail-closed (mirrors the Hetzner renderer).
+  - |
+    set -e
+    fail() {{ echo "bb-worker(aws) bootstrap FAILED: $1" >&2; touch /run/bb-worker.failed; exit 1; }}
+    ok=0
+    for attempt in 1 2 3; do
+      if curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && sh /tmp/get-docker.sh; then ok=1; break; fi
+      echo "docker install attempt $attempt failed; retry in 15s" >&2; sleep 15
+    done
+    [ "$ok" = 1 ] || fail "docker install failed after 3 attempts"
+    systemctl enable --now docker || fail "could not enable docker.service"
+    mkdir -p /opt/buildbarn/volumes/worker/build /opt/buildbarn/volumes/worker/cache /opt/buildbarn/volumes/bb
+    cd /opt/buildbarn
+    docker compose up -d || fail "docker compose up failed"
+    sleep 5
+    [ -n "$(docker compose ps -q 2>/dev/null)" ] || {{ docker compose ps >&2 || true; fail "no running container after compose up"; }}
+    touch /run/bb-worker.ready
+
+final_message: "bb-psmdb-worker (aws/wireguard) cloud-init done in $UPTIME s"
+"""
+
+    # NB: EC2's 16 KB user-data ceiling applies to the value AwsOps actually
+    # ships, which is gzip-compressed (cloud-init auto-detects the gzip magic).
+    # The plain YAML here is ~17 KB but compresses to ~4 KB, so the limit is
+    # enforced in AwsOps.create_worker on the compressed payload, not here.
+    return bootstrap_yaml
+
+
 # ---------------------------------------------------------------------------
 # Module self-check — a `python -m scaler.bootstrap` (or `python bootstrap.py`
 # with $WORKER_SRC set) renders a sample user-data to stdout and exits. Very

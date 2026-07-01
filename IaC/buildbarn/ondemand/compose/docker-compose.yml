@@ -532,6 +532,11 @@ services:
       dockerfile: Dockerfile
     image: psmdb-bb-scaler:local
     network_mode: host
+    # NET_ADMIN lets the scaler run `wg set wg0 …` on the HOST's WireGuard hub
+    # (network_mode: host shares the host net namespace) to add/remove AWS
+    # worker peers. No-op unless AWS fallback is enabled.
+    cap_add:
+      - NET_ADMIN
     environment:
       - HCLOUD_TOKEN=${HCLOUD_TOKEN}
       - SCALER_DRY_RUN=${SCALER_DRY_RUN:-true}
@@ -539,6 +544,21 @@ services:
       - POOLS_CONFIG=/config/ondemand-pools.yaml
       - WORKER_SRC=/worker
       - SCHEDULER_STATE_GRPC=127.0.0.1:8984
+      # --- AWS Graviton fallback (inert unless aws.enabled in ondemand-pools.yaml) ---
+      # Credentials: a narrow IAM-user access key (RunInstances/Terminate/
+      # Describe, region+type+tag scoped — mirror the percona-server GHA
+      # fallback policy). The scaler runs on Hetzner, so no instance profile.
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_AMI_ID=${AWS_AMI_ID:-}
+      - AWS_SUBNET_ID=${AWS_SUBNET_ID:-}
+      - AWS_SECURITY_GROUP_IDS=${AWS_SECURITY_GROUP_IDS:-}
+      - AWS_KEY_NAME=${AWS_KEY_NAME:-}
+      # --- WireGuard hub (written by scripts/setup-wireguard-hub.sh) ---
+      - WG_IFACE=${WG_IFACE:-wg0}
+      - WG_HUB_PUBKEY=${WG_HUB_PUBKEY:-}
+      - WG_HUB_ENDPOINT=${WG_HUB_ENDPOINT:-}
+      - WG_ALLOWED_IPS=${WG_ALLOWED_IPS:-}
     volumes:
       - ./config:/config:ro
       - /var/lib/buildbarn/worker:/worker:ro

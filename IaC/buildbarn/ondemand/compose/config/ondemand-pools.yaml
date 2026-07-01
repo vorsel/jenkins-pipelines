@@ -157,6 +157,54 @@ global:
   scale_down_idle_seconds: 600           # 10 min — matches Hetzner per-hour billing granularity
   scale_up_threshold: 1                  # minimum queued ops before we spawn; desired-fleet math (ceil((queued+executing)/concurrency)) runs only once this floor is crossed
 
+# ===========================================================================
+# AWS Graviton fallback (optional). See ../../aws-graviton-fallback.md.
+# ===========================================================================
+# When an aarch64 pool with `aws_instance_type` set exhausts EVERY Hetzner
+# region in region_try_chain (CAX capacity unavailable — the 10-15h-hang
+# problem this addresses), the scaler spawns the pool on AWS Graviton
+# instead. Those workers reach the central over the WireGuard tunnel
+# defined below. Secrets/account-specific values (creds, subnet, SG, AMI,
+# hub pubkey/endpoint) come from .env — only non-secret shape lives here.
+#
+# enabled: false → the whole feature is inert; aws_instance_type on a pool
+#   is ignored and Hetzner exhaustion just logs an error (today's behaviour).
+aws:
+  enabled: true
+  # Fall back to AWS for EVERY aarch64 pool on Hetzner exhaustion (a full build
+  # matrix routes to many distro-specific aarch64 pools — jammy/OL8/OL9/
+  # amazonlinux/bookworm/noble — all of which need fallback, not just a few).
+  # x86_64 pools are never affected. Per-pool `aws_fallback: true` still works
+  # as an explicit opt-in if you ever want to scope it narrower.
+  fallback_all_aarch64: true
+  region: eu-central-1        # closest to hel1 → lowest CAS-over-tunnel latency
+  use_spot: true              # spot is REQUIRED here (workers are interruptible;
+                              #   bb-scheduler re-queues in-flight actions to a
+                              #   replacement on reclaim — see aws-graviton-fallback.md §6)
+  billing_tag: psmdb-worker   # iit-billing-tag: isolates cost + satisfies the
+                              #   percona-dev-admin cleanup Lambdas. AWS infra
+                              #   (subnet/SG) MUST be dedicated so billing doesn't
+                              #   touch existing resources.
+  # Diversified Graviton spot pool. Every type is 8 vCPU / >=32 GB RAM — at
+  # least as good as Hetzner cax31 (8c / 16 GB) on both axes, faster Neoverse
+  # cores. Multiple families (m=32GB, r=64GB, -d adds local NVMe) and
+  # generations (6/7/8) = many spot capacity pools, so no-capacity and
+  # interruption pressure spread out. The scaler tries them in order on
+  # InsufficientInstanceCapacity (like Hetzner's region_try_chain). Mirrors the
+  # proven percona-cd-platform jenkins-arm-fleet set. Per-pool override via the
+  # pool's own `aws_instance_types`.
+  instance_types: [m7g.2xlarge, m6g.2xlarge, m8g.2xlarge, m7gd.2xlarge, m6gd.2xlarge, r7g.2xlarge, r6g.2xlarge, r8g.2xlarge]
+  # subnet_id / security_group_ids / ami_id come from .env
+  # (AWS_SUBNET_ID / AWS_SECURITY_GROUP_IDS / AWS_AMI_ID).
+
+# WireGuard hub on the central. hub_pubkey / hub_endpoint / allowed_ips are
+# written into .env by scripts/setup-wireguard-hub.sh; left here for shape.
+wireguard:
+  iface: wg0
+  cidr: 10.99.0.0/16          # tunnel address pool for AWS workers
+  hub_ip: 10.99.0.1           # the central's tunnel address (reserved)
+  # hub_pubkey / hub_endpoint / allowed_ips: see .env
+
 # Pools. Each key becomes the Hetzner label `psmdb.pool=<key>` on spawned VMs.
 #
 # Current image generation (Phase 2 PoC migration — see
@@ -212,6 +260,10 @@ pools:
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
+    # Opt into AWS Graviton fallback (active only when aws.enabled: true).
+    # Uses the global aws.instance_types pool; override here with
+    # `aws_instance_types: [...]` if this pool needs different shapes.
+    aws_fallback: true
 
   ubuntu-noble-x86_64__v8_3__7517cebc3bd1:
     runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
@@ -230,6 +282,7 @@ pools:
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
+    aws_fallback: true               # Graviton fallback (aws.enabled: true)
 
   ubuntu-noble-x86_64__vmaster__52917c227b04:
     runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-master-52917c227b04255a129d9b5617228c2269662871"
@@ -248,6 +301,7 @@ pools:
     concurrency: 12
     min_nodes: 0
     max_nodes: 5
+    aws_fallback: true               # Graviton fallback (aws.enabled: true)
 
   # ==========================================================================
   # ubuntu-jammy (Ubuntu 22.04) — distro_or_os "ubuntu22"
@@ -613,7 +667,7 @@ pools:
   # debian-trixie (Debian 13) — distro_or_os "debian13" — PSMDB-2028
   # ==========================================================================
   debian-trixie-x86_64__v8_0__1293cbf854b0:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -622,7 +676,7 @@ pools:
     max_nodes: 5
 
   debian-trixie-aarch64__v8_0__1293cbf854b0:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31

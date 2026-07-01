@@ -1,0 +1,96 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RunInstancesInstanceResource",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:eu-central-1:ACCOUNT_ID:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "eu-central-1",
+          "aws:RequestTag/iit-billing-tag": "psmdb-worker",
+          "ec2:InstanceType": [
+            "m7g.2xlarge", "m6g.2xlarge", "m8g.2xlarge", "m7gd.2xlarge",
+            "m6gd.2xlarge", "r7g.2xlarge", "r6g.2xlarge", "r8g.2xlarge"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "RunInstancesSupportingResources",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:eu-central-1::image/*",
+        "arn:aws:ec2:eu-central-1::snapshot/*",
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:network-interface/*",
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:subnet/*",
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:security-group/*",
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:volume/*",
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:key-pair/*",
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:spot-instances-request/*"
+      ],
+      "Condition": {
+        "StringEquals": { "aws:RequestedRegion": "eu-central-1" }
+      }
+    },
+    {
+      "Sid": "TagOnCreateOnly",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:instance/*",
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:volume/*",
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:network-interface/*",
+        "arn:aws:ec2:eu-central-1:ACCOUNT_ID:spot-instances-request/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": "RunInstances",
+          "aws:RequestedRegion": "eu-central-1"
+        }
+      }
+    },
+    {
+      "Sid": "TerminateOwnWorkersOnly",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "arn:aws:ec2:eu-central-1:ACCOUNT_ID:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "eu-central-1",
+          "aws:ResourceTag/iit-billing-tag": "psmdb-worker"
+        }
+      }
+    },
+    {
+      "Sid": "DescribeReadOnlyInRegion",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeImages",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeSpotInstanceRequests",
+        "ec2:DescribeSpotPriceHistory"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:RequestedRegion": "eu-central-1" }
+      }
+    },
+    {
+      "Sid": "GetConsoleOutputForDebug",
+      "Effect": "Allow",
+      "Action": "ec2:GetConsoleOutput",
+      "Resource": "arn:aws:ec2:eu-central-1:ACCOUNT_ID:instance/*",
+      "Condition": {
+        "StringEquals": { "aws:RequestedRegion": "eu-central-1" }
+      }
+    }
+  ]
+}

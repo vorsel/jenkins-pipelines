@@ -147,6 +147,7 @@ COMPOSE_SRC="$ONDEMAND_DIR/compose"
 WORKER_SRC="$ONDEMAND_DIR/worker"
 SCALER_SRC="$ONDEMAND_DIR/scaler"
 REAPI_PROXY_SRC="$(cd "$ONDEMAND_DIR/../reapi-proxy" && pwd)"
+AWS_FALLBACK_TF="$ONDEMAND_DIR/aws-fallback-vpc"   # dedicated Graviton-fallback VPC (terraform)
 
 # Remote paths on the central host.
 REMOTE_BASE=/var/lib/buildbarn
@@ -1414,6 +1415,16 @@ REMOTE
     "GITHUB_OAUTH_CLIENT_ID='$GITHUB_OAUTH_CLIENT_ID'" \
     "GITHUB_OAUTH_CLIENT_SECRET='$GITHUB_OAUTH_CLIENT_SECRET'" \
     "PSMDB_RBE_GHA_AUDIENCE='$PSMDB_RBE_GHA_AUDIENCE'" \
+    "AWS_ACCESS_KEY_ID='${AWS_ACCESS_KEY_ID:-}'" \
+    "AWS_SECRET_ACCESS_KEY='${AWS_SECRET_ACCESS_KEY:-}'" \
+    "AWS_AMI_ID='${AWS_AMI_ID:-}'" \
+    "AWS_SUBNET_ID='${AWS_SUBNET_ID:-}'" \
+    "AWS_SECURITY_GROUP_IDS='${AWS_SECURITY_GROUP_IDS:-}'" \
+    "AWS_KEY_NAME='${AWS_KEY_NAME:-}'" \
+    "WG_IFACE='${WG_IFACE:-}'" \
+    "WG_HUB_PUBKEY='${WG_HUB_PUBKEY:-}'" \
+    "WG_HUB_ENDPOINT='${WG_HUB_ENDPOINT:-}'" \
+    "WG_ALLOWED_IPS='${WG_ALLOWED_IPS:-}'" \
     "bash -se" <<'REMOTE'
 set -euo pipefail
 
@@ -1544,6 +1555,23 @@ SCALER_DRY_RUN=$PREV_SCALER_DRY_RUN
 # warm up a full pool within one tick during a release matrix. Preserved
 # across re-runs.
 SPAWN_THROTTLE_PER_POOL=$PREV_SPAWN_THROTTLE
+# --- AWS Graviton fallback + WireGuard hub (optional). Forwarded from the
+#     operator's shell (e.g. cluster.env) at bake time; preserved from the
+#     previous .env on re-runs when not re-exported (same pattern as the
+#     secrets above). All inert unless aws.enabled:true in ondemand-pools.yaml.
+#     See ../aws-graviton-fallback.md. WG_HUB_PUBKEY/ENDPOINT come from
+#     scripts/setup-wireguard-hub.sh; AWS_* from the IAM user + aws-fallback-vpc
+#     terraform outputs.
+AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-$(_env_get AWS_ACCESS_KEY_ID)}
+AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-$(_env_get AWS_SECRET_ACCESS_KEY)}
+AWS_AMI_ID=${AWS_AMI_ID:-$(_env_get AWS_AMI_ID)}
+AWS_SUBNET_ID=${AWS_SUBNET_ID:-$(_env_get AWS_SUBNET_ID)}
+AWS_SECURITY_GROUP_IDS=${AWS_SECURITY_GROUP_IDS:-$(_env_get AWS_SECURITY_GROUP_IDS)}
+AWS_KEY_NAME=${AWS_KEY_NAME:-$(_env_get AWS_KEY_NAME)}
+WG_IFACE=${WG_IFACE:-$(_env_get WG_IFACE)}
+WG_HUB_PUBKEY=${WG_HUB_PUBKEY:-$(_env_get WG_HUB_PUBKEY)}
+WG_HUB_ENDPOINT=${WG_HUB_ENDPOINT:-$(_env_get WG_HUB_ENDPOINT)}
+WG_ALLOWED_IPS=${WG_ALLOWED_IPS:-$(_env_get WG_ALLOWED_IPS)}
 EOF
 chmod 600 "$REMOTE_COMPOSE/.env"   # token + OIDC secrets inside; keep off `ls -l` casual reads.
 
@@ -2211,8 +2239,57 @@ EOF
 # -----------------------------------------------------------------------------
 # Main.
 # -----------------------------------------------------------------------------
+check_aws_fallback_vpc() {
+  step "AWS fallback VPC"
+  # Best-effort, NON-FATAL. Validates the dedicated eu-central-1 VPC for
+  # Graviton fallback workers (aws-fallback-vpc/). The Hetzner bootstrap never
+  # depends on it, so every branch here returns 0 — we only warn.
+  if [[ ! -d "$AWS_FALLBACK_TF" ]]; then
+    warn "no aws-fallback-vpc/ dir — skipping (AWS Graviton fallback not set up)"; return 0
+  fi
+  # Pick the IaC binary: explicit $TF_BIN, else tofu (OpenTofu), else terraform.
+  # OpenTofu is preferred because it's the native-arch binary operators tend to
+  # have on Apple Silicon — the Homebrew x86 `terraform` runs the AWS provider
+  # under Rosetta where it can spin at 100% CPU and hang this whole step.
+  local tf="${TF_BIN:-}"
+  [[ -n "$tf" ]] || tf="$(command -v tofu 2>/dev/null || command -v terraform 2>/dev/null || true)"
+  if [[ -z "$tf" ]]; then
+    warn "neither tofu nor terraform found — skipping AWS fallback VPC check"; return 0
+  fi
+  # create-central.sh is always sourced together with cluster.env, whose
+  # AWS_ACCESS_KEY_ID/SECRET belong to the NARROW scaler IAM user
+  # (RunInstances/Terminate/DescribeInstances only). Those keys cannot
+  # DescribeVpcAttribute or read SSM, so a `tofu plan` under them 403s, and env
+  # vars override --profile in the AWS SDK. So strip the scaler creds for every
+  # tofu call and use an ADMIN profile instead: AWS_FALLBACK_TF_PROFILE, else
+  # AWS_PROFILE, else the default profile in ~/.aws.
+  local tf_profile="${AWS_FALLBACK_TF_PROFILE:-${AWS_PROFILE:-}}"
+  _aws_tf() {
+    ( cd "$AWS_FALLBACK_TF" \
+      && env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+           ${tf_profile:+AWS_PROFILE="$tf_profile"} "$tf" "$@" )
+  }
+
+  # `validate` needs a provider, so init first (local backend; idempotent;
+  # downloads the AWS provider on first run). Keep all output quiet.
+  if ! _aws_tf init -input=false >/dev/null 2>&1 || ! _aws_tf validate >/dev/null 2>&1; then
+    warn "$(basename "$tf") validate failed in aws-fallback-vpc/ — fix before enabling AWS fallback"; return 0
+  fi
+  ok "aws-fallback-vpc/ config is valid (via $(basename "$tf"))"
+
+  local rc=0
+  _aws_tf plan -detailed-exitcode -input=false >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) ok "AWS fallback VPC is applied and in sync${tf_profile:+ (profile=$tf_profile)}" ;;
+    2) warn "AWS fallback VPC has pending changes — run 'AWS_PROFILE=<admin> $(basename "$tf") apply' in aws-fallback-vpc/" ;;
+    *) warn "$(basename "$tf") plan failed (rc=$rc) — set AWS_FALLBACK_TF_PROFILE (or AWS_PROFILE) to an admin profile (scaler keys are stripped here on purpose)" ;;
+  esac
+  return 0
+}
+
 main() {
   preflight
+  check_aws_fallback_vpc        # non-fatal AWS Graviton-fallback VPC check
   ensure_server
   attach_volume
   ensure_floating_ip            # API-level only; no $PUBLIC_IP override here
