@@ -172,10 +172,10 @@
       clientSecret: clientSecret,
       // /auth and /token both live under the same Dex listener.
       // Browser-facing /auth is hit by the user's external browser
-      // (resolves bb-psmdb.ddns.net via public DNS → floating IP →
+      // (resolves bb.psmdb.percona.com via public DNS → floating IP →
       // host:5556 → dex container).
       // Server-facing /token is hit by BB's internal HTTP client
-      // (resolves bb-psmdb.ddns.net via docker DNS — the dex
+      // (resolves bb.psmdb.percona.com via docker DNS — the dex
       // service has a network alias for this hostname in
       // docker-compose.yml — so the call stays on the docker bridge
       // and never leaves the host). The TLS handshake validates the

@@ -308,7 +308,7 @@ preflight() {
   # an IP-based URL would never validate against the Let's Encrypt cert
   # provisioned for the DNS name, and we'd silently serve broken UI links.
   [[ -n "$PUBLIC_HOSTNAME" ]] \
-    || die "PUBLIC_HOSTNAME env var is required (e.g. PUBLIC_HOSTNAME=bb-psmdb.ddns.net) — see buildbarn-auth-tls-plan.md §4"
+    || die "PUBLIC_HOSTNAME env var is required (e.g. PUBLIC_HOSTNAME=bb.psmdb.percona.com) — see buildbarn-auth-tls-plan.md §4"
   ok "public hostname: $PUBLIC_HOSTNAME"
 
   # Dex (Step 3 of the auth plan) needs a GitHub OAuth App registered
@@ -799,7 +799,7 @@ fi
 #
 # Operational diagnostics (cheap to install, expensive to be without
 # at 02:00 when something's on fire):
-#   * dnsutils    — dig/nslookup for DNS troubleshooting (bb-psmdb.ddns.net,
+#   * dnsutils    — dig/nslookup for DNS troubleshooting (bb.psmdb.percona.com,
 #                   Hetzner endpoint resolution).
 #   * iotop, htop — process-level CPU + IO inspection.
 #   * tcpdump     — TCP/TLS handshake captures (debugged the PSMDB-2034
@@ -811,10 +811,16 @@ fi
 #                   ships by default but the full vim is friendlier.
 #   * mtr-tiny    — single-pane ICMP/UDP path quality (workers ↔ central
 #                   intra-AZ latency spot-checks).
+#   * certbot     — Let's Encrypt HTTP-01 client for the public TLS cert
+#                   (ensure_tls_cert). The cert TREE lives on the data
+#                   volume (survives VM redeploy) but the binary lives on
+#                   the boot disk, so a fresh VM must reinstall it — hence
+#                   it belongs in this always-run bootstrap, not a one-off.
 apt-get update
 apt-get install -y \
     rsync jq xfsprogs python3-yaml \
-    dnsutils iotop htop tcpdump lsof vim less mtr-tiny
+    dnsutils iotop htop tcpdump lsof vim less mtr-tiny \
+    certbot
 
 systemctl enable --now docker
 
@@ -2287,6 +2293,82 @@ check_aws_fallback_vpc() {
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# Public TLS cert (Let's Encrypt, HTTP-01).
+#
+# Envoy (:8981/:1985), bb-browser, the scheduler admin UI and Dex (:5556) all
+# serve TLS for a SINGLE hostname ($PUBLIC_HOSTNAME) off ONE cert mounted from
+# $REMOTE_BASE/certs/{fullchain,privkey}.pem. This function makes that cert
+# self-healing across VM redeploys and hostname changes, so operators never
+# hand-run certbot:
+#
+#   1. /etc/letsencrypt is a symlink onto the data volume ($REMOTE_BASE/
+#      letsencrypt) — the LE account + issued certs live on the volume and
+#      survive a VM rebuild; only the certbot binary (installed in
+#      bootstrap_host) is on the boot disk.
+#   2. certbot certonly --standalone issues/renews for the CURRENT hostname.
+#      --keep-until-expiring makes it a no-op when a valid cert already exists,
+#      so it's safe to run every deploy; a hostname change just mints a new
+#      lineage (the old one is left in place, harmless).
+#   3. The resolved cert is copied into the stable $REMOTE_BASE/certs dir the
+#      containers mount.
+#   4. A domain-agnostic renewal deploy-hook re-copies on auto-renew and pokes
+#      Envoy — written via $RENEWED_LINEAGE so it keeps working after a rename.
+#
+# HTTP-01 needs DNS for $PUBLIC_HOSTNAME pointing at this host and :80 reachable
+# (the BB stack never binds :80). If issuance fails (DNS not live yet, :80
+# blocked) this is NON-FATAL: it warns and lets the deploy continue with
+# whatever cert is already present, so a first run before DNS propagates
+# doesn't wedge the whole bootstrap.
+# -----------------------------------------------------------------------------
+ensure_tls_cert() {
+  step "TLS certificate ($PUBLIC_HOSTNAME)"
+  rssh "PUBLIC_HOSTNAME='$PUBLIC_HOSTNAME' LE_EMAIL='${LE_EMAIL:-builds-noreply@percona.com}' REMOTE_BASE='$REMOTE_BASE' REMOTE_COMPOSE='$REMOTE_COMPOSE' bash -se" <<'REMOTE'
+set -euo pipefail
+
+LE_DIR="$REMOTE_BASE/letsencrypt"
+CERT_DIR="$REMOTE_BASE/certs"
+LIVE="/etc/letsencrypt/live/$PUBLIC_HOSTNAME"
+
+# 1) LE tree on the volume; /etc/letsencrypt is a symlink to it.
+mkdir -p "$LE_DIR" "$CERT_DIR"
+if [ ! -L /etc/letsencrypt ]; then
+  [ -e /etc/letsencrypt ] && mv /etc/letsencrypt "/etc/letsencrypt.bak.$(date +%s)"
+  ln -s "$LE_DIR" /etc/letsencrypt
+fi
+
+# 2) issue/renew for the current hostname (no-op if a valid cert exists).
+if ! certbot certonly --standalone --non-interactive --agree-tos \
+      --email "$LE_EMAIL" -d "$PUBLIC_HOSTNAME" --keep-until-expiring; then
+  echo "  ! certbot failed for $PUBLIC_HOSTNAME — is DNS live and :80 reachable?" >&2
+  if [ -e "$CERT_DIR/fullchain.pem" ]; then
+    echo "  ! keeping the existing cert in $CERT_DIR; deploy continues." >&2
+    exit 0
+  fi
+  echo "  ! no cert present in $CERT_DIR — Envoy/Dex will fail to start until this succeeds." >&2
+  exit 0
+fi
+
+# 3) publish resolved cert into the stable dir the containers mount.
+install -m 0644 "$(readlink -f "$LIVE/fullchain.pem")" "$CERT_DIR/fullchain.pem"
+install -m 0644 "$(readlink -f "$LIVE/privkey.pem")"   "$CERT_DIR/privkey.pem"
+
+# 4) domain-agnostic renewal deploy-hook: re-copy + poke Envoy on auto-renew.
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/10-buildbarn.sh <<HOOK
+#!/bin/bash
+set -e
+install -m 0644 "\$RENEWED_LINEAGE/fullchain.pem" "$CERT_DIR/fullchain.pem"
+install -m 0644 "\$RENEWED_LINEAGE/privkey.pem"   "$CERT_DIR/privkey.pem"
+cd "$REMOTE_COMPOSE" && docker compose kill -s SIGHUP envoy-proxy 2>/dev/null || true
+HOOK
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/10-buildbarn.sh
+
+echo "  ✓ cert for $PUBLIC_HOSTNAME published to $CERT_DIR"
+REMOTE
+  ok "TLS cert ensured for $PUBLIC_HOSTNAME"
+}
+
 main() {
   preflight
   check_aws_fallback_vpc        # non-fatal AWS Graviton-fallback VPC check
@@ -2320,6 +2402,7 @@ main() {
 
   ensure_central_ssh_key
   sync_configs
+  ensure_tls_cert               # install/renew the LE cert BEFORE containers mount it
   compose_up
   smoke
   summary

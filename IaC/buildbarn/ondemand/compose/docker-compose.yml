@@ -326,13 +326,13 @@ services:
     networks:
       # Network alias for the public hostname so that bb-browser and
       # bb-scheduler — which sit on the same docker-compose default
-      # bridge network as dex — can resolve `bb-psmdb.ddns.net` to
+      # bridge network as dex — can resolve `bb.psmdb.percona.com` to
       # this container directly via docker's embedded DNS, without
       # hairpin-ing through the host's NAT.
       #
       # Why this matters: the OIDC config in browser.jsonnet /
       # scheduler.jsonnet uses the public issuer URL (https://
-      # bb-psmdb.ddns.net:5556) for BOTH the user-browser-facing
+      # bb.psmdb.percona.com:5556) for BOTH the user-browser-facing
       # /auth redirect AND the server-to-server /token call from
       # BB. The user's browser resolves the hostname via public DNS
       # (No-IP → Hetzner Floating IP); the BB container resolves the
@@ -347,10 +347,10 @@ services:
       # we don't need).
       default:
         aliases:
-          - bb-psmdb.ddns.net
+          - bb.psmdb.percona.com
     ports:
       # Public TLS endpoint for OIDC clients. Cert SAN must match
-      # bb-psmdb.ddns.net or browsers / bb-* HTTP clients reject
+      # bb.psmdb.percona.com or browsers / bb-* HTTP clients reject
       # token endpoint calls.
       - "5556:5556"
     volumes:
@@ -433,7 +433,7 @@ services:
   # is the only TLS termination point on the path — frontend and
   # reapi-proxy stay plaintext on the docker bridge. Step 5 added a
   # jwt_authn filter that validates `Authorization: Bearer <jwt>`
-  # against Dex's /keys (issuer https://bb-psmdb.ddns.net:5556,
+  # against Dex's /keys (issuer https://bb.psmdb.percona.com:5556,
   # audience bazel-cli); see envoy.yaml for the filter and the
   # `dex_jwks` upstream cluster.
   # ---------------------------------------------------------------------
@@ -469,7 +469,7 @@ services:
         hard: 524288
     ports:
       # Public TLS endpoint for Bazel clients. Cert is the Let's Encrypt
-      # cert for bb-psmdb.ddns.net (see envoy.yaml). Plain gRPC clients
+      # cert for bb.psmdb.percona.com (see envoy.yaml). Plain gRPC clients
       # (grpc://) will fail with "connection reset" — they must use
       # grpcs:// from now on.
       - "8981:8981"

@@ -77,6 +77,10 @@ on:
         description: "Override mongo branch for psmdb_version=8.0 (default: v8.0)"
         required: false
         default: ""
+      mongo_sha_override:
+        description: "Tag images with this 40-hex sha instead of the resolved last-script-touch sha (re-bake an existing generation from another branch; leave empty for normal runs)"
+        required: false
+        default: ""
   push:
     branches:
       - main
@@ -205,6 +209,7 @@ jobs:
           MONGO_BRANCH_MASTER_INPUT: ${{ github.event.inputs.mongo_branch_master }}
           MONGO_BRANCH_V83_INPUT: ${{ github.event.inputs.mongo_branch_v83 }}
           MONGO_BRANCH_V80_INPUT: ${{ github.event.inputs.mongo_branch_v80 }}
+          MONGO_SHA_OVERRIDE_INPUT: ${{ github.event.inputs.mongo_sha_override }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # GHCR paths must be lowercase; repo owners like "Percona" would
@@ -246,6 +251,22 @@ jobs:
             echo "Failed to resolve last-script-touch SHA for ${MONGO_OWNER_REPO}@${MONGO_BRANCH}" >&2
             exit 1
           fi
+          # mongo_sha_override: tag the images with a sha we pick instead of the
+          # one just resolved. Needed when a branch re-bakes a generation that is
+          # already pinned in psmdb_rbe_containers.bzl + ondemand-pools.yaml, so
+          # the routing key stays put and neither file has to be touched. The
+          # real source commit survives in the source_sha label — without it the
+          # image would claim a provenance it doesn't have.
+          SOURCE_SHA="${SHA}"
+          if [[ -n "${MONGO_SHA_OVERRIDE_INPUT}" ]]; then
+            if [[ ! "${MONGO_SHA_OVERRIDE_INPUT}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "mongo_sha_override must be a 40-hex commit sha, got: ${MONGO_SHA_OVERRIDE_INPUT}" >&2
+              exit 1
+            fi
+            SHA="${MONGO_SHA_OVERRIDE_INPUT}"
+            echo "Tag sha overridden: built from ${SOURCE_SHA}, tagged as ${SHA}"
+          fi
+          echo "source_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
           echo "mongo_sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "Resolved mongo_branch=${MONGO_BRANCH} mongo_sha=${SHA}"
 
@@ -273,6 +294,7 @@ jobs:
             org.percona.psmdb.mongo_repo=${{ steps.meta.outputs.mongo_repo }}
             org.percona.psmdb.mongo_branch=${{ steps.meta.outputs.mongo_branch }}
             org.percona.psmdb.mongo_sha=${{ steps.meta.outputs.mongo_sha }}
+            org.percona.psmdb.source_sha=${{ steps.meta.outputs.source_sha }}
 
       - name: Export digest
         if: steps.filter.outputs.run == 'true' && github.event_name != 'pull_request'
@@ -394,6 +416,7 @@ jobs:
           MONGO_BRANCH_MASTER_INPUT: ${{ github.event.inputs.mongo_branch_master }}
           MONGO_BRANCH_V83_INPUT: ${{ github.event.inputs.mongo_branch_v83 }}
           MONGO_BRANCH_V80_INPUT: ${{ github.event.inputs.mongo_branch_v80 }}
+          MONGO_SHA_OVERRIDE_INPUT: ${{ github.event.inputs.mongo_sha_override }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
@@ -425,6 +448,16 @@ jobs:
           if [[ -z "${SHA}" || "${SHA}" == "null" ]]; then
             echo "Failed to resolve last-script-touch SHA for ${MONGO_OWNER_REPO}@${MONGO_BRANCH}" >&2
             exit 1
+          fi
+          # Same override as in `build` — the two must agree or the manifest
+          # list would be tagged differently from the per-arch images.
+          if [[ -n "${MONGO_SHA_OVERRIDE_INPUT}" ]]; then
+            if [[ ! "${MONGO_SHA_OVERRIDE_INPUT}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "mongo_sha_override must be a 40-hex commit sha, got: ${MONGO_SHA_OVERRIDE_INPUT}" >&2
+              exit 1
+            fi
+            echo "Tag sha overridden: built from ${SHA}, tagged as ${MONGO_SHA_OVERRIDE_INPUT}"
+            SHA="${MONGO_SHA_OVERRIDE_INPUT}"
           fi
           echo "mongo_sha=${SHA}" >> "$GITHUB_OUTPUT"
 

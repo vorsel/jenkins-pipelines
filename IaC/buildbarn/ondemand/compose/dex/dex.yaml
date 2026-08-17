@@ -42,7 +42,7 @@
 #   * be reachable from clients (verified via /.well-known/openid-configuration)
 #   * match the SAN of the TLS cert presented on `web.https` below
 #   * stay stable — changing it invalidates every refresh token in flight
-issuer: https://bb-psmdb.ddns.net:5556
+issuer: https://bb.psmdb.percona.com:5556
 
 # Persistent storage for auth-codes (10 min TTL), refresh tokens
 # (1 y TTL — see `expiry` below), offline sessions, and Dex's own
@@ -176,7 +176,7 @@ connectors:
     # Must match exactly what is registered in the GitHub OAuth App
     # (Settings → Developer settings → OAuth Apps). A mismatch fails
     # at the GitHub callback with `redirect_uri_mismatch`.
-    redirectURI:  https://bb-psmdb.ddns.net:5556/callback
+    redirectURI:  https://bb.psmdb.percona.com:5556/callback
 
     # Authorization gate. A user is allowed in iff they are a member
     # of at least one of the listed `orgs[].teams[]`. Anyone outside
@@ -226,7 +226,7 @@ connectors:
 #
 # Pipelines mint short-lived (~60 min) RS256 id_tokens via
 # `withCredentials([string(credentialsId: 'PSMDB-RBE-OIDC', ...)])` and
-# POST them to https://bb-psmdb.ddns.net:5556/token with
+# POST them to https://bb.psmdb.percona.com:5556/token with
 # grant_type=urn:ietf:params:oauth:grant-type:token-exchange and
 # connector_id=jenkins-psmdb-rbe (this connector). Dex verifies the
 # signature, lifts `sub` (the job URL) into the federated identity, and
@@ -355,12 +355,12 @@ staticClients:
   name: 'Buildbarn Browser'
   secretEnv: BB_BROWSER_OIDC_SECRET
   redirectURIs:
-  - https://bb-psmdb.ddns.net:7984/oidc-callback
+  - https://bb.psmdb.percona.com:7984/oidc-callback
 - id: bb-scheduler-admin
   name: 'Buildbarn Scheduler Admin'
   secretEnv: BB_SCHED_OIDC_SECRET
   redirectURIs:
-  - https://bb-psmdb.ddns.net:7982/oidc-callback
+  - https://bb.psmdb.percona.com:7982/oidc-callback
 # bb-portal — build observability UI (build history, BES ingest).
 # Same OIDC posture as bb-browser / bb-scheduler-admin: confidential
 # client with a per-service secret in .env (BB_PORTAL_OIDC_SECRET,
@@ -376,7 +376,7 @@ staticClients:
   name: 'Buildbarn Portal'
   secretEnv: BB_PORTAL_OIDC_SECRET
   redirectURIs:
-  - https://bb-psmdb.ddns.net:7986/oidc-callback
+  - https://bb.psmdb.percona.com:7986/oidc-callback
 # Step 5: Bazel CLI client for the Device Authorization Grant
 # (RFC 8628). This client is PUBLIC — it has no secret because Bazel
 # clients run on developer machines / CI runners where we cannot

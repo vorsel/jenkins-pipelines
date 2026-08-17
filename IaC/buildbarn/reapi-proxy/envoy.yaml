@@ -65,7 +65,7 @@ static_resources:
     filter_chains:
     # TLS termination for Bazel clients reaching the cluster from the
     # public internet. Cert is the Let's Encrypt cert for
-    # bb-psmdb.ddns.net (No-IP free DDNS, A-record on the central VM's
+    # bb.psmdb.percona.com (No-IP free DDNS, A-record on the central VM's
     # Hetzner Floating IP). Cert files are deploy-copied (resolved
     # symlinks, mode 0644) from /etc/letsencrypt/live/<host>/ into
     # /var/lib/buildbarn/certs/ on the host by the certbot deploy-hook
@@ -129,7 +129,7 @@ static_resources:
               providers:
                 # Dex is the sole issuer at this stage. id_tokens minted
                 # for Bazel-side clients carry:
-                #   iss = https://bb-psmdb.ddns.net:5556
+                #   iss = https://bb.psmdb.percona.com:5556
                 #   aud = ["bazel-cli"]      (Device Code flow — humans)
                 #   aud = ["bazel-jenkins"]  (Token Exchange flow — CI;
                 #                             see dex.yaml `bazel-jenkins`
@@ -147,7 +147,7 @@ static_resources:
                 # they only exist for the one-shot exchange at Dex's
                 # /token. Trust universe stays single-rooted on Dex.
                 dex_provider:
-                  issuer: https://bb-psmdb.ddns.net:5556
+                  issuer: https://bb.psmdb.percona.com:5556
                   audiences:
                   - bazel-cli
                   - bazel-jenkins
@@ -185,7 +185,7 @@ static_resources:
                   # Dex container, negligible.
                   remote_jwks:
                     http_uri:
-                      uri: https://bb-psmdb.ddns.net:5556/keys
+                      uri: https://bb.psmdb.percona.com:5556/keys
                       cluster: dex_jwks
                       timeout: 5s
                     cache_duration: 60s
@@ -681,7 +681,7 @@ static_resources:
               "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
               providers:
                 dex_provider:
-                  issuer: https://bb-psmdb.ddns.net:5556
+                  issuer: https://bb.psmdb.percona.com:5556
                   audiences:
                   - bazel-cli
                   - bazel-jenkins
@@ -691,7 +691,7 @@ static_resources:
                   # full rationale (Dex rotation vs JWKS cache window).
                   remote_jwks:
                     http_uri:
-                      uri: https://bb-psmdb.ddns.net:5556/keys
+                      uri: https://bb.psmdb.percona.com:5556/keys
                       cluster: dex_jwks
                       timeout: 5s
                     cache_duration: 60s
@@ -1067,7 +1067,7 @@ static_resources:
 
   # Step 5 — upstream cluster the jwt_authn filter uses to fetch
   # Dex's public signing keys. We connect via the docker network alias
-  # `bb-psmdb.ddns.net` (added on the dex service in docker-compose.yml
+  # `bb.psmdb.percona.com` (added on the dex service in docker-compose.yml
   # for the Step 4 OIDC token exchange) so traffic stays on the bridge
   # rather than hairpinning out through the floating IP. SNI matches
   # the cert SAN, so the upstream TLS handshake validates cleanly
@@ -1083,13 +1083,13 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: bb-psmdb.ddns.net
+                address: bb.psmdb.percona.com
                 port_value: 5556
     transport_socket:
       name: envoy.transport_sockets.tls
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-        sni: bb-psmdb.ddns.net
+        sni: bb.psmdb.percona.com
         common_tls_context:
           validation_context:
             trusted_ca:
@@ -1097,7 +1097,7 @@ static_resources:
             match_typed_subject_alt_names:
             - san_type: DNS
               matcher:
-                exact: bb-psmdb.ddns.net
+                exact: bb.psmdb.percona.com
 
   # bb-portal-backend BES gRPC ingest — terminates the :1985 listener.
   # Plain HTTP/2 over the docker bridge (no TLS, no auth at this hop —

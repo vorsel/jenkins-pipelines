@@ -211,21 +211,35 @@ wireguard:
 # IaC/buildbarn/runners/README.md "Phased migration plan" for context):
 # Each tag suffix is the SHA of the last commit touching
 # percona-packaging/scripts/psmdb_builder.sh on the corresponding
-# vorsel/percona-server-mongodb feature branch
-# (PSMDB-2054_psmdb_rbe_support_in_build_routines__<release>):
+# vorsel/percona-server-mongodb branch —
+# PSMDB-2054_psmdb_rbe_support_in_build_routines__master for master, a
+# per-ticket branch for v8.0 and v8.3 (both lines have moved past PSMDB-2054):
 #   - master: mongo SHA 52917c227b04255a129d9b5617228c2269662871
-#   - v8.3:   mongo SHA 7517cebc3bd12a03059cf8f01cc2591d801f66d7
-#   - v8.0:   mongo SHA 4f903c5eb2b598da55a69bbc70f786238302aa14
+#   - v8.3:   mongo SHA 2d593e6f8e85df6f1865ceff13993a02a595d856
+#             (PSMDB-2198_psmdb83_add_deb13_trixie_amd64_arm64_support)
+#   - v8.0:   mongo SHA a7a131ec9cd863d4cdd261bb10acb69d2946c020
+#             (PSMDB-2205_psmdb8.0_update_rbe_workers)
 # Tag suffix appears in every runner_image below; pool key short-sha is
-# the first 12 chars.
+# the first 12 chars — EXCEPT the 8.0 and 8.3 lines, whose pool keys now use
+# a lifecycle tier marker (__main = current, __old = previous, to drop once
+# unreferenced) instead of the short-sha. The real SHA still lives only in
+# runner_image (the sole routing source of truth); the key suffix is a
+# human label the scaler never parses.
 #
-# Coverage:
-#   * 12 pools per psmdb_version (3 versions: v8.0, v8.3, master):
-#       - 6 x86_64 pools (one per distro)
-#       - 6 aarch64 sibling pools (one per distro, including debian-
-#         bookworm — the multi-arch manifest list now has both arches
-#         since IaC/buildbarn/runners/debian-bookworm-aarch64/ was added)
-#   * Total: 36 pools
+# Coverage: 124 pools. Every distro is an x86_64 + aarch64 sibling pair
+# (including debian-bookworm, since IaC/buildbarn/runners/debian-bookworm-
+# aarch64/ was added), so per-generation counts are always even. Every pool
+# is min_nodes: 0 — an unreferenced one costs nothing until an action routes
+# to it, which is why demoted generations can linger.
+#   * v8.0   — 34: __main 9 distros x2 (a7a131ec9cd8)
+#                + __old  8 distros x2 (b0032483117d, what upstream/v8.0 pins)
+#   * v8.3   — 60: __main 9 distros x2 (2d593e6f8e85, PSMDB-2198/deb13)
+#                + 9 distros x2 (57029e0d8453, PSMDB-2197/el10)
+#                + __old  6 distros x2 (ac06e9e70d1a, what upstream/v8.3 pins)
+#                + 6 distros x2 (7517cebc3bd1, two pre-ac06e9e7 branches)
+#                Both feature generations collapse into one __main once
+#                PSMDB-2197 and PSMDB-2198 merge and v8.3 is rebuilt.
+#   * master — 30: three in-flight generations, pool keys still use short-sha
 #
 # Why aarch64 siblings can share `runner_image` with their x86_64 sibling:
 # the URL points to a multi-arch manifest list (one per (distro, version,
@@ -243,8 +257,8 @@ pools:
   # ==========================================================================
   # ubuntu-noble (Ubuntu 24.04) — distro_or_os "ubuntu24"
   # ==========================================================================
-  ubuntu-noble-x86_64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  ubuntu-noble-x86_64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -252,8 +266,8 @@ pools:
     min_nodes: 0
     max_nodes: 25
 
-  ubuntu-noble-aarch64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  ubuntu-noble-aarch64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31
@@ -265,8 +279,8 @@ pools:
     # `aws_instance_types: [...]` if this pool needs different shapes.
     aws_fallback: true
 
-  ubuntu-noble-x86_64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  ubuntu-noble-x86_64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
     server_type: cpx42
@@ -274,8 +288,8 @@ pools:
     min_nodes: 0
     max_nodes: 25
 
-  ubuntu-noble-aarch64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  ubuntu-noble-aarch64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
     server_type: cax31
@@ -306,8 +320,8 @@ pools:
   # ==========================================================================
   # ubuntu-jammy (Ubuntu 22.04) — distro_or_os "ubuntu22"
   # ==========================================================================
-  ubuntu-jammy-x86_64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  ubuntu-jammy-x86_64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -315,8 +329,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-jammy-aarch64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  ubuntu-jammy-aarch64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31
@@ -324,8 +338,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-jammy-x86_64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  ubuntu-jammy-x86_64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
     server_type: cpx42
@@ -333,8 +347,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-jammy-aarch64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  ubuntu-jammy-aarch64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
     server_type: cax31
@@ -366,8 +380,8 @@ pools:
   # x86_64 + aarch64 siblings share the same multi-arch manifest list URL
   # (workers pull the right layer based on host arch). Routing-key tuple
   # discriminator between the two pools is bazel_pool_value.
-  debian-bookworm-x86_64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  debian-bookworm-x86_64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -375,8 +389,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-bookworm-aarch64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  debian-bookworm-aarch64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31
@@ -384,8 +398,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-bookworm-x86_64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  debian-bookworm-x86_64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
     server_type: cpx42
@@ -393,8 +407,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-bookworm-aarch64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  debian-bookworm-aarch64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
     server_type: cax31
@@ -423,8 +437,8 @@ pools:
   # ==========================================================================
   # oraclelinux-8 (RHEL8-compatible) — distro_or_os "rhel8"
   # ==========================================================================
-  oraclelinux-8-x86_64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  oraclelinux-8-x86_64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -432,8 +446,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-8-aarch64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  oraclelinux-8-aarch64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31
@@ -441,8 +455,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-8-x86_64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  oraclelinux-8-x86_64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
     server_type: cpx42
@@ -450,8 +464,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-8-aarch64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  oraclelinux-8-aarch64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
     server_type: cax31
@@ -480,8 +494,8 @@ pools:
   # ==========================================================================
   # oraclelinux-9 (RHEL9-compatible) — distro_or_os "rhel9"
   # ==========================================================================
-  oraclelinux-9-x86_64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  oraclelinux-9-x86_64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -489,8 +503,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-9-aarch64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  oraclelinux-9-aarch64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31
@@ -498,8 +512,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-9-x86_64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  oraclelinux-9-x86_64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
     server_type: cpx42
@@ -507,8 +521,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-9-aarch64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  oraclelinux-9-aarch64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
     server_type: cax31
@@ -537,8 +551,8 @@ pools:
   # ==========================================================================
   # amazonlinux-2023 — distro_or_os "amazon_linux_2023"
   # ==========================================================================
-  amazonlinux-2023-x86_64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  amazonlinux-2023-x86_64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -546,8 +560,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  amazonlinux-2023-aarch64__v8_0__4f903c5eb2b5:
-    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14"
+  amazonlinux-2023-aarch64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31
@@ -555,8 +569,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  amazonlinux-2023-x86_64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  amazonlinux-2023-x86_64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
     server_type: cpx42
@@ -564,8 +578,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  amazonlinux-2023-aarch64__v8_3__7517cebc3bd1:
-    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+  amazonlinux-2023-aarch64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
     server_type: cax31
@@ -592,25 +606,20 @@ pools:
     max_nodes: 5
 
   # ==========================================================================
-  # New-distro smoke pools (PSMDB-1943 / PSMDB-2028 / PSMDB-2073).
+  # New-distro pools (PSMDB-1943 / PSMDB-2028 / PSMDB-2073).
   #
-  # Master-only for the first iteration. The runner_image SHA suffix below
-  # is a placeholder — replace it with the real SHA once the sandbox job
-  # `hetzner-psmdb-buildbarn-runner-sandbox` (or the matrix-mode override
-  # of `hetzner-psmdb-buildbarn-runners`) successfully pushes the first
-  # image set built from the matching combined branch
-  # `test_PSMDB-1943_2028_2073_combined__master_new_distros`.
-  #
-  # Until that swap lands, the bb-scheduler will refuse to match these
-  # pools (image not on Docker Hub yet → worker pull will FAIL_PRECONDITION).
-  # Existing OL9/bookworm/noble pools are unaffected.
+  # No longer smoke-only: the 8.0 and 8.3 lines build these three distros in
+  # their regular runner-image generation, so their pools carry the same
+  # __main SHA as every other distro. master still points at the combined
+  # branch `test_PSMDB-1943_2028_2073_combined__master_new_distros`
+  # (4513e9fa839a) until those distros land on mainline master.
   # ==========================================================================
 
   # ==========================================================================
   # oraclelinux-10 (Oracle Linux 10) — distro_or_os "rhel10" — PSMDB-1943
   # ==========================================================================
-  oraclelinux-10-x86_64__v8_0__1293cbf854b0:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+  oraclelinux-10-x86_64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -618,8 +627,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-10-aarch64__v8_0__1293cbf854b0:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+  oraclelinux-10-aarch64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31
@@ -627,8 +636,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-10-x86_64__v8_3__78cbc90209dc:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.3-78cbc90209dcdbc1353dac8cf32b93293bd15cbd"
+  oraclelinux-10-x86_64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
     server_type: cpx42
@@ -636,8 +645,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-10-aarch64__v8_3__78cbc90209dc:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.3-78cbc90209dcdbc1353dac8cf32b93293bd15cbd"
+  oraclelinux-10-aarch64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
     server_type: cax31
@@ -666,8 +675,8 @@ pools:
   # ==========================================================================
   # debian-trixie (Debian 13) — distro_or_os "debian13" — PSMDB-2028
   # ==========================================================================
-  debian-trixie-x86_64__v8_0__1293cbf854b0:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
+  debian-trixie-x86_64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -675,8 +684,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-trixie-aarch64__v8_0__1293cbf854b0:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
+  debian-trixie-aarch64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31
@@ -684,8 +693,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-trixie-x86_64__v8_3__78cbc90209dc:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.3-78cbc90209dcdbc1353dac8cf32b93293bd15cbd"
+  debian-trixie-x86_64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
     server_type: cpx42
@@ -693,8 +702,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-trixie-aarch64__v8_3__78cbc90209dc:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.3-78cbc90209dcdbc1353dac8cf32b93293bd15cbd"
+  debian-trixie-aarch64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
     server_type: cax31
@@ -723,8 +732,8 @@ pools:
   # ==========================================================================
   # ubuntu-resolute (Ubuntu 26.04 LTS) — distro_or_os "ubuntu26" — PSMDB-2073
   # ==========================================================================
-  ubuntu-resolute-x86_64__v8_0__1293cbf854b0:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+  ubuntu-resolute-x86_64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: x86_64
     psmdb_version: "8.0"
     server_type: cpx42
@@ -732,8 +741,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-resolute-aarch64__v8_0__1293cbf854b0:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.0-1293cbf854b0ee521be502590637455a0d40f7f2"
+  ubuntu-resolute-aarch64__v8_0__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.0-a7a131ec9cd863d4cdd261bb10acb69d2946c020"
     bazel_pool_value: aarch64
     psmdb_version: "8.0"
     server_type: cax31
@@ -741,8 +750,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-resolute-x86_64__v8_3__78cbc90209dc:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.3-78cbc90209dcdbc1353dac8cf32b93293bd15cbd"
+  ubuntu-resolute-x86_64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
     server_type: cpx42
@@ -750,8 +759,8 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-resolute-aarch64__v8_3__78cbc90209dc:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.3-78cbc90209dcdbc1353dac8cf32b93293bd15cbd"
+  ubuntu-resolute-aarch64__v8_3__main:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
     server_type: cax31
@@ -803,16 +812,482 @@ pools:
   # discussed subdir-split design and trade-off analysis.
 
   # ---------------------------------------------------------------------------
-  # PSMDB-2072 (vorsel/percona-server-mongodb#PSMDB-2072, branched from v8.3)
-  #   Fix scope: install_deps() in percona-packaging/scripts/psmdb_builder.sh
-  #   mirrors upstream mongo RBE container deps (libncurses, build-essential,
-  #   percona-release 1.0-33 + apt-get install ./*.deb for gnupg-aware
-  #   resolution, etc.). HEAD SHA: ac06e9e70d1a21e006bceaadb822bc93de7b768c.
+  # v8.3 generation 7517cebc3bd12a03059cf8f01cc2591d801f66d7
+  #   (PSMDB-2054_psmdb_rbe_support_in_build_routines__v8.3). Superseded on
+  #   mainline by ac06e9e70d1a, but still pinned in
+  #   bazel/platforms/psmdb_rbe_containers.bzl on
+  #   PSMDB-2034_psmdb_rbe_containers__v8.3 and
+  #   PSMDB-2090_install_deps_mirror_upstream_RBE_container_deps__v8.3.
+  #   Kept so a build off either branch still matches; drop once neither
+  #   references 7517cebc3bd1. Six distros only — this generation predates
+  #   oraclelinux-10 / debian-trixie / ubuntu-resolute.
+  # ---------------------------------------------------------------------------
+
+  ubuntu-noble-x86_64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 25
+
+  ubuntu-noble-aarch64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+    aws_fallback: true               # Graviton fallback (aws.enabled: true)
+
+  ubuntu-jammy-x86_64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-jammy-aarch64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-bookworm-x86_64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-bookworm-aarch64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-8-x86_64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-8-aarch64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-9-x86_64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-9-aarch64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  amazonlinux-2023-x86_64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  amazonlinux-2023-aarch64__v8_3__7517cebc3bd1:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-7517cebc3bd12a03059cf8f01cc2591d801f66d7"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  # ---------------------------------------------------------------------------
+  # PSMDB-2197 (vorsel/percona-server-mongodb#PSMDB-2197, branched from v8.3)
+  #   Fix scope: install_deps() gains the `elif x"$RHEL" = x10` branch (el10
+  #   build deps) and drops the vendored curl 7.77.0 that shadowed system
+  #   libcurl. HEAD SHA: 57029e0d84539baa5216d8ca19a45f549206c34c.
+  #   Image mirror: docker.io/perconalab/psmdb-rbe:<distro>-8.3-57029e0d8453…
+  #   All 9 distros were rebuilt from this branch, so its deb images still
+  #   carry the pre-PSMDB-2198 apt line — take debian-trixie from 2d593e6f8e85
+  #   until both branches merge and one unified generation is built.
+  # ---------------------------------------------------------------------------
+
+  ubuntu-noble-x86_64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 25
+
+  ubuntu-noble-aarch64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+    aws_fallback: true               # Graviton fallback (aws.enabled: true)
+
+  ubuntu-jammy-x86_64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-jammy-aarch64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-bookworm-x86_64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-bookworm-aarch64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-8-x86_64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-8-aarch64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-9-x86_64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-9-aarch64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  amazonlinux-2023-x86_64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  amazonlinux-2023-aarch64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-10-x86_64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-10-aarch64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-trixie-x86_64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-trixie-aarch64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-resolute-x86_64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.3"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-resolute-aarch64__v8_3__57029e0d8453:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-resolute-8.3-57029e0d84539baa5216d8ca19a45f549206c34c"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.3"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  # ---------------------------------------------------------------------------
+  # v8.0 __old tier — previous mainline image, SHA b0032483117d50bee5738876670970d37039a041
+  #   (PSMDB-1943: added el10 + openssl-devel across the whole 8.0 line).
+  #   Demoted from __main when __main rotated to a7a131ec9cd8 (PSMDB-2205:
+  #   drops the vendored curl 7.77.0 build plus the LD_LIBRARY_PATH=/usr/local/lib
+  #   exports that shadowed system libcurl and broke git-over-https on el10).
+  #   Kept so checkouts still pinning b0032483117d in
+  #   bazel/platforms/psmdb_rbe_containers.bzl — upstream/v8.0 today — keep
+  #   routing during the transition. Drop once no branch references
+  #   b0032483117d. The older 07c5bd008df3 generation is gone from this file:
+  #   no tracked file pins it any more.
+  #   Image mirror: docker.io/perconalab/psmdb-rbe:<distro>-8.0-b0032483117d…
+  # ---------------------------------------------------------------------------
+
+  ubuntu-noble-x86_64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 25
+
+  ubuntu-noble-aarch64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-jammy-x86_64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  ubuntu-jammy-aarch64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-bookworm-x86_64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-bookworm-aarch64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-8-x86_64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-8-aarch64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-9-x86_64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-9-aarch64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  amazonlinux-2023-x86_64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  amazonlinux-2023-aarch64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  # oraclelinux-10 had no 07c5bd-generation image — el10 support arrived with
+  # b0032 itself — so this pair is new to the __old tier. upstream/v8.0 pins
+  # b0032 for rhel10, and without a matching pool el10 actions fail
+  # FAILED_PRECONDITION at scheduler match.
+  oraclelinux-10-x86_64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  oraclelinux-10-aarch64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-trixie-x86_64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: x86_64
+    psmdb_version: "8.0"
+    server_type: cpx42
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  debian-trixie-aarch64__v8_0__old:
+    runner_image: "docker.io/perconalab/psmdb-rbe:debian-trixie-8.0-b0032483117d50bee5738876670970d37039a041"
+    bazel_pool_value: aarch64
+    psmdb_version: "8.0"
+    server_type: cax31
+    concurrency: 12
+    min_nodes: 0
+    max_nodes: 5
+
+  # ---------------------------------------------------------------------------
+  # v8.3 __old tier — previous mainline image, SHA ac06e9e70d1a21e006bceaadb822bc93de7b768c
+  #   (PSMDB-2072: install_deps() mirrors upstream mongo RBE container deps —
+  #   libncurses, build-essential, percona-release 1.0-33 installed through
+  #   apt-get install ./*.deb for gnupg-aware resolution).
+  #   Demoted from __main when __main rotated to 2d593e6f8e85 (PSMDB-2198:
+  #   Debian 13 trixie amd64 + arm64 support).
+  #   Kept so checkouts still pinning ac06e9e70d1a in
+  #   bazel/platforms/psmdb_rbe_containers.bzl — upstream/v8.3 today — keep
+  #   routing during the transition. Drop once no branch references
+  #   ac06e9e70d1a. The 7517cebc3bd1 and 78cbc90209dc generations are gone
+  #   from this file; 78cbc90209dc had no referrer left, and 7517cebc3bd1 is
+  #   pinned only by two superseded feature branches
+  #   (PSMDB-2034_psmdb_rbe_containers__v8.3,
+  #   PSMDB-2090_install_deps_mirror_upstream_RBE_container_deps__v8.3) that
+  #   must bump their .bzl if they are ever revived.
   #   Image mirror: docker.io/perconalab/psmdb-rbe:<distro>-8.3-ac06e9e70d1a…
-  #   Pinned in PSMDB-2072 branch's bazel/platforms/psmdb_rbe_containers.bzl.
   # ---------------------------------------------------------------------------
 
-  ubuntu-noble-x86_64__v8_3__ac06e9e70d1a:
+  ubuntu-noble-x86_64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
@@ -821,7 +1296,7 @@ pools:
     min_nodes: 0
     max_nodes: 25
 
-  ubuntu-noble-aarch64__v8_3__ac06e9e70d1a:
+  ubuntu-noble-aarch64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
@@ -830,7 +1305,7 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-jammy-x86_64__v8_3__ac06e9e70d1a:
+  ubuntu-jammy-x86_64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
@@ -839,7 +1314,7 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  ubuntu-jammy-aarch64__v8_3__ac06e9e70d1a:
+  ubuntu-jammy-aarch64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
@@ -848,7 +1323,7 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-bookworm-x86_64__v8_3__ac06e9e70d1a:
+  debian-bookworm-x86_64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
@@ -857,7 +1332,7 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  debian-bookworm-aarch64__v8_3__ac06e9e70d1a:
+  debian-bookworm-aarch64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
@@ -866,7 +1341,7 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-8-x86_64__v8_3__ac06e9e70d1a:
+  oraclelinux-8-x86_64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
@@ -875,7 +1350,7 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-8-aarch64__v8_3__ac06e9e70d1a:
+  oraclelinux-8-aarch64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
@@ -884,7 +1359,7 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-9-x86_64__v8_3__ac06e9e70d1a:
+  oraclelinux-9-x86_64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
@@ -893,7 +1368,7 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  oraclelinux-9-aarch64__v8_3__ac06e9e70d1a:
+  oraclelinux-9-aarch64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
@@ -902,7 +1377,7 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  amazonlinux-2023-x86_64__v8_3__ac06e9e70d1a:
+  amazonlinux-2023-x86_64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: x86_64
     psmdb_version: "8.3"
@@ -911,128 +1386,10 @@ pools:
     min_nodes: 0
     max_nodes: 5
 
-  amazonlinux-2023-aarch64__v8_3__ac06e9e70d1a:
+  amazonlinux-2023-aarch64__v8_3__old:
     runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c"
     bazel_pool_value: aarch64
     psmdb_version: "8.3"
-    server_type: cax31
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  # ---------------------------------------------------------------------------
-  # PSMDB-2090 (vorsel/percona-server-mongodb#PSMDB-2090, branched from v8.0)
-  #   Fix scope: install_deps() in percona-packaging/scripts/psmdb_builder.sh
-  #   mirrors upstream mongo RBE container deps (libncurses, build-essential,
-  #   percona-release 1.0-33 + apt-get install ./*.deb for gnupg-aware
-  #   resolution, etc.). HEAD SHA: 07c5bd008df3acb6e853ebd7c4fefa609c0d03ef.
-  #   Image mirror: docker.io/perconalab/psmdb-rbe:<distro>-8.0-07c5bd008df3…
-  #   Pinned in PSMDB-2090 branch's bazel/platforms/psmdb_rbe_containers.bzl.
-  # ---------------------------------------------------------------------------
-
-  ubuntu-noble-x86_64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: x86_64
-    psmdb_version: "8.0"
-    server_type: cpx42
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 25
-
-  ubuntu-noble-aarch64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: aarch64
-    psmdb_version: "8.0"
-    server_type: cax31
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  ubuntu-jammy-x86_64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: x86_64
-    psmdb_version: "8.0"
-    server_type: cpx42
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  ubuntu-jammy-aarch64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: aarch64
-    psmdb_version: "8.0"
-    server_type: cax31
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  debian-bookworm-x86_64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: x86_64
-    psmdb_version: "8.0"
-    server_type: cpx42
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  debian-bookworm-aarch64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: aarch64
-    psmdb_version: "8.0"
-    server_type: cax31
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  oraclelinux-8-x86_64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: x86_64
-    psmdb_version: "8.0"
-    server_type: cpx42
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  oraclelinux-8-aarch64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: aarch64
-    psmdb_version: "8.0"
-    server_type: cax31
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  oraclelinux-9-x86_64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: x86_64
-    psmdb_version: "8.0"
-    server_type: cpx42
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  oraclelinux-9-aarch64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: aarch64
-    psmdb_version: "8.0"
-    server_type: cax31
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  amazonlinux-2023-x86_64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: x86_64
-    psmdb_version: "8.0"
-    server_type: cpx42
-    concurrency: 12
-    min_nodes: 0
-    max_nodes: 5
-
-  amazonlinux-2023-aarch64__v8_0__07c5bd008df3:
-    runner_image: "docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.0-07c5bd008df3acb6e853ebd7c4fefa609c0d03ef"
-    bazel_pool_value: aarch64
-    psmdb_version: "8.0"
     server_type: cax31
     concurrency: 12
     min_nodes: 0
