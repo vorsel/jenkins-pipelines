@@ -239,10 +239,11 @@ services:
     volumes:
       - ./config:/config:ro
       # Same Let's Encrypt cert / refresh story as bb-browser /
-      # bb-scheduler / dex / envoy: certbot's deploy-hook copies
-      # fullchain.pem + privkey.pem (mode 0644) into this dir on
-      # every renewal and restarts the service so the new cert is
-      # picked up without restart of the whole stack.
+      # bb-scheduler: certbot's deploy-hook swaps fullchain.pem +
+      # privkey.pem (mode 0644) into this dir on every renewal and
+      # bb-storage re-reads them on its own refreshInterval, so this
+      # container needs no restart. dex and envoy-proxy do — the hook
+      # restarts those two explicitly.
       - /var/lib/buildbarn/certs:/etc/buildbarn/certs:ro
     depends_on:
       bb-portal-db:
@@ -492,7 +493,12 @@ services:
       # Cert dir maintained by the certbot deploy-hook (10-buildbarn.sh):
       # contains resolved fullchain.pem + privkey.pem (mode 0644) so the
       # files are readable inside the container regardless of any docker
-      # userns-remap setup. The hook restarts this service on renewal.
+      # userns-remap setup. Envoy reads the pair once at startup and has
+      # no reload path we control, so the hook restarts this service on
+      # renewal. It used to send SIGHUP instead, which envoy ignores
+      # (that signal is for the hot-restarter wrapper, not the process);
+      # the result was envoy serving the previous cert until something
+      # else restarted it — caught in Sep 2026 with 4 weeks to spare.
       - /var/lib/buildbarn/certs:/etc/buildbarn/certs:ro
     depends_on:
       - reapi-proxy

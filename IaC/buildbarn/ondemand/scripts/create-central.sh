@@ -2312,8 +2312,10 @@ check_aws_fallback_vpc() {
 #      lineage (the old one is left in place, harmless).
 #   3. The resolved cert is copied into the stable $REMOTE_BASE/certs dir the
 #      containers mount.
-#   4. A domain-agnostic renewal deploy-hook re-copies on auto-renew and pokes
-#      Envoy — written via $RENEWED_LINEAGE so it keeps working after a rename.
+#   4. A domain-agnostic renewal deploy-hook re-publishes on auto-renew and
+#      restarts the two services that cannot reload a keypair on their own
+#      (dex, envoy-proxy), then verifies what they actually serve — written
+#      via $RENEWED_LINEAGE so it keeps working after a rename.
 #
 # HTTP-01 needs DNS for $PUBLIC_HOSTNAME pointing at this host and :80 reachable
 # (the BB stack never binds :80). If issuance fails (DNS not live yet, :80
@@ -2350,17 +2352,69 @@ if ! certbot certonly --standalone --non-interactive --agree-tos \
 fi
 
 # 3) publish resolved cert into the stable dir the containers mount.
-install -m 0644 "$(readlink -f "$LIVE/fullchain.pem")" "$CERT_DIR/fullchain.pem"
-install -m 0644 "$(readlink -f "$LIVE/privkey.pem")"   "$CERT_DIR/privkey.pem"
+#    Stage beside the live files and rename(2) into place rather than
+#    install(1)-ing straight over them: dex watches both paths with fsnotify
+#    and a truncate-then-refill hands it a zero-length keypair. See the hook
+#    in step 4 for what that failure actually looks like.
+install -m 0644 "$(readlink -f "$LIVE/fullchain.pem")" "$CERT_DIR/.fullchain.pem.new"
+install -m 0644 "$(readlink -f "$LIVE/privkey.pem")"   "$CERT_DIR/.privkey.pem.new"
+mv -f "$CERT_DIR/.fullchain.pem.new" "$CERT_DIR/fullchain.pem"
+mv -f "$CERT_DIR/.privkey.pem.new"   "$CERT_DIR/privkey.pem"
 
-# 4) domain-agnostic renewal deploy-hook: re-copy + poke Envoy on auto-renew.
+# 4) domain-agnostic renewal deploy-hook: re-publish, restart the services
+#    that need it, verify. Runs unattended from certbot's systemd timer.
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 cat > /etc/letsencrypt/renewal-hooks/deploy/10-buildbarn.sh <<HOOK
 #!/bin/bash
-set -e
-install -m 0644 "\$RENEWED_LINEAGE/fullchain.pem" "$CERT_DIR/fullchain.pem"
-install -m 0644 "\$RENEWED_LINEAGE/privkey.pem"   "$CERT_DIR/privkey.pem"
-cd "$REMOTE_COMPOSE" && docker compose kill -s SIGHUP envoy-proxy 2>/dev/null || true
+set -eu
+
+CERT_DIR="$CERT_DIR"
+COMPOSE_DIR="$REMOTE_COMPOSE"
+# Single-domain lineage, so the directory name is the hostname. Derived
+# rather than baked in to keep this hook domain-agnostic across renames.
+CERT_HOST="\$(basename "\$RENEWED_LINEAGE")"
+
+# Publish with rename(2), never in place. dex watches these two paths with
+# fsnotify, and install(1) truncates the destination before refilling it —
+# dex can catch the zero-length window, cache a broken keypair, and never
+# re-read it (its watch already fired). That is what happened on 2026-08-31:
+# the listener stayed up and still answered plain HTTP with Go's 400
+# "Client sent an HTTP request to an HTTPS server.", but every real
+# ClientHello got the connection dropped with no TLS alert. Bazel clients
+# only saw SSL: UNEXPECTED_EOF_WHILE_READING out of the credential helper,
+# and the dex log said nothing at all.
+install -m 0644 "\$RENEWED_LINEAGE/fullchain.pem" "\$CERT_DIR/.fullchain.pem.new"
+install -m 0644 "\$RENEWED_LINEAGE/privkey.pem"   "\$CERT_DIR/.privkey.pem.new"
+mv -f "\$CERT_DIR/.fullchain.pem.new" "\$CERT_DIR/fullchain.pem"
+mv -f "\$CERT_DIR/.privkey.pem.new"   "\$CERT_DIR/privkey.pem"
+
+# bb-browser / bb-scheduler / bb-portal re-read the pair on their own
+# tls.serverKeyPair.files.refreshInterval (3600s), so they are left alone.
+# dex and envoy-proxy are not: dex has only the fsnotify watch above, and
+# envoy has no reload path we control. This used to be a SIGHUP to
+# envoy-proxy, which envoy ignores — that signal is for the hot-restarter
+# wrapper, not the process — so envoy quietly served the previous cert
+# until something restarted it for unrelated reasons.
+cd "\$COMPOSE_DIR"
+docker compose restart dex envoy-proxy ||
+  logger -t buildbarn-cert -p daemon.err "docker compose restart dex envoy-proxy failed"
+
+# Verify instead of hoping: nobody is watching when the timer fires, and a
+# service left on the old cert stays invisible until it expires. Compare the
+# serial each restarted port presents against the one now on disk.
+want="\$(openssl x509 -noout -serial -in "\$CERT_DIR/fullchain.pem")"
+for port in 5556 8981 1985; do
+  got=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    got="\$(openssl s_client -connect "127.0.0.1:\$port" -servername "\$CERT_HOST" </dev/null 2>/dev/null |
+            openssl x509 -noout -serial 2>/dev/null || true)"
+    if [ "\$got" = "\$want" ]; then break; fi
+    sleep 2
+  done
+  if [ "\$got" != "\$want" ]; then
+    logger -t buildbarn-cert -p daemon.err "port \$port is not serving the renewed cert (want \$want, got \${got:-nothing})"
+  fi
+done
 HOOK
 chmod +x /etc/letsencrypt/renewal-hooks/deploy/10-buildbarn.sh
 

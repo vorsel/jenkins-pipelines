@@ -64,11 +64,20 @@ storage:
 # Let's Encrypt cert that envoy-proxy / bb-browser / bb-scheduler
 # already present, so there's nothing to gain from a second hop.
 # The cert directory is /var/lib/buildbarn/certs on the host
-# (resolved fullchain + privkey, mode 0644, refreshed in-place by
+# (resolved fullchain + privkey, mode 0644, swapped atomically by
 # certbot's deploy-hook), mounted read-only at /etc/buildbarn/certs.
-# Dex re-reads the files on TLS handshake misses, so the deploy-hook
-# `docker compose restart dex` line keeps cert rotation hands-off
-# (a stale cert would only hit users on the next renewal cycle).
+#
+# Dex loads the keypair once at startup and watches the two paths with
+# fsnotify; it does NOT re-read them per handshake. That watch is also
+# why the deploy-hook must swap the files with rename(2) and restart
+# this container: on 2026-08-31 the hook still overwrote them in place
+# with install(1), Dex's watch fired mid-truncate, and it cached a
+# zero-length keypair it never re-read. The listener stayed up and kept
+# answering plain HTTP with Go's `Client sent an HTTP request to an
+# HTTPS server.` 400, but every real ClientHello got the connection
+# closed with no TLS alert — Bazel clients saw
+# `SSL: UNEXPECTED_EOF_WHILE_READING` from the credential helper and
+# nothing in the Dex log. See create-central.sh :: ensure_tls_cert.
 web:
   https: 0.0.0.0:5556
   tlsCert: /etc/buildbarn/certs/fullchain.pem
