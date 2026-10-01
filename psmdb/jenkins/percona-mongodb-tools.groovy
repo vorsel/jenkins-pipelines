@@ -1,6 +1,6 @@
-library changelog: false, identifier: 'lib@hetzner', retriever: modernSCM([
+library changelog: false, identifier: 'lib@PSMDB-1944_tools_jenkins_test', retriever: modernSCM([
     $class: 'GitSCMSource',
-    remote: 'https://github.com/Percona-Lab/jenkins-pipelines.git'
+    remote: 'https://github.com/vorsel/jenkins-pipelines.git'
 ]) _
 
 // Builds percona-server-mongodb-tools (the MongoDB Database Tools) independently of the
