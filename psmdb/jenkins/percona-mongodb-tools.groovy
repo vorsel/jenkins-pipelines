@@ -62,7 +62,7 @@ pipeline {
             description: 'URL for the mongo-tools repository to build from',
             name: 'TOOLS_REPO')
         string(
-            defaultValue: '100.18.0',
+            defaultValue: '100.19.1',
             description: 'Tag/Branch of mongo-tools to build. https://github.com/mongodb/mongo-tools/tags',
             name: 'TOOLS_TAG')
         string(
