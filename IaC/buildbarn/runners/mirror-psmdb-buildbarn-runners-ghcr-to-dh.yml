@@ -19,7 +19,7 @@
         amd64 + arm64 images carry over byte-identical.
 
         Inputs:
-            VERSIONS_TO_MIRROR  - space-separated PSMDB version slugs (default: master 8.3 8.0)
+            VERSIONS_TO_MIRROR  - space-separated PSMDB version slugs (default: master 9.0 8.3 8.0)
             GHCR_OWNER          - GHCR namespace owner; vorsel for fork tests, percona-lab for prod
             GHCR_NAMESPACE      - GHCR repo namespace (default: psmdb-buildbarn-runners)
             DH_CRED_ID          - Jenkins creds id with Docker Hub username/token

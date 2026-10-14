@@ -24,7 +24,7 @@
 // Usage
 // -----
 // Trigger manually from Jenkins UI. Default behavior: mirror all 9 distros
-// for all 3 supported PSMDB versions (master, 8.3, 8.0) — i.e. 27 manifest
+// for all 4 supported PSMDB versions (master, 9.0, 8.3, 8.0) — i.e. 36 manifest
 // lists. Subset via VERSIONS_TO_MIRROR.
 //
 // Multi-arch is preserved: the GHCR source is already a manifest list (amd64 +
@@ -143,8 +143,8 @@ pipeline {
     parameters {
         string(
             name: 'VERSIONS_TO_MIRROR',
-            defaultValue: 'master 8.3 8.0',
-            description: 'Space-separated PSMDB version slugs to mirror (any of: master, 8.3, 8.0). Each version pulls the moving tag :<version> for every distro and re-publishes it (plus the immutable :<version>-<sha>) on Docker Hub.'
+            defaultValue: 'master 9.0 8.3 8.0',
+            description: 'Space-separated PSMDB version slugs to mirror (any of: master, 9.0, 8.3, 8.0). Each version pulls the moving tag :<version> for every distro and re-publishes it (plus the immutable :<version>-<sha>) on Docker Hub.'
         )
         string(
             name: 'GHCR_OWNER',

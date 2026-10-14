@@ -71,7 +71,7 @@ In jenkins-pipelines:
   - Drop `paths:` trigger entry for `runners/psmdb_builder_*.sh` (those files won't exist)
   - **Triggers** (Q2c — daily cron + manual):
     - `schedule: cron "0 3 * * *"` (daily 03:00 UTC) — replaces the weekly Phase-1 cron; bounds latency from script-merge in mongo to fresh image at ≤24 h
-    - `workflow_dispatch` with inputs `versions` (subset of `8.0 8.3 master`) and `variants` (subset of 11 distros) — for forced rebuilds (e.g. dev who just merged an `install_deps` change in mongo and doesn't want to wait for cron)
+    - `workflow_dispatch` with inputs `versions` (subset of `8.0 8.3 9.0 master`) and `variants` (subset of 11 distros) — for forced rebuilds (e.g. dev who just merged an `install_deps` change in mongo and doesn't want to wait for cron)
     - `push` on `main`/`PSMDB-2034_buildbarn_setup` touching `IaC/buildbarn/runners/**` or the workflow file (covers Dockerfile / workflow edits in this repo)
   - Add a small mapping in the detect-changes job: `8.0`→`v8.0`, `8.3`→`v8.3`, `master`→`master`
   - **Resolve last-script-touch SHA per branch** (Q1a):
@@ -116,10 +116,11 @@ The cron-driven detect-changes job reduces wasted GHA minutes by rebuilding only
 
 ```bash
 # detect-changes job (runs first, outputs matrix for the build job)
-for psmdb_version in 8.0 8.3 master; do
+for psmdb_version in 8.0 8.3 9.0 master; do
   case "$psmdb_version" in
     8.0)    branch=v8.0 ;;
     8.3)    branch=v8.3 ;;
+    9.0)    branch=v9.0 ;;
     master) branch=master ;;
   esac
 
@@ -438,7 +439,7 @@ GitHub Actions workflow: [`.github/workflows/build-psmdb-buildbarn-runners.yml`]
 
 - `push` to `main` or `PSMDB-2034_buildbarn_setup` touching `IaC/buildbarn/runners/**` or the workflow file — rebuilds all 33 (runner × version) combinations; `CACHE_BUST=$(date +%s)` ensures `install_deps()` re-runs against the current `psmdb_builder_<version>.sh`.
 - `schedule: cron "0 3 * * 1"` — weekly Monday 03:00 UTC rebuild. Covers CVE updates in base OS packages and in MongoDB toolchain downloads without daily churn.
-- `workflow_dispatch` — manual run; supports `variants` input (space-separated subset of the 11 runners), `versions` input (space-separated subset of `8.0 8.3 master`) for targeted rebuilds, and a `push_moving` toggle for isolated branch experiments that must not clobber the `:<version>` pointer.
+- `workflow_dispatch` — manual run; supports `variants` input (space-separated subset of the 11 runners), `versions` input (space-separated subset of `8.0 8.3 9.0 master`) for targeted rebuilds, and a `push_moving` toggle for isolated branch experiments that must not clobber the `:<version>` pointer.
 
 Each matrix job produces two tags on `ghcr.io/<owner>/psmdb-buildbarn-runners/<runner>`:
 
