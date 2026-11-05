@@ -43,10 +43,14 @@ default_properties = fips=yes
 EOF
 
 cd $V/certs
-$O req -x509 -newkey rsa:2048 -sha256 -nodes -days 30 -subj "/CN=oscheck-ca" -keyout ca.key -out ca.pem 2>/dev/null
-$O req -newkey rsa:2048 -sha256 -nodes -subj "/CN=localhost" -keyout srv.key -out srv.csr 2>/dev/null
+# req fails without a config, and the default one (/opt/ossl/ssl/openssl.cnf) isn't here;
+# with an empty config the CA extensions have to be given explicitly or verification fails
+$O req -config /dev/null -x509 -newkey rsa:2048 -sha256 -nodes -days 30 -subj "/CN=oscheck-ca" \
+    -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign -keyout ca.key -out ca.pem
+$O req -config /dev/null -newkey rsa:2048 -sha256 -nodes -subj "/CN=localhost" -keyout srv.key -out srv.csr
 printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > ext.cnf
-$O x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 30 -sha256 -extfile ext.cnf -out srv.crt 2>/dev/null
+$O x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 30 -sha256 -extfile ext.cnf -out srv.crt
+$O verify -x509_strict -CAfile ca.pem srv.crt
 cat srv.key srv.crt > server.pem
 chmod 644 ./*
 
