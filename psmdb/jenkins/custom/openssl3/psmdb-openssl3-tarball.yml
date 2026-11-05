@@ -1,0 +1,15 @@
+- job:
+    name: hetzner-psmdb-openssl3-tarball
+    project-type: pipeline
+    description: |
+        PSMDB tarball linked against a given OpenSSL 3 (RHEL 8 baseline) + runtime libs, manifest, SBOM.
+        Do not edit this job through the web!
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/vorsel/jenkins-pipelines.git
+            branches:
+            - 'custom_psmdb_openssl3'
+            wipe-workspace: false
+      lightweight-checkout: true
+      script-path: psmdb/jenkins/custom/openssl3/psmdb-openssl3-tarball.groovy

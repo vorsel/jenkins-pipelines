@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "image: level A container; ami: level B VM, newest AMI by owner+name (or owner=self + tags)",
+    "ssm is tried first; owner+name is the fallback if the Jenkins key can't read SSM",
+    "RHEL pinned to a minor: EUS rebakes of older minors make 'newest' flip; bump on new minors",
+    "OL: Oracle stopped publishing AMIs in 2024, use the PPG factory (ppg/packer, eu-central-1 only)",
+    "networks: the molecule subnets/SGs; private = agent in the same VPC, public = other region"
+  ],
+  "networks": {
+    "us-west-2":    { "subnet": "subnet-07f71e1a3117a32f9", "sg_name": "molecule-vpc-08eb4de1376aba839", "key_name": "molecule-pkg-tests", "connect": "private" },
+    "eu-central-1": { "subnet": "subnet-0fad4db6fdd8025b6", "sg_name": "molecule-vpc-02f8275fe220ec651", "key_name": "molecule-pkg-tests", "connect": "public" }
+  },
+  "x86_64": [
+    { "id": "rhel8",    "image": "registry.access.redhat.com/ubi8/ubi-minimal",  "user": "ec2-user", "billing": "payg", "ami": { "owner": "309956199498", "name": "RHEL-8.10.0_HVM*-x86_64-*-Hourly2-GP3" } },
+    { "id": "rhel9",    "image": "registry.access.redhat.com/ubi9/ubi-minimal",  "user": "ec2-user", "billing": "payg", "ami": { "owner": "309956199498", "name": "RHEL-9.8.0_HVM*-x86_64-*-Hourly2-GP3" } },
+    { "id": "rhel10",   "image": "registry.access.redhat.com/ubi10/ubi-minimal", "user": "ec2-user", "billing": "payg", "ami": { "owner": "309956199498", "name": "RHEL-10.2.0_HVM*-x86_64-*-Hourly2-GP3" } },
+    { "id": "rocky8",   "image": "rockylinux/rockylinux:8", "user": "rocky",    "billing": "free", "ami": { "owner": "792107900819", "name": "Rocky-8-EC2-Base-8.*.x86_64" } },
+    { "id": "rocky9",   "image": "rockylinux/rockylinux:9", "user": "rocky",    "billing": "free", "ami": { "owner": "792107900819", "name": "Rocky-9-EC2-Base-9.*.x86_64" } },
+    { "id": "alma8",    "image": "almalinux:8",             "user": "ec2-user", "billing": "free", "ami": { "owner": "764336703387", "name": "AlmaLinux OS 8.*x86_64" } },
+    { "id": "alma9",    "image": "almalinux:9",             "user": "ec2-user", "billing": "free", "ami": { "owner": "764336703387", "name": "AlmaLinux OS 9.*x86_64" } },
+    { "id": "ol8",      "image": "oraclelinux:8",           "user": "ec2-user", "billing": "free", "ami": { "owner": "self", "region": "eu-central-1", "tags": { "role": "ppg-package-test", "os": "oraclelinux", "os_major": "8" } } },
+    { "id": "ol9",      "image": "oraclelinux:9",           "user": "ec2-user", "billing": "free", "ami": { "owner": "self", "region": "eu-central-1", "tags": { "role": "ppg-package-test", "os": "oraclelinux", "os_major": "9" } } },
+    { "id": "jammy",    "image": "ubuntu:22.04",            "user": "ubuntu",   "billing": "free", "ami": { "owner": "099720109477", "name": "ubuntu/images/hvm-ssd*/ubuntu-jammy-22.04-amd64-server-*" } },
+    { "id": "noble",    "image": "ubuntu:24.04",            "user": "ubuntu",   "billing": "free", "ami": { "owner": "099720109477", "name": "ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-amd64-server-*" } },
+    { "id": "resolute", "image": "ubuntu:26.04",            "user": "ubuntu",   "billing": "free", "ami": { "owner": "099720109477", "name": "ubuntu/images/hvm-ssd*/ubuntu-resolute-26.04-amd64-server-*" } },
+    { "id": "debian12", "image": "debian:12",               "user": "admin",    "billing": "free", "ami": { "owner": "136693071363", "name": "debian-12-amd64-*" } },
+    { "id": "debian13", "image": "debian:13",               "user": "admin",    "billing": "free", "ami": { "owner": "136693071363", "name": "debian-13-amd64-*" } },
+    { "id": "sles15sp7","image": "registry.suse.com/bci/bci-base:15.7", "user": "ec2-user", "billing": "payg", "ami": { "owner": "013907871322", "name": "suse-sles-15-sp7-v????????-hvm-ssd-x86_64" } },
+    { "id": "sles16",   "image": "registry.suse.com/bci/bci-base:16.0", "user": "ec2-user", "billing": "payg", "ami": { "owner": "013907871322", "name": "suse-sles-16-0-v????????-hvm-ssd-x86_64" } },
+    { "id": "al2023",   "image": "amazonlinux:2023",        "user": "ec2-user", "billing": "free", "ami": { "ssm": "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64", "owner": "137112412989", "name": "al2023-ami-2023.*-kernel-6.18-x86_64" } }
+  ]
+}

@@ -1,0 +1,15 @@
+- job:
+    name: hetzner-psmdb-openssl3-tarball-test
+    project-type: pipeline
+    description: |
+        Tests a psmdb-openssl3-tarball build on the os-matrix.json OS list (containers and/or EC2 VMs).
+        Do not edit this job through the web!
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/vorsel/jenkins-pipelines.git
+            branches:
+            - 'custom_psmdb_openssl3'
+            wipe-workspace: false
+      lightweight-checkout: true
+      script-path: psmdb/jenkins/custom/openssl3/psmdb-openssl3-tarball-test.groovy
