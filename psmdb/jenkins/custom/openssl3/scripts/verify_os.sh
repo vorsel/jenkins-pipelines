@@ -3,8 +3,11 @@
 # (via ssh port forwards in ssh mode).
 #   verify_os.sh container ID IDX IMAGE              # host kernel
 #   verify_os.sh ssh       ID IDX HOST USER KEYFILE  # VM, its own kernel
-# env: T (from helper_setup.sh: pkg/ rt/ [vendor/] verify/), OUT, HELPER, OPENSSL_VERSION
+# env: T (from helper_setup.sh: pkg/ rt/ [vendor/] verify/), OUT, HELPER, OPENSSL_VERSION,
+#      VM_INFO (ssh mode, for the log header)
 # writes $OUT/<IDX>-<ID>.tsv: OS_ID, check, PASS|FAIL|INFO, detail; keeps going after a FAIL
+# full log: $OUT/<IDX>-<ID>.log, printed to the job console as one block when this OS is done;
+# mongod logs of every case: $OUT/<IDX>-<ID>.mongod/
 set -uo pipefail
 MODE=$1 ID=$2 IDX=$3
 : "${T:?}" "${OUT:?}"
@@ -18,8 +21,21 @@ S=/work/vendor
 D=/work/rt
 LDSO=/lib64/ld-linux-x86-64.so.2
 CERTS="--tlsMode requireTLS --tlsCertificateKeyFile /work/verify/certs/server.pem --tlsCAFile /work/verify/certs/ca.pem --tlsAllowConnectionsWithoutCertificates"
+exec 3>&1     # job console: this OS's log goes there in one piece at the end, not mixed with other OSes
 exec >"$TAB.log" 2>&1
-rm -f "$TAB.tsv"
+rm -rf "$TAB.tsv" "$TAB.mongod"; mkdir -p "$TAB.mongod"
+WHERE=$MODE
+
+dump() {
+    local p f
+    p=$(grep -c $'\tPASS\t' "$TAB.tsv" 2>/dev/null); f=$(grep -c $'\tFAIL\t' "$TAB.tsv" 2>/dev/null)
+    {
+        echo "===== $ID BEGIN | $WHERE ====="
+        cat "$TAB.log"
+        echo "===== $ID END | PASS=${p:-0} FAIL=${f:-0} | artifacts: $(basename "$TAB").log, $(basename "$TAB").tsv, $(basename "$TAB").mongod/ ====="
+    } | if command -v flock >/dev/null; then flock "$OUT/.console.lock" cat; else cat; fi >&3
+}
+hdr() { printf '\n---- %s: %s\n' "$1" "$2"; }
 
 res() { printf '%s\t%s\t%s\t%s\n' "$ID" "$1" "$2" "${3:-}" | tee -a "$TAB.tsv"; }
 chk() { local name=$1 detail=$2; shift 2; if "$@"; then res "$name" PASS "$detail"; else res "$name" FAIL "$detail"; fi; }
@@ -34,9 +50,11 @@ container)
     dx() { docker exec "$C" "$@"; }
     fwd() { :; }; unfwd() { :; }
     cleanup() { docker rm -f "$C" >/dev/null 2>&1; rm -rf "$RD"; }
-    trap cleanup EXIT
+    trap 'cleanup; dump' EXIT
+    WHERE="container $IMG on the agent (host kernel)"
     docker rm -f "$C" >/dev/null 2>&1
-    if ! docker pull -q "$IMG" >/dev/null 2>&1; then res pull FAIL "image pull failed: $IMG"; exit 0; fi
+    if ! docker pull -q "$IMG"; then res pull FAIL "image pull failed: $IMG"; exit 0; fi
+    res image INFO "$(docker image inspect --format '{{join .RepoDigests " "}}' "$IMG")"
     # --init so killed mongods get reaped and /proc/<pid> really goes away
     docker run -d --init --name "$C" --network host -v "$T":/work:ro -v "$RD":/poc "$IMG" sleep infinity >/dev/null
     ;;
@@ -48,11 +66,13 @@ ssh)
     fwd() { "${SSH[@]}" -O forward -L "127.0.0.1:$1:127.0.0.1:$1" "$USER_@$HOST" 2>/dev/null; }
     unfwd() { "${SSH[@]}" -O cancel -L "127.0.0.1:$1:127.0.0.1:$1" "$USER_@$HOST" 2>/dev/null; }
     cleanup() { "${SSH[@]}" -O exit "$USER_@$HOST" 2>/dev/null; }
-    trap cleanup EXIT
+    trap 'cleanup; dump' EXIT
+    WHERE="VM $HOST ${VM_INFO:-}"
+    [ -z "${VM_INFO:-}" ] || res vm INFO "$VM_INFO"
     "${SSH[@]}" -M -f -N "$USER_@$HOST" || { res ssh FAIL "no ssh to $HOST"; exit 0; }
     # minimal images (the OL factory ones) come without tar
     "${SSH[@]}" "$USER_@$HOST" 'command -v tar >/dev/null || sudo dnf -y -q install tar || sudo yum -y -q install tar ||
-        sudo zypper -n -q install tar || { sudo apt-get -q update && sudo apt-get -y -q install tar; }' >/dev/null 2>&1 \
+        sudo zypper -n -q install tar || { sudo apt-get -q update && sudo apt-get -y -q install tar; }' \
         || { res upload FAIL "no tar on $HOST and could not install it"; exit 0; }
     # vendor/ only if present: the customer bundle never leaves our hosts except to these test VMs
     tar -C "$T" -czf - pkg rt verify $( [ -d "$T/vendor" ] && echo vendor ) \
@@ -80,7 +100,8 @@ KERNEL_GUARD=0; [ -n "$kv" ] && in_range "$kv" && KERNEL_GUARD=1
 ldd_check() { # tag root
     local out; out=$(dx env LD_LIBRARY_PATH="$(lp "$2")" $LDSO --list "$BIN" 2>&1)
     echo "== ldd $1"; echo "$out" | sed 's/ (0x.*//'
-    echo "$out" | sed 's/ (0x.*//' | awk -v r="$2" '{ p=$3; sub(r, "X", p); print $1, p }' | sort > "$TAB.ldd_$1"
+    # NF: a stray blank line showed up over ssh once and broke ldd_same
+    echo "$out" | sed 's/ (0x.*//' | awk -v r="$2" 'NF { p=$3; sub(r, "X", p); print $1, p }' | sort > "$TAB.ldd_$1"
     chk "ldd_$1" "all resolved" nogrep 'not found' "$out"
     chk "no_ossl11_$1" "no libssl/libcrypto 1.1" nogrep 'so\.1\.1' "$out"
     local n; n=$(grep -c " $2/" <<<"$out")
@@ -88,10 +109,14 @@ ldd_check() { # tag root
 }
 [ -d "$T/vendor" ] && ldd_check vendor $S
 ldd_check ours $D
-[ -d "$T/vendor" ] && chk ldd_same "our libs resolve like the vendor bundle" diff "$TAB.ldd_vendor" "$TAB.ldd_ours"
+if [ -d "$T/vendor" ]; then
+    echo "== ldd vendor vs ours, root shown as X (no output = same)"
+    chk ldd_same "our libs resolve like the vendor bundle" diff "$TAB.ldd_vendor" "$TAB.ldd_ours"
+fi
 rm -f "$TAB".ldd_*
 
 v=$(dx env LD_LIBRARY_PATH="$(lp $D)" "$BIN" --version 2>&1)
+echo "== mongod --version (our libs)"; echo "$v"
 OSSL_V=$(grep -oE 'OpenSSL [0-9.]+' <<<"$v" | head -1)
 if [ -n "${OPENSSL_VERSION:-}" ]; then chk version "$OSSL_V" test "$OSSL_V" = "OpenSSL $OPENSSL_VERSION"; else res version INFO "$OSSL_V"; fi
 
@@ -105,6 +130,7 @@ mstart() { # name envs... -- extra mongod args
     # keep it in a file: the kernel guard fires before --logpath is open
     local cmd; cmd=$(printf '%q ' env "${envs[@]}" "$BIN" --dbpath "/poc/$n" --port $PORT --bind_ip 127.0.0.1 \
         --replSet kv --fork --logpath "/poc/$n.log" --pidfilepath "/poc/$n.pid" $CERTS "$@")
+    echo "+ $cmd"
     dx bash -c "$cmd </dev/null >/poc/$n.out 2>&1"
 }
 started_or_guard() { # name -> 0 started, 1 failed, 2 refused by the kernel guard
@@ -119,11 +145,27 @@ mstop() {
     for _ in $(seq 60); do dx test -d "/proc/$pid" || return 0; sleep 1; done
     dx bash -c "kill -9 $pid" 2>/dev/null
 }
-maps() { dx cat "/proc/$(rcat "$1.pid")/maps" 2>/dev/null; }
-client() { docker exec "$HELPER" python3.11 /work/verify/client.py $PORT 2>&1 | tail -1; }
-sclient() { # cipher -> handshake summary
+show_mlog() { # name: print mongod's stdout and log, keep copies for the artifacts
+    rcat "$1.out" > "$TAB.mongod/$1.stdout.log"; rcat "$1.log" > "$TAB.mongod/$1.log"
+    echo "-- $1: mongod stdout/stderr (the kernel guard writes here, before the log file is open)"
+    cat "$TAB.mongod/$1.stdout.log"
+    echo "-- $1: mongod log"
+    cat "$TAB.mongod/$1.log"
+}
+maps() { # name -> /proc/<pid>/maps, the .so list goes to the log
+    local m; m=$(dx cat "/proc/$(rcat "$1.pid")/maps" 2>/dev/null)
+    echo "-- $1: shared objects mapped in mongod" >&2; awk '$6 ~ /\.so/ { print $6 }' <<<"$m" | sort -u >&2
+    echo "$m"
+}
+client() { # full output to the log, last line ("OK openssl=... perCPU=...") to the caller
+    local out; out=$(docker exec "$HELPER" python3.11 /work/verify/client.py $PORT 2>&1)
+    echo "-- client (TLS, replSetInitiate, CRUD, buildInfo, serverStatus)" >&2; echo "$out" >&2
+    tail -1 <<<"$out"
+}
+sclient() { # cipher -> handshake summary; full output (cert body cut) to the log
     local out; out=$(echo | docker exec -i "$HELPER" env LD_LIBRARY_PATH=/work/rt/lib /work/rt/bin/openssl \
         s_client -connect 127.0.0.1:$PORT -cipher "$1" -tls1_2 -CAfile /work/verify/certs/ca.pem 2>&1)
+    echo "-- openssl s_client -tls1_2 -cipher $1" >&2; sed '/BEGIN CERTIFICATE/,/END CERTIFICATE/d' <<<"$out" >&2
     grep -m1 -E '^New,|Cipher is' <<<"$out"
 }
 start_result() { # name rc
@@ -139,13 +181,13 @@ tls_case() { # name root [extra env]
     started_or_guard "$n" LD_LIBRARY_PATH="$(lp "$r")" "$@" --; rc=$?
     start_result "$n" $rc; PERCPU=$([ $rc = 2 ] && echo guard || echo "")
     if [ $rc = 0 ]; then
-        out=$(client); echo "$n client: $out"
+        out=$(client)
         chk "${n}_kv" "$out" grep -q "^OK openssl=OpenSSL_${OSSL_V#OpenSSL }" <<<"$out"
         chk "${n}_libssl" "libssl.so.3 from $r" grep -q " $r/lib/libssl.so.3$" <<<"$(maps "$n")"
         PERCPU=$(grep -oE 'perCPU=[A-Za-z]+' <<<"$out" | cut -d= -f2)
         [ $KERNEL_GUARD = 1 ] && chk "${n}_guard" "per-CPU caches off on guarded kernel" test "$PERCPU" != True
     fi
-    mstop "$n"
+    mstop "$n"; show_mlog "$n"
 }
 
 # vendor openssl.cnf includes its fipsmodule.cnf via $ENV::<root var>; set every such var to the root
@@ -160,27 +202,36 @@ fips_case() { # name root openssl.cnf modules-dir [extra env]
     if [ $rc = 0 ]; then
         chk "${n}_fipslog" "FIPS 140 mode activated" grep -q '"FIPS 140 mode activated"' <<<"$(rcat "$n.log")"
         chk "${n}_fipsso" "$mods/fips.so mapped" grep -q " $mods/fips.so$" <<<"$(maps "$n")"
-        out=$(client); echo "$n client: $out"
+        out=$(client)
         chk "${n}_kv" "$out" grep -q '^OK openssl=' <<<"$out"
         h=$(sclient ECDHE-RSA-CHACHA20-POLY1305)
         chk "${n}_chacha_refused" "$h" grep -q 'Cipher is (NONE)' <<<"$h"
         h=$(sclient ECDHE-RSA-AES256-GCM-SHA384)
         chk "${n}_aesgcm_ok" "$h" grep -q 'Cipher is ECDHE-RSA-AES256-GCM-SHA384' <<<"$h"
     fi
-    mstop "$n"
+    mstop "$n"; show_mlog "$n"
 }
 
+G="on 6.19.0-7.0.13 kernels mongod must refuse to start (12257600)"
 if [ -d "$T/vendor" ]; then
+    hdr vendor_tls "customer's runtime libs ($S), TLS, client CRUD; per-CPU caches as glibc defaults them"
     tls_case vendor_tls $S; P_DEFAULT=$PERCPU
+    hdr vendor_rseq0 "customer's libs + GLIBC_TUNABLES=glibc.pthread.rseq=0 (per-CPU caches on); $G"
     tls_case vendor_rseq0 $S GLIBC_TUNABLES=glibc.pthread.rseq=0; P_TUN=$PERCPU
     for c in "$T"/vendor/share/openssl3/fips140-*; do
         [ -d "$c" ] || continue; f=$(basename "$c")
+        hdr "vendor_${f//-/}" "customer's openssl.cnf + fips.so from $f, --tlsFIPSMode: FIPS active, ChaCha20 refused, AES-GCM works"
         # shellcheck disable=SC2046
         fips_case "vendor_${f//-/}" $S "$S/share/openssl3/$f/openssl.cnf" "$S/lib/ossl-modules/$f" $(cnf_envs "$c/openssl.cnf" $S)
     done
 fi
+hdr ours_tls "our runtime-libs tarball ($D), TLS, client CRUD"
 tls_case ours_tls $D; [ -d "$T/vendor" ] || P_DEFAULT=$PERCPU
-[ -d "$T/vendor" ] || { tls_case ours_rseq0 $D GLIBC_TUNABLES=glibc.pthread.rseq=0; P_TUN=$PERCPU; }
+if [ ! -d "$T/vendor" ]; then
+    hdr ours_rseq0 "our libs + GLIBC_TUNABLES=glibc.pthread.rseq=0 (per-CPU caches on); $G"
+    tls_case ours_rseq0 $D GLIBC_TUNABLES=glibc.pthread.rseq=0; P_TUN=$PERCPU
+fi
+hdr ours_fips "our fips.so, fipsmodule.cnf from fipsinstall in helper_setup.sh, --tlsFIPSMode"
 fips_case ours_fips $D /work/verify/ours-fips.cnf $D/lib/ossl-modules
 
 res perCPU INFO "default=$P_DEFAULT with_tunable=$P_TUN (glibc $glibc, kernel $kernel)"
@@ -190,12 +241,13 @@ else
     chk rseq0_percpu "tunable turns per-CPU caches on" test "$P_TUN" = True
 fi
 
-# no FIPS provider reachable: --tlsFIPSMode must refuse to start
 R=$D; [ -d "$T/vendor" ] && R=$S
+hdr nofips "no FIPS provider reachable (empty OPENSSL_CONF/OPENSSL_MODULES), --tlsFIPSMode: mongod must refuse to start"
 if mstart nofips OPENSSL_CONF=/dev/null OPENSSL_MODULES=/poc/nomods LD_LIBRARY_PATH="$(lp $R)" -- --tlsFIPSMode; then
     res nofips_refused FAIL "started without a FIPS provider"; mstop nofips
 else
     l=$(mlog nofips)
     chk nofips_refused "$(grep -oE '"id":(7585801|12257600),[^}]*' <<<"$l" | head -1 | cut -c1-120)" grep -qE '"id":(7585801|12257600)' <<<"$l"
 fi
+show_mlog nofips
 echo ONE_DONE

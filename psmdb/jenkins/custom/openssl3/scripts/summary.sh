@@ -3,6 +3,8 @@
 # usage: summary.sh results.tsv   (also writes results.tsv -> summary.txt next to it)
 set -uo pipefail
 R=$1
+cat "$(dirname "$0")/checks.txt"
+echo
 awk -F'\t' '{ if (!($1 in seen)) { seen[$1]=1; ord[++n]=$1 }
               if ($2=="os") os[$1]=$4; if ($2=="perCPU") pc[$1]=$4
               if ($3=="PASS") p[$1]++; if ($3=="FAIL") f[$1]=f[$1] " " $2 }

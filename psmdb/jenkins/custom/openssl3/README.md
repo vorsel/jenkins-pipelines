@@ -70,6 +70,11 @@ Runtime-libs includes a customer README (install, `fipsinstall`, rseq) and `bin/
 - Each OS is its own parallel branch with `failFast: false`. A VM lost to a spot interruption
   is retried once on-demand, for that OS only.
 - The vendor bundle goes from RepoCI to the agent and test VMs only: never S3, never archived.
+- Logs: each OS prints its full log to the console as one block when it finishes
+  (`===== <os> BEGIN | <container image or VM details>` ... `END | PASS/FAIL`): every mongod
+  command line, its stdout and log, mapped libs, client and `s_client` output, the ldd diff.
+  The same goes to artifacts: `results/<level>/NN-<os>.log`, `.tsv`, `NN-<os>.mongod/`.
+  The summary at the end starts with a legend of all checks (`scripts/checks.txt`).
 
 ## AWS
 

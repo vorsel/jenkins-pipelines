@@ -18,15 +18,15 @@ void vmTest(String id, int idx, String S, String M) {
             // second attempt only after a spot interruption, and then on-demand
             String od = (attempt > 1 || params.FORCE_ON_DEMAND) ? '1' : '0'
             def vm = sh(returnStdout: true, script: "FORCE_ON_DEMAND=${od} bash ${S}/ec2_vm.sh launch ${M} ${params.ARCH} ${id} ${env.TAG}").trim().split()
-            String iid = vm[0], ip = vm[1], user = vm[2], life = vm[3], ami = vm[4], region = vm[5]
-            echo "${id}: ${iid} ${region} ${life} ${ami} ${ip}"
+            String iid = vm[0], ip = vm[1], user = vm[2], life = vm[3], ami = vm[4], region = vm[5], type = vm[6], az = vm[7]
+            String info = "${iid} ${type} ${life} ${az} ${ami}"
+            echo "${id}: ${info} ${ip}"
             int rc
             try {
                 rc = sh(returnStatus: true, script: """
                     bash ${S}/wait_ssh.sh ${ip} ${user} \$MOLECULE_AWS_PRIVATE_KEY
-                    T=\$WORKSPACE/t OUT=\$WORKSPACE/results/vm OPENSSL_VERSION=${params.OPENSSL_VERSION} \
+                    T=\$WORKSPACE/t OUT=\$WORKSPACE/results/vm OPENSSL_VERSION=${params.OPENSSL_VERSION} VM_INFO='${info}' \
                         bash ${S}/verify_os.sh ssh ${id} ${idx} ${ip} ${user} \$MOLECULE_AWS_PRIVATE_KEY
-                    printf '%s\\tami\\tINFO\\t%s %s %s %s\\n' ${id} ${ami} ${region} ${life} ${iid} >> \$WORKSPACE/results/vm/\$(printf %02d ${idx})-${id}.tsv
                 """)
             } finally {
                 sh "bash ${S}/ec2_vm.sh terminate ${region} ${iid} || true"

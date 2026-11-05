@@ -1,6 +1,6 @@
 #!/bin/bash
 # Level B helper: one throwaway VM per OS.
-#   ec2_vm.sh launch <os-matrix.json> <arch> <os id> <jenkins tag>  -> prints "INSTANCE_ID IP USER LIFECYCLE AMI REGION"
+#   ec2_vm.sh launch <os-matrix.json> <arch> <os id> <jenkins tag>  -> prints "INSTANCE_ID IP USER LIFECYCLE AMI REGION TYPE AZ"
 #   ec2_vm.sh ami <os-matrix.json> <arch> <os id>                   -> "ID REGION AMI DATE NAME", read-only
 #   ec2_vm.sh terminate <region> <instance id>
 #   ec2_vm.sh lost <region> <instance id>     -> exit 0 if AWS reclaimed it (spot interruption)
@@ -71,6 +71,7 @@ launch)
     [[ $ami == ami-* ]] || { echo "no AMI for $ID in $R" >&2; exit 1; }
     ERR=$(mktemp)
     types_var=TYPES_$ARCH; iid=""; life=""
+    echo "$ID: AMI $ami ($(aws ec2 describe-images --region "$R" --image-ids "$ami" --query 'Images[0].Name' --output text)) in $R" >&2
     if [ "${FORCE_ON_DEMAND:-0}" != 1 ]; then
         for t in ${!types_var}; do
             if iid=$(run "$ami" "$t" spot); then life=spot; break; fi
@@ -88,8 +89,10 @@ launch)
     aws ec2 wait instance-running --region "$R" --instance-ids "$iid"
     # private: the agent is in the same VPC (psmdb.cd, us-west-2); public: VM in another region
     [ "$connect" = public ] && q=PublicIpAddress || q=PrivateIpAddress
-    ip=$(aws ec2 describe-instances --region "$R" --instance-ids "$iid" --query "Reservations[0].Instances[0].$q" --output text)
-    echo "$iid $ip $user $life $ami $R"
+    read -r ip az < <(aws ec2 describe-instances --region "$R" --instance-ids "$iid" \
+        --query "Reservations[0].Instances[0].[$q, Placement.AvailabilityZone]" --output text)
+    echo "$ID: $iid $t $life in $az, ip $ip" >&2
+    echo "$iid $ip $user $life $ami $R $t $az"
     ;;
 ami)
     # read-only: which AMI a launch would take now

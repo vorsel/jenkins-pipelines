@@ -1,0 +1,26 @@
+Checks (results.tsv / <NN>-<os>.tsv columns: os, check, PASS|FAIL|INFO, detail).
+Each OS has a full log block in the console and <NN>-<os>.log; mongod logs per case in <NN>-<os>.mongod/.
+"vendor" = customer runtime bundle (/work/vendor), "ours" = our runtime-libs tarball (/work/rt).
+
+  os, image, vm, kernel     INFO: distro, glibc, kernel; container image digest or VM (instance, type, spot/on-demand, AZ, AMI)
+  pull, ssh, upload         FAIL only: could not get the image / reach the VM / copy files to it
+  ldd_<x>                   every library of mongod resolves with that runtime
+  no_ossl11_<x>             nothing pulls in OpenSSL 1.1
+  from_layout_<x>           13 libraries come from the runtime dir, the rest from the OS
+  ldd_same                  same libraries resolve with ours and the customer's (diff in the log)
+  version                   mongod --version reports the expected OpenSSL
+  <case>_start              mongod started (or was refused by the kernel guard where that is expected)
+  <case>_kv                 client over TLS: replset init, insert/update/find/delete, runtime OpenSSL
+  <case>_libssl             libssl.so.3 really loaded from that runtime (/proc/<pid>/maps)
+  <case>_guard              guarded kernel: tcmalloc per-CPU caches are off, so mongod may run
+  <case>_fipslog            "FIPS 140 mode activated" in the mongod log
+  <case>_fipsso             fips.so from that set is loaded in mongod
+  <case>_chacha_refused     ChaCha20 handshake fails (not FIPS-approved)
+  <case>_aesgcm_ok          AES-256-GCM handshake works
+  perCPU                    INFO: tcmalloc per-CPU caches by default and with GLIBC_TUNABLES=glibc.pthread.rseq=0
+  rseq0_percpu              normal kernel: the tunable turns per-CPU caches on
+  rseq0_guard               kernel 6.19.0-7.0.13: with the tunable mongod refuses to start (log id 12257600)
+  nofips_refused            --tlsFIPSMode without a FIPS provider: mongod refuses to start
+
+Cases: vendor_tls, vendor_rseq0, vendor_fips1402, vendor_fips1403 (one per fips140-* set in the bundle),
+       ours_tls, ours_rseq0 (only without the bundle), ours_fips, nofips.

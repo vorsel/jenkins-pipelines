@@ -12,7 +12,7 @@ HELPER=${HELPER:-oscheck-helper}
 docker rm -f "$HELPER" >/dev/null 2>&1 || true
 docker pull -q oraclelinux:8
 docker run -d --name "$HELPER" --network host -v "$T":/work oraclelinux:8 sleep infinity
-docker exec "$HELPER" bash -c 'yum -y -q install python3.11 python3.11-pip >/dev/null && python3.11 -m pip install -q pymongo'
+docker exec "$HELPER" bash -c 'yum -y install python3.11 python3.11-pip && python3.11 -m pip install pymongo'
 
 docker exec -i "$HELPER" bash -euxo pipefail <<'EOS'
 O="env LD_LIBRARY_PATH=/work/rt/lib /work/rt/bin/openssl"
