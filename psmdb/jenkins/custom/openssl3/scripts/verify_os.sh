@@ -8,6 +8,7 @@
 set -uo pipefail
 MODE=$1 ID=$2 IDX=$3
 : "${T:?}" "${OUT:?}"
+mkdir -p "$OUT"
 HELPER=${HELPER:-oscheck-helper}
 TAB=$OUT/$(printf %02d "$IDX")-$ID
 PORT=$((27000 + IDX * 20))
@@ -49,6 +50,10 @@ ssh)
     cleanup() { "${SSH[@]}" -O exit "$USER_@$HOST" 2>/dev/null; }
     trap cleanup EXIT
     "${SSH[@]}" -M -f -N "$USER_@$HOST" || { res ssh FAIL "no ssh to $HOST"; exit 0; }
+    # minimal images (the OL factory ones) come without tar
+    "${SSH[@]}" "$USER_@$HOST" 'command -v tar >/dev/null || sudo dnf -y -q install tar || sudo yum -y -q install tar ||
+        sudo zypper -n -q install tar || { sudo apt-get -q update && sudo apt-get -y -q install tar; }' >/dev/null 2>&1 \
+        || { res upload FAIL "no tar on $HOST and could not install it"; exit 0; }
     # vendor/ only if present: the customer bundle never leaves our hosts except to these test VMs
     tar -C "$T" -czf - pkg rt verify $( [ -d "$T/vendor" ] && echo vendor ) \
         | "${SSH[@]}" "$USER_@$HOST" 'sudo mkdir -p /work /poc && sudo tar -xzf - -C /work' \
@@ -57,6 +62,7 @@ ssh)
 *) echo "unknown mode $MODE"; exit 2 ;;
 esac
 rcat() { dx cat "/poc/$1" 2>/dev/null; }
+mlog() { rcat "$1.log"; rcat "$1.out"; }    # .out: what mongod printed before its log file was open
 dx mkdir -p /poc/nomods
 
 os=$(dx cat /etc/os-release | sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p')
@@ -95,14 +101,15 @@ mstart() { # name envs... -- extra mongod args
     while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
     PORT=$((PORT + 1))
     dx rm -rf "/poc/$n"; dx mkdir -p "/poc/$n"
-    # detach stdio on the far side too, or the ssh session would hang on the forked mongod
+    # detach stdio on the far side too, or the ssh session would hang on the forked mongod;
+    # keep it in a file: the kernel guard fires before --logpath is open
     local cmd; cmd=$(printf '%q ' env "${envs[@]}" "$BIN" --dbpath "/poc/$n" --port $PORT --bind_ip 127.0.0.1 \
         --replSet kv --fork --logpath "/poc/$n.log" --pidfilepath "/poc/$n.pid" $CERTS "$@")
-    dx bash -c "$cmd </dev/null >/dev/null 2>&1"
+    dx bash -c "$cmd </dev/null >/poc/$n.out 2>&1"
 }
 started_or_guard() { # name -> 0 started, 1 failed, 2 refused by the kernel guard
     if mstart "$@"; then fwd $PORT; return 0; fi
-    if [ $KERNEL_GUARD = 1 ] && rcat "$1.log" | grep -q '"id":12257600'; then return 2; fi
+    if [ $KERNEL_GUARD = 1 ] && mlog "$1" | grep -q '"id":12257600'; then return 2; fi
     return 1
 }
 mstop() {
@@ -123,7 +130,7 @@ start_result() { # name rc
     case $2 in
         0) res "${1}_start" PASS ;;
         2) res "${1}_start" PASS "refused by kernel guard 12257600 (expected on $kernel)" ;;
-        *) res "${1}_start" FAIL "$(rcat "$1.log" | tail -c 400)" ;;
+        *) res "${1}_start" FAIL "$(mlog "$1" | tail -c 400)" ;;
     esac
 }
 
@@ -188,7 +195,7 @@ R=$D; [ -d "$T/vendor" ] && R=$S
 if mstart nofips OPENSSL_CONF=/dev/null OPENSSL_MODULES=/poc/nomods LD_LIBRARY_PATH="$(lp $R)" -- --tlsFIPSMode; then
     res nofips_refused FAIL "started without a FIPS provider"; mstop nofips
 else
-    l=$(rcat nofips.log)
+    l=$(mlog nofips)
     chk nofips_refused "$(grep -oE '"id":(7585801|12257600),[^}]*' <<<"$l" | head -1 | cut -c1-120)" grep -qE '"id":(7585801|12257600)' <<<"$l"
 fi
 echo ONE_DONE
