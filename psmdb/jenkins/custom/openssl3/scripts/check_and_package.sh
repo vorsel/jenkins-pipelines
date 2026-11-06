@@ -4,7 +4,7 @@
 #   <name>.tar.gz + .sha256sum              mongod/mongos/perconadecrypt/mongobridge, stripped
 #   <name>-runtime-libs.tar.gz + .sha256sum our rebuilt libs in the customer's layout + README
 #   <name>.manifest.json                    versions, commit, NEEDED, min OpenSSL at runtime, hashes
-#   <name>.sbom.cdx.json, <name>-runtime-libs.sbom.cdx.json
+# SBOMs are a separate job stage (make_sbom.py, from the manifest).
 #
 # env: OPENSSL_VERSION, PROFILE, ARCH, BUILD_URL (optional), WORK (default /work)
 set -euo pipefail
@@ -76,11 +76,11 @@ cd "$OUT"
 sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256sum"
 sha256sum "$LIBS.tar.gz" > "$LIBS.tar.gz.sha256sum"
 
-python3 "$HERE/make_manifest_sbom.py" \
+python3 "$HERE/make_manifest.py" \
     --name "$NAME" --libs "$LIBS" --out "$OUT" \
     --psmdb-version "$PSMDB_VERSION" --commit "$PSMDB_COMMIT" --arch "$ARCH" \
     --openssl "$OPENSSL_VERSION" --min-openssl "$MIN_OPENSSL" --glibc "$GLIBC_NEED" \
     --needed "$NEEDED" --deps "$WORK/deps-versions.txt" --profile "$PROFILE_NAME" \
-    --source-sbom "$SRC/sbom.json" --build-url "${BUILD_URL:-}"
+    --build-url "${BUILD_URL:-}"
 ls -la "$OUT"
 echo PACKAGE_DONE

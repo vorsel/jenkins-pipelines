@@ -24,6 +24,8 @@ scripts/                                    everything the jobs run, usable by h
 | `PROFILE` | `openssl3-fips` | `profiles/<name>.env` |
 | `ARCH` | `x86_64` | |
 | `JIRA_TASK` | `CUSTOM000` | RepoCI path and TESTING dir |
+| `MAKE_SBOM` | true | off = no SBOM stage, manifest only |
+| `SBOM_ONLY_BUILD` | empty | build number: only redo that build's SBOMs, no build, no tests (ignores `MAKE_SBOM`) |
 | `RUN_TESTS`, `TEST_LEVEL` | true, `containers` | start the test job |
 
 - Fresh `oraclelinux:8` every build, deps from `psmdb_builder.sh --install_deps=1` of the same tag.
@@ -31,6 +33,10 @@ scripts/                                    everything the jobs run, usable by h
 - Bazel runs locally: RBE workers have no OpenSSL 3 under `MONGO_OPENSSL_ROOT`.
 - Fails on: NEEDED != profile, any OpenSSL 1.1 dependency, glibc symbols newer than 2.28,
   unresolved libs, wrong OpenSSL in `mongod --version`.
+- Stage `SBOM` runs after every build unless `MAKE_SBOM` is off: `make_sbom.py` takes the manifest from RepoCI and `sbom.json`
+  at the build commit from `PSMDB_REPO`. With `SBOM_ONLY_BUILD=<n>` only this stage runs, for build
+  `<n>`, and replaces its SBOMs on RepoCI. To get them to downloads, rerun the test job for that
+  build with `PUBLISH_TO_TESTING` (one OS in `OS_LIST` is enough; unchanged tarballs are skipped by rsync).
 
 Everything on RepoCI lives in one private dir with no sync to downloads:
 
@@ -46,10 +52,12 @@ Build output:
 percona-server-mongodb-<ver>-<arch>.glibc2.28-openssl<ver>.tar.gz              + .sha256sum
 percona-server-mongodb-<ver>-<arch>.glibc2.28-openssl<ver>-runtime-libs.tar.gz + .sha256sum
 ...manifest.json            versions, commit, NEEDED, min runtime OpenSSL, lib source hashes
-...sbom.cdx.json, ...-runtime-libs.sbom.cdx.json
+...sbom.cdx.json            PSMDB sbom.json pinned to this release + OpenSSL as a runtime dep
+...-runtime-libs.sbom.cdx.json  the rebuilt libs
 ```
 
-SBOMs sit next to the tarballs because they carry the tarball sha256.
+SBOMs sit next to the tarballs because they carry the tarball sha256. PSMDB, mongo and our libs have
+CPEs: grype matches C/C++ code only by CPE; Trivy ignores `pkg:generic`/`pkg:github` and finds nothing.
 Runtime-libs includes a customer README (install, `fipsinstall`, rseq) and `bin/openssl`.
 
 ## Tests
