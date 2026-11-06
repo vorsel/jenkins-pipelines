@@ -3,6 +3,7 @@ Each OS has a full log block in the console and <NN>-<os>.log; mongod logs per c
 "vendor" = customer runtime bundle (/work/vendor), "ours" = our runtime-libs tarball (/work/rt).
 
   os, image, vm, kernel     INFO: distro, glibc, kernel; container image digest or VM (instance, type, spot/on-demand, AZ, AMI)
+  kernel_sig                INFO, Ubuntu kernels only: /proc/version_signature, last field = upstream kernel version
   pull, ssh, upload         FAIL only: could not get the image / reach the VM / copy files to it
   ldd_<x>                   every library of mongod resolves with that runtime
   no_ossl11_<x>             nothing pulls in OpenSSL 1.1
