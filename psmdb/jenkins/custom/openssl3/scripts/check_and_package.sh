@@ -1,8 +1,8 @@
 #!/bin/bash
 # Runs in the build container after build_psmdb.sh. Checks the binaries (fails the job on any
 # mismatch), then writes everything that goes to RepoCI into $WORK/out:
-#   <name>.tar.gz + .sha256                 mongod/mongos/perconadecrypt/mongobridge, stripped
-#   <name>-runtime-libs.tar.gz + .sha256    our rebuilt libs in the customer's layout + README
+#   <name>.tar.gz + .sha256sum              mongod/mongos/perconadecrypt/mongobridge, stripped
+#   <name>-runtime-libs.tar.gz + .sha256sum our rebuilt libs in the customer's layout + README
 #   <name>.manifest.json                    versions, commit, NEEDED, min OpenSSL at runtime, hashes
 #   <name>.sbom.cdx.json, <name>-runtime-libs.sbom.cdx.json
 #
@@ -72,8 +72,9 @@ cd "$WORK/pkg"
 tar --owner=0 --group=0 -czf "$OUT/$NAME.tar.gz" "$NAME"
 tar --owner=0 --group=0 -czf "$OUT/$LIBS.tar.gz" "$LIBS"
 cd "$OUT"
-sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
-sha256sum "$LIBS.tar.gz" > "$LIBS.tar.gz.sha256"
+# .sha256sum: downloads.percona.com does not serve .sha256
+sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256sum"
+sha256sum "$LIBS.tar.gz" > "$LIBS.tar.gz.sha256sum"
 
 python3 "$HERE/make_manifest_sbom.py" \
     --name "$NAME" --libs "$LIBS" --out "$OUT" \

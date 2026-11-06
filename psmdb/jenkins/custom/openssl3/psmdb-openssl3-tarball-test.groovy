@@ -104,7 +104,7 @@ pipeline {
                 }
                 sh """
                     set -o xtrace
-                    (cd dl && sha256sum -c ./*.sha256)
+                    (cd dl && sha256sum -c ./*.sha256sum)
                     T=\$WORKSPACE/t; mkdir -p \$T/pkg \$T/rt
                     for f in dl/*.tar.gz; do
                         case \$f in

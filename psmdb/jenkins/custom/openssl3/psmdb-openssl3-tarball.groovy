@@ -85,7 +85,7 @@ pipeline {
                             chown -R \$HOST_UID:\$HOST_GID work/out'
                     ls -la work/out
                 """
-                archiveArtifacts artifacts: 'work/out/*.json,work/out/*.sha256', allowEmptyArchive: false
+                archiveArtifacts artifacts: 'work/out/*.json,work/out/*.sha256sum', allowEmptyArchive: false
                 withCredentials([sshUserPrivateKey(credentialsId: 'repo.ci.percona.com', keyFileVariable: 'KEY_PATH', usernameVariable: 'USER')]) {
                     sh """
                         cat /etc/hosts > hosts

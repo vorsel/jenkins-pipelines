@@ -43,8 +43,8 @@ Everything on RepoCI lives in one private dir with no sync to downloads:
 Build output:
 
 ```
-percona-server-mongodb-<ver>-<arch>.glibc2.28-openssl<ver>.tar.gz              + .sha256
-percona-server-mongodb-<ver>-<arch>.glibc2.28-openssl<ver>-runtime-libs.tar.gz + .sha256
+percona-server-mongodb-<ver>-<arch>.glibc2.28-openssl<ver>.tar.gz              + .sha256sum
+percona-server-mongodb-<ver>-<arch>.glibc2.28-openssl<ver>-runtime-libs.tar.gz + .sha256sum
 ...manifest.json            versions, commit, NEEDED, min runtime OpenSSL, lib source hashes
 ...sbom.cdx.json, ...-runtime-libs.sbom.cdx.json
 ```
