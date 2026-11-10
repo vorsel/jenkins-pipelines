@@ -15,13 +15,28 @@ bin/openssl                OpenSSL CLI, needed for `fipsinstall`
 
 ```bash
 tar xzf @NAME@.tar.gz -C /opt
-tar xzf @NAME@-runtime-libs.tar.gz -C /opt
-L=/opt/@NAME@-runtime-libs
+mkdir -p @PREFIX@
+tar xzf @NAME@-runtime-libs.tar.gz -C @PREFIX@ --strip-components=1
+L=@PREFIX@
 export LD_LIBRARY_PATH=$L/opt/mongo/openssl3/lib:$L/lib
 /opt/@NAME@/bin/mongod --version        # must report OpenSSL @OPENSSL_VERSION@
 ```
 
 `mongod` needs OpenSSL @MIN_OPENSSL@ or newer at runtime (symbol version `OPENSSL_@MIN_OPENSSL@`).
+
+## Kerberos and LDAP
+
+`libsasl2` loads its plugins (GSSAPI, PLAIN, SCRAM, OTP) from `@PREFIX@/opt/mongo/openssl3/lib/sasl2`.
+If the libraries are installed in another directory, set:
+
+```bash
+export SASL_PATH=$L/opt/mongo/openssl3/lib/sasl2
+```
+
+- SASL config (`<saslServiceName>.conf`, `mongodb.conf` by default) is read from the plugin directory and `/etc/sasl2`.
+- saslauthd socket: `/var/run/saslauthd/mux`, or `saslauthd_path` in the SASL config.
+- Kerberos: `/etc/krb5.conf`; keytab from `KRB5_KTNAME`.
+- LDAP: `/etc/openldap/ldap.conf`. On Debian and Ubuntu set `LDAPCONF=/etc/ldap/ldap.conf`.
 
 ## FIPS mode
 

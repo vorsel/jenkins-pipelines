@@ -32,7 +32,10 @@ scripts/                                    everything the jobs run, usable by h
 - Runtime libs are built from source each time (~6-8 min), no cache.
 - Bazel runs locally: RBE workers have no OpenSSL 3 under `MONGO_OPENSSL_ROOT`.
 - Fails on: NEEDED != profile, any OpenSSL 1.1 dependency, glibc symbols newer than 2.28,
-  unresolved libs, wrong OpenSSL in `mongod --version`.
+  unresolved libs, wrong OpenSSL in `mongod --version`, RPATH or build paths in the libs,
+  sasl without the GSSAPI or PLAIN server mechanism.
+- Libs are configured for `RUNTIME_PREFIX` of the profile (`/opt/psmdb-runtime-libs`): the sasl and
+  krb5 plugin dirs compiled into them point there. Installed elsewhere, sasl needs `SASL_PATH`.
 - Stage `SBOM` runs after every build unless `MAKE_SBOM` is off: `make_sbom.py` takes the manifest from RepoCI and `sbom.json`
   at the build commit from `PSMDB_REPO`. With `SBOM_ONLY_BUILD=<n>` only this stage runs, for build
   `<n>`, and replaces its SBOMs on RepoCI. To get them to downloads, rerun the test job for that
