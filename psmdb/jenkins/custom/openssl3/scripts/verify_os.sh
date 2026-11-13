@@ -90,14 +90,20 @@ glibc=$(dx $LDSO --version 2>&1 | grep -oE 'version [0-9.]+' | head -1 | cut -d'
 kernel=$(dx uname -r)
 res os INFO "$os | glibc $glibc | kernel $kernel | $MODE"
 
-# 8.0.34 refuses to start with tcmalloc per-CPU caches on 6.19.0-7.0.13 (startup_check_rseq.cpp)
+# mongod refuses to start with tcmalloc per-CPU caches on 6.19.0-7.0.13 (startup_check_rseq.cpp)
 kv=$(grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' <<<"$kernel")
 in_range() { [ "$(printf '%s\n%s\n' 6.19.0 "$1" | sort -V | head -1)" = 6.19.0 ] && [ "$(printf '%s\n%s\n' "$1" 7.0.13 | sort -V | head -1)" = "$1" ]; }
-KERNEL_GUARD=0; [ -n "$kv" ] && in_range "$kv" && KERNEL_GUARD=1
-[ $KERNEL_GUARD = 1 ] && res kernel INFO "kernel $kernel is in the 6.19.0-7.0.13 guard range"
+ver_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
 # Ubuntu keeps 7.0.0 in uname -r; the last field here is the upstream base (7.0.14+ has the rseq fix)
 sig=$(dx cat /proc/version_signature 2>/dev/null)
 [ -z "$sig" ] || res kernel_sig INFO "$sig"
+# 8.0.37+ (SERVER-131779) checks that upstream base instead of uname -r
+pv=$(grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' <<<"${PKG#percona-server-mongodb-}")
+if [ -n "$sig" ] && [ -n "$pv" ] && ver_ge "$pv" 8.0.37; then
+    kv=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+$' <<<"$sig")
+fi
+KERNEL_GUARD=0; [ -n "$kv" ] && in_range "$kv" && KERNEL_GUARD=1
+[ $KERNEL_GUARD = 1 ] && res kernel INFO "kernel $kernel ($kv) is in the 6.19.0-7.0.13 guard range"
 
 # ---- dynamic linking
 ldd_check() { # tag root

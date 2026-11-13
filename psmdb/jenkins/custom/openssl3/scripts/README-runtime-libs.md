@@ -70,4 +70,6 @@ export GLIBC_TUNABLES=glibc.pthread.rseq=0
 This setting has no effect on glibc 2.28.
 On Linux kernels 6.19.0 – 7.0.13, mongod refuses to start when per-CPU caches are active
 (SERVER-121912). Don't set the variable on these kernels.
+On Ubuntu, mongod 8.0.37+ reads the kernel version from `/proc/version_signature`, so Ubuntu
+kernels shown as 7.0.0 but based on 7.0.14+ are not blocked (SERVER-131779).
 On RHEL 8 hosts, per-CPU caches are always active, so mongod can't run on those kernels at all.

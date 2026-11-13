@@ -20,7 +20,8 @@ Each OS has a full log block in the console and <NN>-<os>.log; mongod logs per c
   <case>_aesgcm_ok          AES-256-GCM handshake works
   perCPU                    INFO: tcmalloc per-CPU caches by default and with GLIBC_TUNABLES=glibc.pthread.rseq=0
   rseq0_percpu              normal kernel: the tunable turns per-CPU caches on
-  rseq0_guard               kernel 6.19.0-7.0.13: with the tunable mongod refuses to start (log id 12257600)
+  rseq0_guard               kernel 6.19.0-7.0.13: with the tunable mongod refuses to start (log id 12257600);
+                            on Ubuntu with 8.0.37+ the version comes from /proc/version_signature
   nofips_refused            --tlsFIPSMode without a FIPS provider: mongod refuses to start
 
 Cases: vendor_tls, vendor_rseq0, vendor_fips1402, vendor_fips1403 (one per fips140-* set in the bundle),

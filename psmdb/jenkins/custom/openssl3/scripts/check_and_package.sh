@@ -2,7 +2,7 @@
 # Runs in the build container after build_psmdb.sh. Checks the binaries (fails the job on any
 # mismatch), then writes everything that goes to RepoCI into $WORK/out:
 #   <name>.tar.gz + .sha256sum              mongod/mongos/perconadecrypt/mongobridge, stripped
-#   <name>-runtime-libs.tar.gz + .sha256sum our rebuilt libs in the customer's layout + README
+#   <name>-runtime-libs.tar.gz + .sha256sum our rebuilt libs in the customer's layout + README, stripped
 #   <name>.manifest.json                    versions, commit, NEEDED, min OpenSSL at runtime, hashes
 # SBOMs are a separate job stage (make_sbom.py, from the manifest).
 #
@@ -27,17 +27,13 @@ NEEDED=$(readelf -d $BIN/mongod | awk '/NEEDED/{print $NF}' | tr -d '[]' | sort 
 [ "$NEEDED" = "$EXPECTED_NEEDED" ] && ok "NEEDED as expected" || { bad "NEEDED differs"; echo " got:      $NEEDED"; echo " expected: $EXPECTED_NEEDED"; }
 
 readelf -d $BIN/mongod | grep -q 'so\.1\.1' && bad "mongod needs OpenSSL 1.1" || ok "no OpenSSL 1.1 in mongod"
-T=$(mktemp)
 for f in $(find "$RT" -name '*.so*' -type f); do
     d=$(readelf -d "$f" 2>/dev/null)
     grep -q 'lib\(ssl\|crypto\)\.so\.1\.1' <<<"$d" && bad "$f needs OpenSSL 1.1"
     # RPATH is searched before LD_LIBRARY_PATH; build paths don't exist on the target
     grep -qE 'R(UN)?PATH' <<<"$d" && bad "$f has RPATH: $(grep -E 'R(UN)?PATH' <<<"$d" | xargs)"
-    # debug info keeps source paths, only what gets loaded matters
-    objcopy --strip-debug "$f" "$T" && grep -qF "$RT" "$T" && bad "$f has the build path $RT in it"
 done
-rm -f "$T"
-[ $fail -eq 0 ] && ok "no RPATH or build paths in the libs"
+[ $fail -eq 0 ] && ok "no RPATH in the libs"
 
 # symbol versions: newest glibc needed (must stay within the RHEL 8 baseline) and the oldest
 # OpenSSL that can run this binary (the build headers decide it, e.g. 3.5 headers -> OPENSSL_3.4.0)
@@ -85,6 +81,13 @@ mkdir -p "$WORK/pkg/$LIBS/opt/mongo/openssl3" "$WORK/pkg/$LIBS/bin"
 cp -a "$RT/opt/mongo/openssl3/lib" "$WORK/pkg/$LIBS/opt/mongo/openssl3/"
 cp -a /opt/ossl/bin/openssl "$WORK/pkg/$LIBS/bin/"          # needed for fipsinstall on the target
 find "$WORK/pkg/$LIBS" \( -name '*.a' -o -name '*.la' -o -name pkgconfig \) -prune -exec rm -rf {} +
+# debug info carries the build path; fips.so stays as built
+find "$WORK/pkg/$LIBS" -type f \( -name '*.so*' -o -path '*/bin/*' \) ! -name fips.so -print0 \
+    | xargs -0 strip --strip-debug
+# container work dir and the Jenkins workspace (mounted under its host path)
+p=$(grep -rlE "$WORK/|/workspace/" "$WORK/pkg/$LIBS" || true)
+[ -z "$p" ] || { echo "FAIL: build path in:"; echo "$p"; exit 1; }
+ok "no build path in the packaged libs"
 sed -e "s/@OPENSSL_VERSION@/$OPENSSL_VERSION/g" -e "s/@MIN_OPENSSL@/$MIN_OPENSSL/g" \
     -e "s/@NAME@/$NAME/g" -e "s|@PREFIX@|$RUNTIME_PREFIX|g" "$HERE/README-runtime-libs.md" > "$WORK/pkg/$LIBS/README.md"
 
